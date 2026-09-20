@@ -21,7 +21,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/regulation_policy_compiler"]
+packages = ["regulation_policy_compiler"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
