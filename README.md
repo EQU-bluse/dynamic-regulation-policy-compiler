@@ -16,8 +16,10 @@ pytest
 
 - `GET /health`：返回 `{"status":"ok"}`，用于进程健康检查。
 - `regulation_policy_compiler.policy.evaluate(at, facts, rules)`：对版本化规则做确定性求值，返回 `(decision, trace)`。
+- `regulation_policy_compiler.policy.compile_rules(at, rules)`：复用 `evaluate` 的校验、生效窗口、选版与排序，返回含 `at, rules, conflicts` 的深副本；`conflicts` 按规则下标 `i < j` 列出结果不同且条件可同时成立的规则对（`winner`/`loser` 为 `[source, id, ver]`）。
+- `POST /rules/compile`：请求体为恰含 `at, rules` 的 JSON 对象，返回 `compile_rules` 的 UTF-8 紧凑 JSON（非 ASCII 不转义、无末尾换行）；解析失败、类型或键集错误、校验失败均响应 422 `{"detail":"invalid request"}`。
 - `regulation_policy_compiler.history.DecisionHistory(path)`：把决策记录持久化到 UTF-8 紧凑 JSON 文件（仅含按 `(id, at)` 升序的 `records` 数组，原子写入）。`record(record_id, at, facts, rules)` 复用 `evaluate` 的校验、选版与排序，存并返回含 `id, at, decision, trace, basis` 的记录；`replay(record_id, at)` 返回该 id 在不晚于 `at` 的最近一条记录副本，无则 `KeyError`。
 
 ## 当前限制
 
-规则编译、冲突处理与决策解释的 HTTP 接口尚未实现。
+决策解释的 HTTP 接口尚未实现。

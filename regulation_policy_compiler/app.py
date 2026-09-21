@@ -10,7 +10,13 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from .history import DecisionHistory
-from .policy import _check_fact_map, _check_non_empty_str, _check_time, _validate_rules
+from .policy import (
+    _check_fact_map,
+    _check_non_empty_str,
+    _check_time,
+    _validate_rules,
+    compile_rules,
+)
 
 app = FastAPI(title="Dynamic Regulation Policy Compiler")
 
@@ -20,6 +26,7 @@ H: DecisionHistory | None = (
 )
 
 _POST_KEYS = {"at", "facts", "rules"}
+_COMPILE_KEYS = {"at", "rules"}
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -42,6 +49,21 @@ def _record_response(record: dict[str, Any]) -> Response:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/rules/compile")
+async def compile_rules_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _COMPILE_KEYS:
+        return _invalid_request()
+    try:
+        compiled = compile_rules(body["at"], body["rules"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(compiled)
 
 
 @app.post("/decisions/{record_id}")

@@ -95,16 +95,13 @@ def _compare(a: dict[str, Any], b: dict[str, Any]) -> int:
     return 0
 
 
-def _matched_rules(
-    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Return the matching rules in ranking order after validation.
+def _ranked_effective(at: str, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the effective latest-version rules in ranking order.
 
-    Validation, latest-version selection, and ordering are exactly those of
-    :func:`evaluate`.
+    Validation, effective-window selection, latest-version selection, and
+    ordering are exactly those of :func:`evaluate`.
     """
     _check_time(at, "at")
-    _check_fact_map(facts, "facts")
     rules = _validate_rules(rules)
 
     effective = [
@@ -119,14 +116,28 @@ def _matched_rules(
         if key not in latest or rule["ver"] > latest[key]["ver"]:
             latest[key] = rule
 
-    matched = [
+    ranked = list(latest.values())
+    ranked.sort(key=cmp_to_key(_compare))
+    return ranked
+
+
+def _matched_rules(
+    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return the matching rules in ranking order after validation.
+
+    Validation, latest-version selection, and ordering are exactly those of
+    :func:`evaluate`.
+    """
+    _check_time(at, "at")
+    _check_fact_map(facts, "facts")
+    ranked = _ranked_effective(at, rules)
+    return [
         rule
-        for rule in latest.values()
+        for rule in ranked
         if rule["when"] is None
         or all(key in facts and facts[key] == value for key, value in rule["when"].items())
     ]
-    matched.sort(key=cmp_to_key(_compare))
-    return matched
 
 
 def evaluate(
@@ -143,3 +154,55 @@ def evaluate(
         return None, []
     trace = [f"{rule['id']}@{rule['ver']}" for rule in matched]
     return matched[0]["result"], trace
+
+
+def _snapshot_rule(rule: dict[str, Any]) -> dict[str, Any]:
+    when = rule["when"]
+    if when is not None:
+        when = {key: when[key] for key in sorted(when)}
+    return {
+        "id": rule["id"],
+        "ver": rule["ver"],
+        "source": rule["source"],
+        "priority": rule["priority"],
+        "from": rule["from"],
+        "to": rule["to"],
+        "when": when,
+        "result": rule["result"],
+    }
+
+
+def _conditions_compatible(a: dict[str, bool] | None, b: dict[str, bool] | None) -> bool:
+    if a is None or b is None:
+        return True
+    return all(key not in b or b[key] == value for key, value in a.items())
+
+
+def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compile the effective rules at a UTC second timestamp.
+
+    Applies the same validation, effective-window selection, latest-version
+    selection, and ranking as :func:`evaluate`. Returns a deep-copied dict
+    with keys ``at``, ``rules``, ``conflicts``: ``rules`` holds the ranked
+    effective rules, and ``conflicts`` lists each pair (by ``rules`` index
+    ``i < j``) whose results differ while their conditions can hold at the
+    same time, as ``{"winner": [source, id, ver], "loser": [source, id, ver]}``
+    with the earlier-ranked rule as winner.
+    """
+    ranked = _ranked_effective(at, rules)
+    compiled = [_snapshot_rule(rule) for rule in ranked]
+    conflicts: list[dict[str, list[Any]]] = []
+    for i in range(len(ranked)):
+        for j in range(i + 1, len(ranked)):
+            first, second = ranked[i], ranked[j]
+            if first["result"] == second["result"]:
+                continue
+            if not _conditions_compatible(first["when"], second["when"]):
+                continue
+            conflicts.append(
+                {
+                    "winner": [first["source"], first["id"], first["ver"]],
+                    "loser": [second["source"], second["id"], second["ver"]],
+                }
+            )
+    return {"at": at, "rules": compiled, "conflicts": conflicts}
