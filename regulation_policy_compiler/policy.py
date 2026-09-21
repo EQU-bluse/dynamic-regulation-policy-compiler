@@ -95,19 +95,12 @@ def _compare(a: dict[str, Any], b: dict[str, Any]) -> int:
     return 0
 
 
-def evaluate(
+def _select_matched(
     at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
-) -> tuple[str | None, list[str]]:
-    """Evaluate versioned rules against facts at a UTC second timestamp.
-
-    Returns ``(decision, trace)`` where ``trace`` lists every matching rule as
-    ``id@ver`` in ranking order and ``decision`` is the top rule's ``result``
-    (``None`` with an empty trace when nothing matches).
-    """
-    _check_time(at, "at")
-    _check_fact_map(facts, "facts")
-    rules = _validate_rules(rules)
-
+) -> list[dict[str, Any]]:
+    """Select rules effective at ``at``, keep the newest version per
+    ``(source, id)``, filter on ``facts``, and return matches ranked as in
+    :func:`evaluate`. Inputs must already be validated."""
     effective = [
         rule
         for rule in rules
@@ -127,6 +120,40 @@ def evaluate(
         or all(key in facts and facts[key] == value for key, value in rule["when"].items())
     ]
     matched.sort(key=cmp_to_key(_compare))
+    return matched
+
+
+def _snapshot_basis(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return an ordered deep copy of a rule suitable for persisted output:
+    keys in id, ver, source, priority, from, to, when, result order and the
+    ``when`` mapping sorted by key."""
+    when = rule["when"]
+    return {
+        "id": rule["id"],
+        "ver": rule["ver"],
+        "source": rule["source"],
+        "priority": rule["priority"],
+        "from": rule["from"],
+        "to": rule["to"],
+        "when": None if when is None else {key: when[key] for key in sorted(when)},
+        "result": rule["result"],
+    }
+
+
+def evaluate(
+    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
+) -> tuple[str | None, list[str]]:
+    """Evaluate versioned rules against facts at a UTC second timestamp.
+
+    Returns ``(decision, trace)`` where ``trace`` lists every matching rule as
+    ``id@ver`` in ranking order and ``decision`` is the top rule's ``result``
+    (``None`` with an empty trace when nothing matches).
+    """
+    _check_time(at, "at")
+    _check_fact_map(facts, "facts")
+    rules = _validate_rules(rules)
+
+    matched = _select_matched(at, facts, rules)
 
     if not matched:
         return None, []
