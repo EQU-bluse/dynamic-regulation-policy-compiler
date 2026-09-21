@@ -18,8 +18,5 @@ pytest
 - `regulation_policy_compiler.policy.evaluate(at, facts, rules)`：对版本化规则做确定性求值，返回 `(decision, trace)`。
 - `regulation_policy_compiler.policy.compile_rules(at, rules)`：复用 `evaluate` 的校验、`[from,to)` 生效选取、每 `(source,id)` 取最高 `ver` 与排序，返回深副本 `{"at","rules","conflicts"}`；`conflicts` 按排序下标 `i<j` 列出结果不同且 `when` 条件可同时成立的规则对（前项为 winner）。
 - `POST /rules/compile`：请求体为恰含 `at,rules` 的 JSON 对象；非法请求响应 422 `{"detail":"invalid request"}`，成功返回 UTF-8 紧凑 JSON（非 ASCII 不转义、无末尾换行）。
+- `POST /explanations`：请求体为恰含 `at,facts,rules` 的 JSON 对象（校验同 `evaluate`）；成功返回顶层键 `at,decision,trace,basis,conflicts`，其中 `basis` 为胜出规则的深副本（无匹配时为 `null`），`conflicts` 仅保留编译结果中涉及该胜出规则的项并保持原顺序。非法请求响应 422 `{"detail":"invalid request"}`，不读写历史。
 - `regulation_policy_compiler.history.DecisionHistory(path)`：把决策记录持久化到 UTF-8 紧凑 JSON 文件（仅含按 `(id, at)` 升序的 `records` 数组，原子写入）。`record(record_id, at, facts, rules)` 复用 `evaluate` 的校验、选版与排序，存并返回含 `id, at, decision, trace, basis` 的记录；`replay(record_id, at)` 返回该 id 在不晚于 `at` 的最近一条记录副本，无则 `KeyError`。
-
-## 当前限制
-
-决策解释的 HTTP 接口尚未实现。
