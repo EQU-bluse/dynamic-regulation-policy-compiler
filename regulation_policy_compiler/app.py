@@ -16,6 +16,7 @@ from .policy import (
     _check_time,
     _validate_rules,
     compile_rules,
+    evaluate,
 )
 
 app = FastAPI(title="Dynamic Regulation Policy Compiler")
@@ -64,6 +65,50 @@ async def compile_rules_endpoint(request: Request) -> Response:
     except ValueError:
         return _invalid_request()
     return _record_response(compiled)
+
+
+@app.post("/explanations")
+async def explanations(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _POST_KEYS:
+        return _invalid_request()
+    at = body["at"]
+    facts = body["facts"]
+    rules = body["rules"]
+    try:
+        decision, trace = evaluate(at, facts, rules)
+        compiled = compile_rules(at, rules)
+    except ValueError:
+        return _invalid_request()
+    basis = None
+    for rule in compiled["rules"]:
+        when = rule["when"]
+        if when is None or all(
+            key in facts and facts[key] == value for key, value in when.items()
+        ):
+            basis = rule
+            break
+    if basis is None:
+        conflicts: list[dict[str, Any]] = []
+    else:
+        winner_key = [basis["source"], basis["id"], basis["ver"]]
+        conflicts = [
+            conflict
+            for conflict in compiled["conflicts"]
+            if conflict["winner"] == winner_key or conflict["loser"] == winner_key
+        ]
+    return _record_response(
+        {
+            "at": at,
+            "decision": decision,
+            "trace": trace,
+            "basis": basis,
+            "conflicts": conflicts,
+        }
+    )
 
 
 @app.post("/decisions/{record_id}")
