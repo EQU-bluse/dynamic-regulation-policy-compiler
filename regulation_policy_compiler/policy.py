@@ -95,16 +95,10 @@ def _compare(a: dict[str, Any], b: dict[str, Any]) -> int:
     return 0
 
 
-def _matched_rules(
-    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Return the matching rules in ranking order after validation.
-
-    Validation, latest-version selection, and ordering are exactly those of
-    :func:`evaluate`.
-    """
+def _effective_rules(at: str, rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate, select effective-at-``at`` rules, keep the highest ver per
+    ``(source, id)``, and rank them exactly as :func:`evaluate` does."""
     _check_time(at, "at")
-    _check_fact_map(facts, "facts")
     rules = _validate_rules(rules)
 
     effective = [
@@ -119,14 +113,27 @@ def _matched_rules(
         if key not in latest or rule["ver"] > latest[key]["ver"]:
             latest[key] = rule
 
-    matched = [
+    ranked = list(latest.values())
+    ranked.sort(key=cmp_to_key(_compare))
+    return ranked
+
+
+def _matched_rules(
+    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return the matching rules in ranking order after validation.
+
+    Validation, latest-version selection, and ordering are exactly those of
+    :func:`evaluate`.
+    """
+    _check_fact_map(facts, "facts")
+    ranked = _effective_rules(at, rules)
+    return [
         rule
-        for rule in latest.values()
+        for rule in ranked
         if rule["when"] is None
         or all(key in facts and facts[key] == value for key, value in rule["when"].items())
     ]
-    matched.sort(key=cmp_to_key(_compare))
-    return matched
 
 
 def evaluate(
@@ -143,3 +150,68 @@ def evaluate(
         return None, []
     trace = [f"{rule['id']}@{rule['ver']}" for rule in matched]
     return matched[0]["result"], trace
+
+
+def _conditions_compatible(a: dict[str, bool] | None, b: dict[str, bool] | None) -> bool:
+    """Return whether two ``when`` conditions can hold simultaneously.
+
+    ``None`` means unconstrained. Conditions are incompatible only when they
+    assign opposite booleans to a shared key.
+    """
+    if a is None or b is None:
+        return True
+    for key, value in a.items():
+        if key in b and b[key] is not value:
+            return False
+    return True
+
+
+def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compile the rules effective at ``at`` into rules and conflicts.
+
+    Reuses the full validation of :func:`evaluate` for ``at`` and ``rules``
+    (raising ``ValueError`` on anything invalid), keeps rules in their
+    ``[from, to)`` window, retains only the highest ``ver`` per
+    ``(source, id)``, and orders the survivors with :func:`evaluate`'s ranking.
+
+    ``conflicts`` lists, for ranked indices ``i < j``, pairs whose results
+    differ and whose ``when`` conditions can hold simultaneously; the earlier
+    rule is the winner. The returned structure is a deep copy with stable key
+    order.
+    """
+    ranked = _effective_rules(at, rules)
+
+    compiled_rules: list[dict[str, Any]] = []
+    for rule in ranked:
+        when = rule["when"]
+        if when is not None:
+            when = {key: when[key] for key in sorted(when)}
+        compiled_rules.append(
+            {
+                "id": rule["id"],
+                "ver": rule["ver"],
+                "source": rule["source"],
+                "priority": rule["priority"],
+                "from": rule["from"],
+                "to": rule["to"],
+                "when": when,
+                "result": rule["result"],
+            }
+        )
+
+    conflicts: list[dict[str, Any]] = []
+    for i in range(len(ranked)):
+        winner = ranked[i]
+        for j in range(i + 1, len(ranked)):
+            loser = ranked[j]
+            if winner["result"] != loser["result"] and _conditions_compatible(
+                winner["when"], loser["when"]
+            ):
+                conflicts.append(
+                    {
+                        "winner": [winner["source"], winner["id"], winner["ver"]],
+                        "loser": [loser["source"], loser["id"], loser["ver"]],
+                    }
+                )
+
+    return {"at": at, "rules": compiled_rules, "conflicts": conflicts}
