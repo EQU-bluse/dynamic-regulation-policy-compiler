@@ -95,14 +95,13 @@ def _compare(a: dict[str, Any], b: dict[str, Any]) -> int:
     return 0
 
 
-def evaluate(
+def _matched_rules(
     at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
-) -> tuple[str | None, list[str]]:
-    """Evaluate versioned rules against facts at a UTC second timestamp.
+) -> list[dict[str, Any]]:
+    """Return the matching rules in ranking order after validation.
 
-    Returns ``(decision, trace)`` where ``trace`` lists every matching rule as
-    ``id@ver`` in ranking order and ``decision`` is the top rule's ``result``
-    (``None`` with an empty trace when nothing matches).
+    Validation, latest-version selection, and ordering are exactly those of
+    :func:`evaluate`.
     """
     _check_time(at, "at")
     _check_fact_map(facts, "facts")
@@ -127,7 +126,19 @@ def evaluate(
         or all(key in facts and facts[key] == value for key, value in rule["when"].items())
     ]
     matched.sort(key=cmp_to_key(_compare))
+    return matched
 
+
+def evaluate(
+    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
+) -> tuple[str | None, list[str]]:
+    """Evaluate versioned rules against facts at a UTC second timestamp.
+
+    Returns ``(decision, trace)`` where ``trace`` lists every matching rule as
+    ``id@ver`` in ranking order and ``decision`` is the top rule's ``result``
+    (``None`` with an empty trace when nothing matches).
+    """
+    matched = _matched_rules(at, facts, rules)
     if not matched:
         return None, []
     trace = [f"{rule['id']}@{rule['ver']}" for rule in matched]
