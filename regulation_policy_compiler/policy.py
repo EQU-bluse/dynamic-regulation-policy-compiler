@@ -118,6 +118,14 @@ def _effective_rules(at: str, rules: list[dict[str, Any]]) -> list[dict[str, Any
     return ranked
 
 
+def _matches(rule: dict[str, Any], facts: dict[str, bool]) -> bool:
+    """Return whether ``rule``'s ``when`` condition holds under ``facts``."""
+    when = rule["when"]
+    return when is None or all(
+        key in facts and facts[key] == value for key, value in when.items()
+    )
+
+
 def _matched_rules(
     at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -128,12 +136,7 @@ def _matched_rules(
     """
     _check_fact_map(facts, "facts")
     ranked = _effective_rules(at, rules)
-    return [
-        rule
-        for rule in ranked
-        if rule["when"] is None
-        or all(key in facts and facts[key] == value for key, value in rule["when"].items())
-    ]
+    return [rule for rule in ranked if _matches(rule, facts)]
 
 
 def evaluate(
@@ -166,39 +169,34 @@ def _conditions_compatible(a: dict[str, bool] | None, b: dict[str, bool] | None)
     return True
 
 
-def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
-    """Compile the rules effective at ``at`` into rules and conflicts.
+def _snapshot_rule(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep-copied rule snapshot with stable key order.
 
-    Reuses the full validation of :func:`evaluate` for ``at`` and ``rules``
-    (raising ``ValueError`` on anything invalid), keeps rules in their
-    ``[from, to)`` window, retains only the highest ``ver`` per
-    ``(source, id)``, and orders the survivors with :func:`evaluate`'s ranking.
-
-    ``conflicts`` lists, for ranked indices ``i < j``, pairs whose results
-    differ and whose ``when`` conditions can hold simultaneously; the earlier
-    rule is the winner. The returned structure is a deep copy with stable key
-    order.
+    Keys are ordered ``id, ver, source, priority, from, to, when, result``
+    and ``when`` keys are sorted in Unicode code point order.
     """
-    ranked = _effective_rules(at, rules)
+    when = rule["when"]
+    if when is not None:
+        when = {key: when[key] for key in sorted(when)}
+    return {
+        "id": rule["id"],
+        "ver": rule["ver"],
+        "source": rule["source"],
+        "priority": rule["priority"],
+        "from": rule["from"],
+        "to": rule["to"],
+        "when": when,
+        "result": rule["result"],
+    }
 
-    compiled_rules: list[dict[str, Any]] = []
-    for rule in ranked:
-        when = rule["when"]
-        if when is not None:
-            when = {key: when[key] for key in sorted(when)}
-        compiled_rules.append(
-            {
-                "id": rule["id"],
-                "ver": rule["ver"],
-                "source": rule["source"],
-                "priority": rule["priority"],
-                "from": rule["from"],
-                "to": rule["to"],
-                "when": when,
-                "result": rule["result"],
-            }
-        )
 
+def _find_conflicts(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """List conflicts between ranked rules as ``winner``/``loser`` triples.
+
+    For ranked indices ``i < j``, a pair conflicts when the results differ
+    and the ``when`` conditions can hold simultaneously; the earlier rule is
+    the winner.
+    """
     conflicts: list[dict[str, Any]] = []
     for i in range(len(ranked)):
         winner = ranked[i]
@@ -213,5 +211,62 @@ def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
                         "loser": [loser["source"], loser["id"], loser["ver"]],
                     }
                 )
+    return conflicts
 
+
+def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compile the rules effective at ``at`` into rules and conflicts.
+
+    Reuses the full validation of :func:`evaluate` for ``at`` and ``rules``
+    (raising ``ValueError`` on anything invalid), keeps rules in their
+    ``[from, to)`` window, retains only the highest ``ver`` per
+    ``(source, id)``, and orders the survivors with :func:`evaluate`'s ranking.
+
+    ``conflicts`` lists, for ranked indices ``i < j``, pairs whose results
+    differ and whose ``when`` conditions can hold simultaneously; the earlier
+    rule is the winner. The returned structure is a deep copy with stable key
+    order.
+    """
+    ranked = _effective_rules(at, rules)
+    compiled_rules = [_snapshot_rule(rule) for rule in ranked]
+    conflicts = _find_conflicts(ranked)
     return {"at": at, "rules": compiled_rules, "conflicts": conflicts}
+
+
+def explain(
+    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Explain the decision :func:`evaluate` reaches for the same inputs.
+
+    Applies exactly :func:`evaluate`'s validation (raising ``ValueError`` on
+    anything invalid), effective-window selection, latest-version retention,
+    ranking, and matching, without mutating the inputs. The result is a deep
+    copy with keys ``at``, ``decision``, ``trace``, ``basis``, ``conflicts``;
+    ``decision`` and ``trace`` are exactly :func:`evaluate`'s outputs.
+
+    When nothing matches, ``basis`` is ``None`` and ``conflicts`` is empty.
+    Otherwise ``basis`` is a snapshot of the top-ranked matching rule and
+    ``conflicts`` keeps, in original order, the :func:`compile_rules`
+    conflicts whose winner or loser equals
+    ``[basis.source, basis.id, basis.ver]``.
+    """
+    _check_fact_map(facts, "facts")
+    ranked = _effective_rules(at, rules)
+    matched = [rule for rule in ranked if _matches(rule, facts)]
+    if not matched:
+        return {"at": at, "decision": None, "trace": [], "basis": None, "conflicts": []}
+    basis = _snapshot_rule(matched[0])
+    basis_key = [basis["source"], basis["id"], basis["ver"]]
+    conflicts = [
+        conflict
+        for conflict in _find_conflicts(ranked)
+        if conflict["winner"] == basis_key or conflict["loser"] == basis_key
+    ]
+    trace = [f"{rule['id']}@{rule['ver']}" for rule in matched]
+    return {
+        "at": at,
+        "decision": matched[0]["result"],
+        "trace": trace,
+        "basis": basis,
+        "conflicts": conflicts,
+    }
