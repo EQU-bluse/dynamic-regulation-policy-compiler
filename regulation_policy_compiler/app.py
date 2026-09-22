@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from .history import DecisionHistory
+from .history import DecisionHistory, verify_audit
 from .policy import (
     _check_fact_map,
     _check_non_empty_str,
@@ -30,6 +30,7 @@ H: DecisionHistory | None = (
 _POST_KEYS = {"at", "facts", "rules"}
 _COMPILE_KEYS = {"at", "rules"}
 _COMPARE_KEYS = {"from", "to", "facts", "rules"}
+_VERIFY_KEYS = {"report", "expected"}
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -179,6 +180,21 @@ def get_evolution(record_id: str, request: Request) -> Response:
     except OSError:
         return _history_unavailable()
     return _record_response(report)
+
+
+@app.post("/audits/verify")
+async def verify_audit_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_audit(body["report"], body["expected"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
 
 
 @app.get("/decisions/{record_id}/audit")

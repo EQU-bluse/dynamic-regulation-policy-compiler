@@ -15,7 +15,11 @@ _RECORD_KEYS = ("id", "at", "decision", "trace", "basis")
 _BASIS_KEYS = ("id", "ver", "source", "priority", "from", "to", "when", "result")
 _EVOLUTION_FIELDS = ("decision", "trace", "basis")
 _AUDIT_PAYLOAD_KEYS = ("at", "decision", "trace", "basis")
+_AUDIT_ENTRY_KEYS = ("at", "decision", "trace", "basis", "previous", "digest")
+_AUDIT_REPORT_KEYS = ("id", "start", "end", "root", "entries")
+_AUDIT_EXPECTED_KEYS = ("id", "start", "end", "root")
 _AUDIT_GENESIS = "0" * 64
+_HEX_DIGITS = frozenset("0123456789abcdef")
 
 
 def _check_trace_entry(value: Any, field: str) -> str:
@@ -81,6 +85,124 @@ def _audit_digest(previous: str, entry: dict[str, Any]) -> str:
     payload = {key: entry[key] for key in _AUDIT_PAYLOAD_KEYS}
     content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(previous.encode("ascii") + content.encode("utf-8")).hexdigest()
+
+
+def _check_hex64(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in _HEX_DIGITS for char in value)
+    ):
+        raise ValueError(f"{field} must be 64 lowercase hexadecimal characters")
+    return value
+
+
+def _check_time_window(start: Any, end: Any, field: str) -> None:
+    _check_time(start, f"{field}.start")
+    _check_time(end, f"{field}.end")
+    if start > end:
+        raise ValueError(f"{field}.start must not be after {field}.end")
+
+
+def _validate_audit_entry(entry: Any, index: int) -> dict[str, Any]:
+    """Validate one audit entry and return a normalized deep copy of it."""
+    field = f"entries[{index}]"
+    if not isinstance(entry, dict) or set(entry) != set(_AUDIT_ENTRY_KEYS):
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys "
+            "at, decision, trace, basis, previous, digest"
+        )
+    _check_time(entry["at"], f"{field}.at")
+    decision = entry["decision"]
+    if decision is not None and not isinstance(decision, str):
+        raise ValueError(f"{field}.decision must be a string or null")
+    trace = entry["trace"]
+    if not isinstance(trace, list):
+        raise ValueError(f"{field}.trace must be a list of id@ver strings")
+    for position, item in enumerate(trace):
+        _check_trace_entry(item, f"{field}.trace[{position}]")
+    basis = entry["basis"]
+    if basis is not None:
+        try:
+            _validate_rules([basis])
+        except ValueError as exc:
+            raise ValueError(f"{field}.basis is not a valid rule: {exc}") from exc
+        basis = _snapshot_basis(basis)
+    _check_hex64(entry["previous"], f"{field}.previous")
+    _check_hex64(entry["digest"], f"{field}.digest")
+    return {
+        "at": entry["at"],
+        "decision": copy.deepcopy(decision),
+        "trace": copy.deepcopy(trace),
+        "basis": basis,
+        "previous": entry["previous"],
+        "digest": entry["digest"],
+    }
+
+
+def verify_audit(report: Any, expected: Any) -> bool:
+    """Verify an audit report against an expected summary by recomputation.
+
+    ``report`` must be a dict with exactly the keys ``id, start, end, root,
+    entries``; ``id`` a non-empty string, ``start``/``end`` valid UTC seconds
+    with ``start <= end``, and ``entries`` a non-empty list whose ``at``
+    values are strictly increasing and lie in the closed interval
+    ``[start, end]``. Each entry must have exactly the keys ``at, decision,
+    trace, basis, previous, digest``; the first four follow the audit entry
+    contract, and ``previous``/``digest`` must be 64 lowercase hexadecimal
+    characters. ``expected`` must have exactly the keys ``id, start, end,
+    root`` and is validated the same way. Any violation raises ``ValueError``.
+
+    Returns ``False`` when the shared fields differ between ``report`` and
+    ``expected``. Otherwise each entry's ``basis`` (and its ``when`` keys) is
+    normalized to the canonical key order and the chain is recomputed exactly
+    as :meth:`DecisionHistory.audit` defines it: the first ``previous`` is 64
+    ASCII ``0`` characters, every later ``previous`` is the preceding entry's
+    ``digest``, and ``digest`` is the lowercase hexadecimal SHA-256 of
+    ``previous``'s ASCII bytes immediately followed by ``C``. Any chain,
+    digest, or root mismatch returns ``False``; otherwise ``True``.
+
+    The function touches neither history nor files and does not mutate its
+    inputs.
+    """
+    if not isinstance(report, dict) or set(report) != set(_AUDIT_REPORT_KEYS):
+        raise ValueError(
+            "report must be a dict with exactly the keys id, start, end, root, entries"
+        )
+    _check_non_empty_str(report["id"], "report.id")
+    _check_time_window(report["start"], report["end"], "report")
+    _check_hex64(report["root"], "report.root")
+    entries = report["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("report.entries must be a non-empty list")
+    normalized: list[dict[str, Any]] = []
+    previous_at: str | None = None
+    for index, entry in enumerate(entries):
+        normalized.append(_validate_audit_entry(entry, index))
+        at = entry["at"]
+        if previous_at is not None and at <= previous_at:
+            raise ValueError("report.entries must be strictly increasing in at")
+        if not report["start"] <= at <= report["end"]:
+            raise ValueError(f"entries[{index}].at lies outside [start, end]")
+        previous_at = at
+    if not isinstance(expected, dict) or set(expected) != set(_AUDIT_EXPECTED_KEYS):
+        raise ValueError(
+            "expected must be a dict with exactly the keys id, start, end, root"
+        )
+    _check_non_empty_str(expected["id"], "expected.id")
+    _check_time_window(expected["start"], expected["end"], "expected")
+    _check_hex64(expected["root"], "expected.root")
+    for key in _AUDIT_EXPECTED_KEYS:
+        if report[key] != expected[key]:
+            return False
+    previous = _AUDIT_GENESIS
+    for entry in normalized:
+        if entry["previous"] != previous:
+            return False
+        if entry["digest"] != _audit_digest(previous, entry):
+            return False
+        previous = entry["digest"]
+    return report["root"] == previous
 
 
 class DecisionHistory:
