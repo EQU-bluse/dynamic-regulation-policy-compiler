@@ -310,3 +310,72 @@ def compare_decisions(
         "before": before,
         "after": after,
     }
+
+
+def decision_timeline(
+    start: str,
+    end: str,
+    facts: dict[str, bool],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Explain how the decision evolves across the rule boundaries in a range.
+
+    ``start`` and ``end`` must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``start <= end``; ``facts`` and ``rules``
+    are validated exactly as in :func:`explain`. Any type, time,
+    rule-structure, or ordering violation raises ``ValueError`` without
+    mutating the inputs.
+
+    The candidate timestamps are ``start`` plus every rule ``from`` and
+    non-``None`` ``to`` falling in ``(start, end]``, deduplicated and sorted
+    ascending; :func:`explain` is called at each candidate. The first point
+    is always kept; a later point is kept only when it differs from the
+    previously kept point.
+
+    Returns a deep copy with keys ``start``, ``end``, ``points``. Each point
+    has keys ``at``, ``decision``, ``trace``, ``basis``, ``conflicts``,
+    ``changes``; the first five are exactly the :func:`explain` values at
+    ``at``. The first point's ``changes`` is ``[]``; a later point's
+    ``changes`` lists, in the order ``decision``, ``trace``, ``basis``,
+    ``conflicts``, the fields that differ from the previously kept point.
+    """
+    _check_time(start, "start")
+    _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    first = explain(start, facts, rules)
+    candidates = {start}
+    for rule in rules:
+        for boundary in (rule["from"], rule["to"]):
+            if boundary is not None and start < boundary <= end:
+                candidates.add(boundary)
+    points = [
+        {
+            "at": first["at"],
+            "decision": first["decision"],
+            "trace": first["trace"],
+            "basis": first["basis"],
+            "conflicts": first["conflicts"],
+            "changes": [],
+        }
+    ]
+    previous = first
+    for at in sorted(candidates - {start}):
+        report = explain(at, facts, rules)
+        changes = [
+            field for field in _COMPARE_FIELDS if previous[field] != report[field]
+        ]
+        if not changes:
+            continue
+        points.append(
+            {
+                "at": report["at"],
+                "decision": report["decision"],
+                "trace": report["trace"],
+                "basis": report["basis"],
+                "conflicts": report["conflicts"],
+                "changes": changes,
+            }
+        )
+        previous = report
+    return {"start": start, "end": end, "points": points}
