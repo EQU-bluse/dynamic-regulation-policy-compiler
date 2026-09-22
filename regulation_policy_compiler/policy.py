@@ -422,6 +422,61 @@ def policy_schedule(
     return {"start": start, "end": end, "points": points}
 
 
+_SCHEDULE_ATTESTATION_GENESIS = "0" * 64
+
+
+def policy_schedule_attestation(
+    start: str, end: str, rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Attest a :func:`policy_schedule` result with a SHA-256 hash chain.
+
+    ``start``, ``end``, and ``rules`` are validated exactly as in
+    :func:`policy_schedule`; any type, time, rule-structure, or ordering
+    violation raises ``ValueError`` without mutating the inputs.
+
+    Let ``schedule`` be the :func:`policy_schedule` result. Returns a deep
+    copy with keys ``start``, ``end``, ``root``, ``points``; ``start`` and
+    ``end`` come from ``schedule`` and ``points`` keeps ``schedule``'s point
+    order. Each point has keys ``at``, ``rules``, ``conflicts``, ``delta``,
+    ``previous``, ``digest``; the first four are exactly the same-named
+    :func:`policy_schedule` values and keep that contract at every level.
+
+    Let ``C`` be the UTF-8 bytes of the current point restricted to
+    ``at``, ``rules``, ``conflicts``, ``delta`` in that key order, serialized
+    with ``json.dumps(..., ensure_ascii=False, separators=(',', ':'))`` (no
+    trailing newline). The first point's ``previous`` is 64 ASCII ``0``
+    characters; every later point's ``previous`` is the preceding point's
+    ``digest``. ``digest`` is the lowercase 64-char hex SHA-256 of
+    ``previous``'s ASCII bytes immediately followed by ``C``; ``root`` is the
+    last point's ``digest``. Equal-valued inputs yield byte-identical
+    results.
+    """
+    schedule = policy_schedule(start, end, rules)
+    points: list[dict[str, Any]] = []
+    previous = _SCHEDULE_ATTESTATION_GENESIS
+    for point in schedule["points"]:
+        payload = {
+            "at": copy.deepcopy(point["at"]),
+            "rules": copy.deepcopy(point["rules"]),
+            "conflicts": copy.deepcopy(point["conflicts"]),
+            "delta": copy.deepcopy(point["delta"]),
+        }
+        content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        digest = hashlib.sha256(
+            previous.encode("ascii") + content.encode("utf-8")
+        ).hexdigest()
+        payload["previous"] = previous
+        payload["digest"] = digest
+        points.append(payload)
+        previous = digest
+    return {
+        "start": schedule["start"],
+        "end": schedule["end"],
+        "root": previous,
+        "points": points,
+    }
+
+
 def explain(
     at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
 ) -> dict[str, Any]:
