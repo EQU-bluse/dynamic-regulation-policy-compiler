@@ -233,6 +233,104 @@ def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
     return {"at": at, "rules": compiled_rules, "conflicts": conflicts}
 
 
+_SOURCE_ORDER = {"law": 0, "org": 1}
+
+
+def _conflict_identity(conflict: dict[str, Any]) -> tuple[str, str, int, str, str, int]:
+    """Return the six-element identity of a conflict: winner then loser."""
+    return tuple(conflict["winner"]) + tuple(conflict["loser"])
+
+
+def policy_delta(
+    from_at: str, to_at: str, rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Diff the :func:`compile_rules` results at two UTC timestamps.
+
+    Both timestamps must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``from_at <= to_at``; ``rules`` is
+    validated exactly as in :func:`compile_rules`. Any type, time,
+    rule-structure, or ordering violation raises ``ValueError`` without
+    mutating the inputs.
+
+    The rules effective at each timestamp are compiled separately and
+    identified by ``(source, id)``. Returns a deep copy with keys ``from``,
+    ``to``, ``rules``, ``conflicts``. ``rules`` lists, ordered by ``source``
+    (``law`` before ``org``) then ``id`` in Unicode code point order, one
+    entry per rule that was ``added`` (only at ``to_at``), ``removed`` (only
+    at ``from_at``), or ``updated`` (present at both but with a different
+    compiled value); identical rules are omitted. Each entry has keys
+    ``source``, ``id``, ``kind``, ``before``, ``after``; ``before``/``after``
+    are the corresponding compiled rule snapshots (with :func:`compile_rules`
+    key order and ``when`` sorting) or ``None``.
+
+    ``conflicts`` has keys ``added``, ``removed``. A conflict's identity is
+    the six-element value of its ``winner`` array followed by its ``loser``
+    array. ``added`` lists, in the ``to_at`` compile order, the conflicts
+    present only at ``to_at``; ``removed`` lists, in the ``from_at`` compile
+    order, those present only at ``from_at``. Each conflict keeps the keys
+    ``winner``, ``loser`` with deep-copied values. When nothing differs,
+    ``rules`` is empty and both conflict arrays are empty.
+    """
+    _check_time(from_at, "from_at")
+    _check_time(to_at, "to_at")
+    if from_at > to_at:
+        raise ValueError(f"from_at must not be after to_at: {from_at!r} > {to_at!r}")
+    before_compiled = compile_rules(from_at, rules)
+    after_compiled = compile_rules(to_at, rules)
+
+    before_rules = {
+        (rule["source"], rule["id"]): rule for rule in before_compiled["rules"]
+    }
+    after_rules = {
+        (rule["source"], rule["id"]): rule for rule in after_compiled["rules"]
+    }
+    entries: list[dict[str, Any]] = []
+    for key in sorted(
+        set(before_rules) | set(after_rules),
+        key=lambda item: (_SOURCE_ORDER[item[0]], item[1]),
+    ):
+        before = before_rules.get(key)
+        after = after_rules.get(key)
+        if before is not None and after is not None and before == after:
+            continue
+        if before is None:
+            kind = "added"
+        elif after is None:
+            kind = "removed"
+        else:
+            kind = "updated"
+        entries.append(
+            {
+                "source": key[0],
+                "id": key[1],
+                "kind": kind,
+                "before": before,
+                "after": after,
+            }
+        )
+
+    before_conflicts = before_compiled["conflicts"]
+    after_conflicts = after_compiled["conflicts"]
+    before_identities = {_conflict_identity(c) for c in before_conflicts}
+    after_identities = {_conflict_identity(c) for c in after_conflicts}
+    added_conflicts = [
+        {"winner": list(c["winner"]), "loser": list(c["loser"])}
+        for c in after_conflicts
+        if _conflict_identity(c) not in before_identities
+    ]
+    removed_conflicts = [
+        {"winner": list(c["winner"]), "loser": list(c["loser"])}
+        for c in before_conflicts
+        if _conflict_identity(c) not in after_identities
+    ]
+    return {
+        "from": from_at,
+        "to": to_at,
+        "rules": entries,
+        "conflicts": {"added": added_conflicts, "removed": removed_conflicts},
+    }
+
+
 def explain(
     at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
 ) -> dict[str, Any]:
