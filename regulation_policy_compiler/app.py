@@ -22,6 +22,7 @@ from .policy import (
     explain,
     policy_attestation,
     policy_schedule,
+    policy_schedule_attestation,
 )
 
 app = FastAPI(title="Dynamic Regulation Policy Compiler")
@@ -103,6 +104,23 @@ async def policy_schedule_endpoint(request: Request) -> Response:
         return _invalid_request()
     try:
         report = policy_schedule(body["start"], body["end"], body["rules"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/rules/schedule/attest")
+async def policy_schedule_attestation_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _SCHEDULE_KEYS:
+        return _invalid_request()
+    try:
+        report = policy_schedule_attestation(
+            body["start"], body["end"], body["rules"]
+        )
     except ValueError:
         return _invalid_request()
     return _record_response(report)
