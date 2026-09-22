@@ -270,3 +270,43 @@ def explain(
         "basis": basis,
         "conflicts": conflicts,
     }
+
+
+_COMPARE_FIELDS = ("decision", "trace", "basis", "conflicts")
+
+
+def compare_decisions(
+    from_at: str,
+    to_at: str,
+    facts: dict[str, bool],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare the decisions :func:`explain` reaches at two UTC timestamps.
+
+    Both timestamps must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``from_at <= to_at``; ``facts`` and
+    ``rules`` are validated exactly as in :func:`explain`. Any type, time,
+    rule-structure, or ordering violation raises ``ValueError`` without
+    mutating the inputs.
+
+    Returns a deep copy with keys ``from``, ``to``, ``changes``, ``before``,
+    ``after``. ``before``/``after`` are the full :func:`explain` results for
+    ``from_at``/``to_at`` and are independent of each other. ``changes``
+    lists, in the order ``decision``, ``trace``, ``basis``, ``conflicts``,
+    the fields whose values differ between the two snapshots (empty when the
+    snapshots are identical).
+    """
+    _check_time(from_at, "from_at")
+    _check_time(to_at, "to_at")
+    if from_at > to_at:
+        raise ValueError(f"from_at must not be after to_at: {from_at!r} > {to_at!r}")
+    before = explain(from_at, facts, rules)
+    after = explain(to_at, facts, rules)
+    changes = [field for field in _COMPARE_FIELDS if before[field] != after[field]]
+    return {
+        "from": from_at,
+        "to": to_at,
+        "changes": changes,
+        "before": before,
+        "after": after,
+    }

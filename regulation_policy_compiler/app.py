@@ -15,6 +15,7 @@ from .policy import (
     _check_non_empty_str,
     _check_time,
     _validate_rules,
+    compare_decisions,
     compile_rules,
     explain,
 )
@@ -28,6 +29,7 @@ H: DecisionHistory | None = (
 
 _POST_KEYS = {"at", "facts", "rules"}
 _COMPILE_KEYS = {"at", "rules"}
+_COMPARE_KEYS = {"from", "to", "facts", "rules"}
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -77,6 +79,23 @@ async def explain_decision(request: Request) -> Response:
         return _invalid_request()
     try:
         report = explain(body["at"], body["facts"], body["rules"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/decision-changes")
+async def decision_changes(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _COMPARE_KEYS:
+        return _invalid_request()
+    try:
+        report = compare_decisions(
+            body["from"], body["to"], body["facts"], body["rules"]
+        )
     except ValueError:
         return _invalid_request()
     return _record_response(report)
