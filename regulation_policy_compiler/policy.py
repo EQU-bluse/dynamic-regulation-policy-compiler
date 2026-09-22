@@ -548,6 +548,22 @@ def decision_timeline(
 _CASE_KEYS = frozenset({"id", "facts"})
 
 
+def _validate_cases(cases: Any) -> list[dict[str, Any]]:
+    if not isinstance(cases, list):
+        raise ValueError("cases must be a list of case dicts")
+    seen_ids: set[str] = set()
+    for index, case in enumerate(cases):
+        field = f"cases[{index}]"
+        if not isinstance(case, dict) or set(case) != _CASE_KEYS:
+            raise ValueError(f"{field} must be a dict with exactly the keys id, facts")
+        case_id = _check_non_empty_str(case["id"], f"{field}.id")
+        if case_id in seen_ids:
+            raise ValueError(f"duplicate case id: {case_id!r}")
+        seen_ids.add(case_id)
+        _check_fact_map(case["facts"], f"{field}.facts")
+    return cases
+
+
 def decision_impact(
     from_at: str,
     to_at: str,
@@ -579,18 +595,7 @@ def decision_impact(
     _check_time(to_at, "to_at")
     if from_at > to_at:
         raise ValueError(f"from_at must not be after to_at: {from_at!r} > {to_at!r}")
-    if not isinstance(cases, list):
-        raise ValueError("cases must be a list of case dicts")
-    seen_ids: set[str] = set()
-    for index, case in enumerate(cases):
-        field = f"cases[{index}]"
-        if not isinstance(case, dict) or set(case) != _CASE_KEYS:
-            raise ValueError(f"{field} must be a dict with exactly the keys id, facts")
-        case_id = _check_non_empty_str(case["id"], f"{field}.id")
-        if case_id in seen_ids:
-            raise ValueError(f"duplicate case id: {case_id!r}")
-        seen_ids.add(case_id)
-        _check_fact_map(case["facts"], f"{field}.facts")
+    _validate_cases(cases)
 
     policy = policy_delta(from_at, to_at, rules)
     entries: list[dict[str, Any]] = []
@@ -607,3 +612,86 @@ def decision_impact(
             }
         )
     return {"from": from_at, "to": to_at, "policy": policy, "cases": entries}
+
+
+def decision_matrix(
+    start: str,
+    end: str,
+    cases: list[dict[str, Any]],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Explain a set of fact cases across the rule boundaries in a range.
+
+    ``start`` and ``end`` must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``start <= end``; ``rules`` is validated
+    exactly as in :func:`compile_rules`. ``cases`` must be a list whose items
+    are dicts with exactly the keys ``id`` and ``facts``; ``id`` is a
+    non-empty string unique across the list and ``facts`` is validated
+    exactly as in :func:`explain`. Any type, time, case-structure, or
+    rule-structure violation raises ``ValueError`` without mutating the
+    inputs. An empty ``cases`` list is valid.
+
+    The candidate timestamps are ``start`` plus every rule ``from`` and
+    non-``None`` ``to`` falling in ``(start, end]``, deduplicated and sorted
+    ascending. At each candidate, :func:`explain` is called for every case in
+    ``id`` Unicode code point order. The first point is always kept; a later
+    point is kept only when some case's ``decision``, ``trace``, ``basis``,
+    or ``conflicts`` differs from the previously kept point.
+
+    Returns a deep copy with keys ``start``, ``end``, ``points``. Each point
+    has keys ``at``, ``changes``, ``cases``. The first point's ``changes`` is
+    ``[]``; a later point's ``changes`` lists the ids of the cases that
+    changed relative to the previously kept point, in the case order above.
+    ``cases`` lists one entry per case in that same order, with keys ``id``,
+    ``decision``, ``trace``, ``basis``, ``conflicts``; the last four are
+    exactly the same-named :func:`explain` values at ``at`` and keep that
+    contract at every level. With an empty ``cases`` list only the ``start``
+    point is returned, with empty ``changes`` and ``cases``.
+    """
+    _check_time(start, "start")
+    _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    _validate_cases(cases)
+    _validate_rules(rules)
+
+    ordered_cases = sorted(cases, key=lambda item: item["id"])
+
+    def explain_cases(at: str) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for case in ordered_cases:
+            report = explain(at, case["facts"], rules)
+            entries.append(
+                {
+                    "id": case["id"],
+                    "decision": report["decision"],
+                    "trace": report["trace"],
+                    "basis": report["basis"],
+                    "conflicts": report["conflicts"],
+                }
+            )
+        return entries
+
+    candidates = {start}
+    for rule in rules:
+        for boundary in (rule["from"], rule["to"]):
+            if boundary is not None and start < boundary <= end:
+                candidates.add(boundary)
+
+    first_cases = explain_cases(start)
+    points = [{"at": start, "changes": [], "cases": first_cases}]
+    previous_cases = first_cases
+    for at in sorted(candidates - {start}):
+        current_cases = explain_cases(at)
+        changes = [
+            entry["id"]
+            for entry, previous in zip(current_cases, previous_cases)
+            if any(
+                previous[field] != entry[field] for field in _COMPARE_FIELDS
+            )
+        ]
+        if not changes:
+            continue
+        points.append({"at": at, "changes": changes, "cases": current_cases})
+        previous_cases = current_cases
+    return {"start": start, "end": end, "points": points}
