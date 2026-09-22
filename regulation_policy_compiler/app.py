@@ -37,6 +37,7 @@ _COMPARE_KEYS = {"from", "to", "facts", "rules"}
 _TIMELINE_KEYS = {"start", "end", "facts", "rules"}
 _IMPACT_KEYS = {"from", "to", "cases", "rules"}
 _VERIFY_KEYS = {"report", "expected"}
+_BUNDLE_KEYS = {"record_ids", "start", "end"}
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -279,3 +280,38 @@ def get_audit(record_id: str, request: Request) -> Response:
     except OSError:
         return _history_unavailable()
     return _record_response(report)
+
+
+@app.post("/audits/bundle")
+async def audit_bundle_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _BUNDLE_KEYS:
+        return _invalid_request()
+    try:
+        record_ids = body["record_ids"]
+        if not isinstance(record_ids, list) or not record_ids:
+            raise ValueError("record_ids must be a non-empty list of record id strings")
+        seen: set[str] = set()
+        for index, record_id in enumerate(record_ids):
+            _check_non_empty_str(record_id, f"record_ids[{index}]")
+            if record_id in seen:
+                raise ValueError("record_ids must not contain duplicates")
+            seen.add(record_id)
+        _check_time(body["start"], "start")
+        _check_time(body["end"], "end")
+        if body["start"] > body["end"]:
+            raise ValueError("start must not be after end")
+    except ValueError:
+        return _invalid_request()
+    if H is None:
+        return _history_unavailable()
+    try:
+        bundle = H.audit_bundle(record_ids, body["start"], body["end"])
+    except KeyError:
+        return _error(404, "record not found")
+    except OSError:
+        return _history_unavailable()
+    return _record_response(bundle)
