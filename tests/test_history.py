@@ -190,3 +190,71 @@ def test_failed_write_keeps_old_file(tmp_path, monkeypatch):
     # The failed record was rolled back in memory as well.
     with pytest.raises(KeyError):
         history.replay("rec-2", "2021-01-01T00:00:00Z")
+
+
+def test_evolution_lists_entries_in_interval_with_changes(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [_rule(result="first")])
+    history.record("rec-1", "2021-03-01T00:00:00Z", {}, [_rule(result="second", ver=2)])
+    history.record("rec-1", "2021-06-01T00:00:00Z", {}, [_rule(result="second", ver=2)])
+    history.record("rec-1", "2021-09-01T00:00:00Z", {}, [])
+    history.record("rec-2", "2021-03-01T00:00:00Z", {}, [_rule(result="other")])
+    report = history.evolution("rec-1", "2021-03-01T00:00:00Z", "2021-09-01T00:00:00Z")
+    assert list(report) == ["id", "start", "end", "entries"]
+    assert report["id"] == "rec-1"
+    assert report["start"] == "2021-03-01T00:00:00Z"
+    assert report["end"] == "2021-09-01T00:00:00Z"
+    assert [entry["at"] for entry in report["entries"]] == [
+        "2021-03-01T00:00:00Z",
+        "2021-06-01T00:00:00Z",
+        "2021-09-01T00:00:00Z",
+    ]
+    for entry in report["entries"]:
+        assert list(entry) == ["at", "decision", "trace", "basis", "changes"]
+    assert [entry["changes"] for entry in report["entries"]] == [
+        [],
+        [],
+        ["decision", "trace", "basis"],
+    ]
+
+
+def test_evolution_closed_interval_and_single_entry(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [_rule()])
+    history.record("rec-1", "2021-06-01T00:00:00Z", {}, [])
+    report = history.evolution("rec-1", "2021-06-01T00:00:00Z", "2021-06-01T00:00:00Z")
+    assert len(report["entries"]) == 1
+    assert report["entries"][0]["at"] == "2021-06-01T00:00:00Z"
+    assert report["entries"][0]["changes"] == []
+
+
+def test_evolution_rejects_bad_input_and_empty_range(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [])
+    for bad_id in ("", None, 123):
+        with pytest.raises(ValueError):
+            history.evolution(bad_id, "2021-01-01T00:00:00Z", "2021-01-01T00:00:00Z")
+    with pytest.raises(ValueError):
+        history.evolution("rec-1", "bad", "2021-01-01T00:00:00Z")
+    with pytest.raises(ValueError):
+        history.evolution("rec-1", "2021-01-01T00:00:00Z", "bad")
+    with pytest.raises(ValueError):
+        history.evolution("rec-1", "2021-06-01T00:00:00Z", "2021-01-01T00:00:00Z")
+    with pytest.raises(KeyError):
+        history.evolution("rec-1", "2022-01-01T00:00:00Z", "2022-02-01T00:00:00Z")
+    with pytest.raises(KeyError):
+        history.evolution("missing", "2020-01-01T00:00:00Z", "2022-01-01T00:00:00Z")
+
+
+def test_evolution_returns_a_deep_copy_and_does_not_persist(tmp_path):
+    path = tmp_path / "history.json"
+    history = DecisionHistory(str(path))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [_rule()])
+    before = path.read_bytes()
+    report = history.evolution("rec-1", "2021-01-01T00:00:00Z", "2021-01-01T00:00:00Z")
+    report["entries"][0]["decision"] = "tampered"
+    report["entries"][0]["basis"]["result"] = "tampered"
+    again = history.evolution("rec-1", "2021-01-01T00:00:00Z", "2021-01-01T00:00:00Z")
+    assert again["entries"][0]["decision"] == "allow"
+    assert again["entries"][0]["basis"]["result"] == "allow"
+    assert path.read_bytes() == before

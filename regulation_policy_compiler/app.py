@@ -150,3 +150,31 @@ def get_decision(record_id: str, at: str | None = None) -> Response:
     except OSError:
         return _history_unavailable()
     return _record_response(record)
+
+
+@app.get("/decisions/{record_id}/evolution")
+def get_decision_evolution(record_id: str, request: Request) -> Response:
+    params = request.query_params.multi_items()
+    try:
+        _check_non_empty_str(record_id, "record_id")
+        if sorted(key for key, _ in params) != ["end", "start"]:
+            raise ValueError("query must contain exactly one start and one end")
+        start = request.query_params["start"]
+        end = request.query_params["end"]
+        _check_time(start, "start")
+        _check_time(end, "end")
+        if start > end:
+            raise ValueError("start must not be after end")
+    except ValueError:
+        return _invalid_request()
+    if H is None:
+        return _history_unavailable()
+    try:
+        report = H.evolution(record_id, start, end)
+    except KeyError:
+        return _error(404, "record not found")
+    except ValueError:
+        return _invalid_request()
+    except OSError:
+        return _history_unavailable()
+    return _record_response(report)
