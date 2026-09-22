@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -13,6 +14,8 @@ from .policy import _check_non_empty_str, _check_time, _matched_rules, _validate
 _RECORD_KEYS = ("id", "at", "decision", "trace", "basis")
 _BASIS_KEYS = ("id", "ver", "source", "priority", "from", "to", "when", "result")
 _EVOLUTION_FIELDS = ("decision", "trace", "basis")
+_AUDIT_PAYLOAD_KEYS = ("at", "decision", "trace", "basis")
+_AUDIT_GENESIS = "0" * 64
 
 
 def _check_trace_entry(value: Any, field: str) -> str:
@@ -46,6 +49,9 @@ def _validate_entry(entry: Any, index: int) -> dict[str, Any]:
             _validate_rules([basis])
         except ValueError as exc:
             raise ValueError(f"{field}.basis is not a valid rule: {exc}") from exc
+        # Normalize the snapshot to the canonical key order in memory so every
+        # history method returns the same basis shape; the file is not rewritten.
+        entry["basis"] = _snapshot_basis(basis)
     return entry
 
 
@@ -69,6 +75,12 @@ def _dump(records: list[dict[str, Any]]) -> bytes:
     ordered = sorted(records, key=lambda entry: (entry["id"], entry["at"]))
     text = json.dumps({"records": ordered}, ensure_ascii=False, separators=(",", ":"))
     return (text + "\n").encode("utf-8")
+
+
+def _audit_digest(previous: str, entry: dict[str, Any]) -> str:
+    payload = {key: entry[key] for key in _AUDIT_PAYLOAD_KEYS}
+    content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(previous.encode("ascii") + content.encode("utf-8")).hexdigest()
 
 
 class DecisionHistory:
@@ -208,3 +220,59 @@ class DecisionHistory:
             )
             previous = entry
         return {"id": record_id, "start": start, "end": end, "entries": entries}
+
+    def audit(self, record_id: str, start: str, end: str) -> dict[str, Any]:
+        """Return a hash-chained audit trail for ``record_id`` over ``[start, end]``.
+
+        Only already-persisted records are read; nothing is recomputed, written,
+        or otherwise mutated. ``record_id`` must be a non-empty string and
+        ``start``/``end`` valid UTC seconds with ``start <= end``; otherwise
+        ``ValueError`` is raised. Matching records are returned in ascending
+        ``at`` order; when none match, ``KeyError`` is raised. The result is a
+        deep copy with keys ``id, start, end, root, entries``; each entry has
+        keys ``at, decision, trace, basis, previous, digest``, the first four
+        following the record contract.
+
+        Let ``C`` be the UTF-8 compact JSON bytes (non-ASCII unescaped, no
+        trailing newline) of the current entry restricted to
+        ``at, decision, trace, basis`` in that key order. The first entry's
+        ``previous`` is 64 ASCII ``0`` characters; every later entry's
+        ``previous`` is the preceding entry's ``digest``. ``digest`` is the
+        lowercase hexadecimal SHA-256 of ``previous``'s ASCII bytes immediately
+        followed by ``C``; ``root`` is the last entry's ``digest``.
+        """
+        _check_non_empty_str(record_id, "record_id")
+        _check_time(start, "start")
+        _check_time(end, "end")
+        if start > end:
+            raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+        matched = [
+            entry
+            for entry in self._records
+            if entry["id"] == record_id and start <= entry["at"] <= end
+        ]
+        if not matched:
+            raise KeyError(record_id)
+        matched.sort(key=lambda entry: entry["at"])
+        entries: list[dict[str, Any]] = []
+        previous = _AUDIT_GENESIS
+        for entry in matched:
+            digest = _audit_digest(previous, entry)
+            entries.append(
+                {
+                    "at": entry["at"],
+                    "decision": copy.deepcopy(entry["decision"]),
+                    "trace": copy.deepcopy(entry["trace"]),
+                    "basis": copy.deepcopy(entry["basis"]),
+                    "previous": previous,
+                    "digest": digest,
+                }
+            )
+            previous = digest
+        return {
+            "id": record_id,
+            "start": start,
+            "end": end,
+            "root": previous,
+            "entries": entries,
+        }
