@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -160,19 +161,9 @@ class DecisionHistory:
             raise KeyError(record_id)
         return copy.deepcopy(best)
 
-    def evolution(self, record_id: str, start: str, end: str) -> dict[str, Any]:
-        """Return stored snapshots for ``record_id`` within the closed ``[start, end]``.
-
-        Only already-persisted records are read; nothing is recomputed, written,
-        or otherwise mutated. ``record_id`` must be a non-empty string and
-        ``start``/``end`` valid UTC seconds with ``start <= end``; otherwise
-        ``ValueError`` is raised. Matching records are returned in ascending
-        ``at`` order; when none match, ``KeyError`` is raised. The result is a
-        deep copy with keys ``id, start, end, entries``; each entry has keys
-        ``at, decision, trace, basis, changes``, where ``changes`` lists, in
-        the order ``decision, trace, basis``, the fields differing from the
-        previous entry (the first entry's ``changes`` is ``[]``).
-        """
+    def _interval_entries(
+        self, record_id: str, start: str, end: str
+    ) -> list[dict[str, Any]]:
         _check_non_empty_str(record_id, "record_id")
         _check_time(start, "start")
         _check_time(end, "end")
@@ -186,6 +177,22 @@ class DecisionHistory:
         if not matched:
             raise KeyError(record_id)
         matched.sort(key=lambda entry: entry["at"])
+        return matched
+
+    def evolution(self, record_id: str, start: str, end: str) -> dict[str, Any]:
+        """Return stored snapshots for ``record_id`` within the closed ``[start, end]``.
+
+        Only already-persisted records are read; nothing is recomputed, written,
+        or otherwise mutated. ``record_id`` must be a non-empty string and
+        ``start``/``end`` valid UTC seconds with ``start <= end``; otherwise
+        ``ValueError`` is raised. Matching records are returned in ascending
+        ``at`` order; when none match, ``KeyError`` is raised. The result is a
+        deep copy with keys ``id, start, end, entries``; each entry has keys
+        ``at, decision, trace, basis, changes``, where ``changes`` lists, in
+        the order ``decision, trace, basis``, the fields differing from the
+        previous entry (the first entry's ``changes`` is ``[]``).
+        """
+        matched = self._interval_entries(record_id, start, end)
         entries: list[dict[str, Any]] = []
         previous: dict[str, Any] | None = None
         for entry in matched:
@@ -208,3 +215,52 @@ class DecisionHistory:
             )
             previous = entry
         return {"id": record_id, "start": start, "end": end, "entries": entries}
+
+    def audit(self, record_id: str, start: str, end: str) -> dict[str, Any]:
+        """Return a hash-chained audit trail for ``record_id`` over ``[start, end]``.
+
+        Validation, closed-interval selection, ascending ``at`` order, deep
+        copies, read-only semantics, and the ``ValueError``/``KeyError``
+        contract are identical to :meth:`evolution`. The result has keys
+        ``id, start, end, root, entries``; each entry has keys
+        ``at, decision, trace, basis, previous, digest``, the first four
+        following the record contract. Let ``C`` be the UTF-8 compact JSON
+        bytes (non-ASCII unescaped, no trailing newline) of the current entry
+        holding only ``at, decision, trace, basis`` in that key order. The
+        first entry's ``previous`` is 64 ASCII ``0`` characters; later entries
+        take the previous entry's ``digest``. ``digest`` is the lowercase hex
+        SHA-256 of ``previous``'s ASCII bytes immediately followed by ``C``;
+        ``root`` is the last entry's ``digest``.
+        """
+        matched = self._interval_entries(record_id, start, end)
+        entries: list[dict[str, Any]] = []
+        previous = "0" * 64
+        for entry in matched:
+            current = {
+                "at": entry["at"],
+                "decision": copy.deepcopy(entry["decision"]),
+                "trace": copy.deepcopy(entry["trace"]),
+                "basis": copy.deepcopy(entry["basis"]),
+            }
+            payload = json.dumps(current, ensure_ascii=False, separators=(",", ":"))
+            digest = hashlib.sha256(
+                previous.encode("ascii") + payload.encode("utf-8")
+            ).hexdigest()
+            entries.append(
+                {
+                    "at": current["at"],
+                    "decision": current["decision"],
+                    "trace": current["trace"],
+                    "basis": current["basis"],
+                    "previous": previous,
+                    "digest": digest,
+                }
+            )
+            previous = digest
+        return {
+            "id": record_id,
+            "start": start,
+            "end": end,
+            "root": previous,
+            "entries": entries,
+        }
