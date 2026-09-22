@@ -270,3 +270,43 @@ def explain(
         "basis": basis,
         "conflicts": conflicts,
     }
+
+
+def compare_decisions(
+    from_at: str,
+    to_at: str,
+    facts: dict[str, bool],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare the decisions :func:`explain` reaches at two UTC timestamps.
+
+    Both timestamps must be valid UTC seconds with ``from_at <= to_at``;
+    ``facts`` and ``rules`` are validated exactly as :func:`explain` does.
+    Any type, time, rule-structure, or ordering error raises ``ValueError``
+    without mutating the inputs.
+
+    Returns a deep copy with keys ``from``, ``to``, ``changes``, ``before``,
+    ``after``. ``before`` and ``after`` are the full :func:`explain` results
+    for ``from_at`` and ``to_at`` and share no mutable state. ``changes``
+    lists, in the order ``decision``, ``trace``, ``basis``, ``conflicts``,
+    the fields whose structural values differ between the two snapshots
+    (empty when they are identical).
+    """
+    _check_time(from_at, "from")
+    _check_time(to_at, "to")
+    if from_at > to_at:
+        raise ValueError("from must not be after to")
+    before = explain(from_at, facts, rules)
+    after = explain(to_at, facts, rules)
+    changes = [
+        field
+        for field in ("decision", "trace", "basis", "conflicts")
+        if before[field] != after[field]
+    ]
+    return {
+        "from": from_at,
+        "to": to_at,
+        "changes": changes,
+        "before": before,
+        "after": after,
+    }
