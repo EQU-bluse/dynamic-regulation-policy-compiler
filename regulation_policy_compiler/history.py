@@ -398,3 +398,55 @@ class DecisionHistory:
             "root": previous,
             "entries": entries,
         }
+
+    def audit_bundle(self, record_ids: Any, start: str, end: str) -> dict[str, Any]:
+        """Return one hash-chained bundle of audit reports over ``[start, end]``.
+
+        Only already-persisted records are read; nothing is recomputed,
+        written, or otherwise mutated. ``record_ids`` must be a non-empty list
+        of unique non-empty strings and ``start``/``end`` valid UTC seconds
+        with ``start <= end``; otherwise ``ValueError`` is raised and the
+        inputs are left untouched. Each id is audited once in ascending
+        Unicode code point order; if any id has no record in the closed
+        interval, ``KeyError`` is raised and no partial result is returned.
+
+        The result is a deep copy with keys ``start, end, root, reports``;
+        ``reports`` holds each id's complete audit result in that same order,
+        preserving the per-report contract. Let ``h0`` be 64 ASCII ``0``
+        characters and ``Pi`` the UTF-8 compact JSON bytes (non-ASCII
+        unescaped, no trailing newline) of the i-th report restricted to
+        ``id, root`` in that key order. ``hi`` is the lowercase hexadecimal
+        SHA-256 of ``h{i-1}``'s ASCII bytes immediately followed by ``Pi``;
+        the bundle ``root`` is ``hn``.
+        """
+        if not isinstance(record_ids, list) or not record_ids:
+            raise ValueError("record_ids must be a non-empty list of record id strings")
+        seen: set[str] = set()
+        for index, record_id in enumerate(record_ids):
+            _check_non_empty_str(record_id, f"record_ids[{index}]")
+            if record_id in seen:
+                raise ValueError(
+                    f"record_ids must not contain duplicates: {record_id!r}"
+                )
+            seen.add(record_id)
+        _check_time(start, "start")
+        _check_time(end, "end")
+        if start > end:
+            raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+        reports = [
+            self.audit(record_id, start, end)
+            for record_id in sorted(record_ids)
+        ]
+        root = _AUDIT_GENESIS
+        for report in reports:
+            payload = json.dumps(
+                {"id": report["id"], "root": report["root"]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            root = hashlib.sha256(
+                root.encode("ascii") + payload.encode("utf-8")
+            ).hexdigest()
+        return copy.deepcopy(
+            {"start": start, "end": end, "root": root, "reports": reports}
+        )
