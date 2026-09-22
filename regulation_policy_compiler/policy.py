@@ -233,6 +233,100 @@ def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
     return {"at": at, "rules": compiled_rules, "conflicts": conflicts}
 
 
+def _conflict_identity(conflict: dict[str, Any]) -> tuple[Any, ...]:
+    """Identify a conflict by the six values of winner followed by loser."""
+    return tuple(conflict["winner"] + conflict["loser"])
+
+
+def policy_delta(
+    from_at: str, to_at: str, rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Diff the policies :func:`compile_rules` produces at two timestamps.
+
+    Both timestamps must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``from_at <= to_at``; ``rules`` are
+    validated exactly as in :func:`compile_rules`. Any type, time,
+    rule-structure, or ordering violation raises ``ValueError`` without
+    mutating the inputs.
+
+    The rules selected at each point are matched by ``(source, id)``. The
+    returned ``rules`` list keeps, sorted by ``source`` (``law`` before
+    ``org``) and then ``id`` in Unicode code point order, one entry per
+    selected rule that was ``added`` (only at ``to_at``), ``removed`` (only
+    at ``from_at``), or ``updated`` (present at both but differing in its
+    full compiled value); identical rules are omitted. Each entry has keys
+    ``source``, ``id``, ``kind``, ``before``, ``after``, where ``before``/
+    ``after`` are the corresponding compiled rule snapshots or ``None``.
+
+    ``conflicts`` has keys ``added`` and ``removed``. A conflict is
+    identified by the six values of its ``winner`` array followed by its
+    ``loser`` array; ``added`` lists, in the ``to_at`` compile's original
+    conflict order, the conflicts present only at ``to_at``, and ``removed``
+    does the same from the ``from_at`` compile. With no differences,
+    ``rules`` is ``[]`` and both conflict lists are empty. The whole result
+    is a deep copy.
+    """
+    _check_time(from_at, "from_at")
+    _check_time(to_at, "to_at")
+    if from_at > to_at:
+        raise ValueError(f"from_at must not be after to_at: {from_at!r} > {to_at!r}")
+    before = compile_rules(from_at, rules)
+    after = compile_rules(to_at, rules)
+
+    before_rules = {
+        (rule["source"], rule["id"]): rule for rule in before["rules"]
+    }
+    after_rules = {(rule["source"], rule["id"]): rule for rule in after["rules"]}
+
+    entries: list[dict[str, Any]] = []
+    for key in set(before_rules) | set(after_rules):
+        source, rule_id = key
+        old = before_rules.get(key)
+        new = after_rules.get(key)
+        if old is None and new is not None:
+            kind = "added"
+        elif new is None and old is not None:
+            kind = "removed"
+        elif old != new:
+            kind = "updated"
+        else:
+            continue
+        entries.append(
+            {
+                "source": source,
+                "id": rule_id,
+                "kind": kind,
+                "before": old,
+                "after": new,
+            }
+        )
+    entries.sort(key=lambda item: (_SOURCES.index(item["source"]), item["id"]))
+
+    before_conflicts = {
+        _conflict_identity(conflict) for conflict in before["conflicts"]
+    }
+    after_conflicts = {
+        _conflict_identity(conflict) for conflict in after["conflicts"]
+    }
+    conflicts_added = [
+        conflict
+        for conflict in after["conflicts"]
+        if _conflict_identity(conflict) not in before_conflicts
+    ]
+    conflicts_removed = [
+        conflict
+        for conflict in before["conflicts"]
+        if _conflict_identity(conflict) not in after_conflicts
+    ]
+
+    return {
+        "from": from_at,
+        "to": to_at,
+        "rules": entries,
+        "conflicts": {"added": conflicts_added, "removed": conflicts_removed},
+    }
+
+
 def explain(
     at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
 ) -> dict[str, Any]:
