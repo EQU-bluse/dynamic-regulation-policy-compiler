@@ -310,3 +310,70 @@ def compare_decisions(
         "before": before,
         "after": after,
     }
+
+
+def decision_timeline(
+    start: str,
+    end: str,
+    facts: dict[str, bool],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a timeline of decision changes between two UTC timestamps.
+
+    ``start`` and ``end`` must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``start <= end``; ``facts`` and ``rules``
+    are validated exactly as in :func:`explain`. Any type, time,
+    rule-structure, or ordering violation raises ``ValueError`` without
+    mutating the inputs.
+
+    Candidate timestamps are ``start`` plus every rule ``from`` and non-null
+    ``to`` falling in ``(start, end]``, deduplicated and sorted ascending;
+    :func:`explain` is evaluated at each candidate. The first point is always
+    kept; a later point is kept only when it differs from the previously kept
+    point in at least one of ``decision``, ``trace``, ``basis``,
+    ``conflicts``.
+
+    Returns a deep copy with keys ``start``, ``end``, ``points``. Each point
+    has keys ``at``, ``decision``, ``trace``, ``basis``, ``conflicts``,
+    ``changes``; the first five are the corresponding :func:`explain` values,
+    ``changes`` is ``[]`` for the first point and otherwise lists, in the
+    order ``decision``, ``trace``, ``basis``, ``conflicts``, the fields that
+    differ from the previously kept point.
+    """
+    _check_time(start, "start")
+    _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    _check_fact_map(facts, "facts")
+    _validate_rules(rules)
+
+    candidates = {start}
+    for rule in rules:
+        for key in ("from", "to"):
+            moment = rule[key]
+            if moment is not None and start < moment <= end:
+                candidates.add(moment)
+
+    points: list[dict[str, Any]] = []
+    for at in sorted(candidates):
+        report = explain(at, facts, rules)
+        if not points:
+            changes: list[str] = []
+        else:
+            previous = points[-1]
+            changes = [
+                field for field in _COMPARE_FIELDS if previous[field] != report[field]
+            ]
+            if not changes:
+                continue
+        points.append(
+            {
+                "at": at,
+                "decision": report["decision"],
+                "trace": report["trace"],
+                "basis": report["basis"],
+                "conflicts": report["conflicts"],
+                "changes": changes,
+            }
+        )
+    return {"start": start, "end": end, "points": points}
