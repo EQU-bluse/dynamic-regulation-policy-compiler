@@ -152,6 +152,70 @@ def evaluate(
     return matched[0]["result"], trace
 
 
+def _snapshot_rule(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return a stable-key deep copy of a rule, with ``when`` keys sorted by
+    Unicode code point."""
+    when = rule["when"]
+    if when is not None:
+        when = {key: when[key] for key in sorted(when)}
+    return {
+        "id": rule["id"],
+        "ver": rule["ver"],
+        "source": rule["source"],
+        "priority": rule["priority"],
+        "from": rule["from"],
+        "to": rule["to"],
+        "when": when,
+        "result": rule["result"],
+    }
+
+
+def explain(
+    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Explain the decision of :func:`evaluate` with its basis rule and conflicts.
+
+    Applies the same validation as :func:`evaluate` (raising ``ValueError`` for
+    invalid ``at``, ``facts`` or ``rules``, including bad intervals and
+    duplicate ``(source, id, ver)`` triples) without mutating the inputs.
+
+    Returns a deep copy with the key order ``at, decision, trace, basis,
+    conflicts``; ``decision`` and ``trace`` are exactly what
+    :func:`evaluate` returns. With no match, ``basis`` is ``None`` and
+    ``conflicts`` is empty. Otherwise ``basis`` is a snapshot of the
+    highest-ranked matching rule (keys ``id, ver, source, priority, from, to,
+    when, result``; ``when`` keys in Unicode code point order), and
+    ``conflicts`` holds the :func:`compile_rules` conflict entries, in their
+    original order, whose ``winner`` or ``loser`` is the basis triple.
+    """
+    explanation: dict[str, Any] = {
+        "at": at,
+        "decision": None,
+        "trace": [],
+        "basis": None,
+        "conflicts": [],
+    }
+    matched = _matched_rules(at, facts, rules)
+    if not matched:
+        return explanation
+    basis = matched[0]
+    basis_key = [basis["source"], basis["id"], basis["ver"]]
+    compiled = compile_rules(at, rules)
+    explanation["decision"] = basis["result"]
+    explanation["trace"] = [f"{rule['id']}@{rule['ver']}" for rule in matched]
+    explanation["basis"] = next(
+        rule
+        for rule in compiled["rules"]
+        if [rule["source"], rule["id"], rule["ver"]] == basis_key
+    )
+    explanation["conflicts"] = [
+        conflict
+        for conflict in compiled["conflicts"]
+        if conflict["winner"] == basis_key or conflict["loser"] == basis_key
+    ]
+    return explanation
+
+
 def _conditions_compatible(a: dict[str, bool] | None, b: dict[str, bool] | None) -> bool:
     """Return whether two ``when`` conditions can hold simultaneously.
 
@@ -181,23 +245,7 @@ def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
     """
     ranked = _effective_rules(at, rules)
 
-    compiled_rules: list[dict[str, Any]] = []
-    for rule in ranked:
-        when = rule["when"]
-        if when is not None:
-            when = {key: when[key] for key in sorted(when)}
-        compiled_rules.append(
-            {
-                "id": rule["id"],
-                "ver": rule["ver"],
-                "source": rule["source"],
-                "priority": rule["priority"],
-                "from": rule["from"],
-                "to": rule["to"],
-                "when": when,
-                "result": rule["result"],
-            }
-        )
+    compiled_rules: list[dict[str, Any]] = [_snapshot_rule(rule) for rule in ranked]
 
     conflicts: list[dict[str, Any]] = []
     for i in range(len(ranked)):
