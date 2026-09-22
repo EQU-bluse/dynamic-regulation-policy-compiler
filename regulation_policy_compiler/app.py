@@ -17,6 +17,7 @@ from .policy import (
     _validate_rules,
     compare_decisions,
     compile_rules,
+    decision_impact,
     decision_timeline,
     explain,
 )
@@ -32,6 +33,7 @@ _POST_KEYS = {"at", "facts", "rules"}
 _COMPILE_KEYS = {"at", "rules"}
 _COMPARE_KEYS = {"from", "to", "facts", "rules"}
 _TIMELINE_KEYS = {"start", "end", "facts", "rules"}
+_IMPACT_KEYS = {"from", "to", "cases", "rules"}
 _VERIFY_KEYS = {"report", "expected"}
 
 
@@ -115,6 +117,23 @@ async def decision_timeline_endpoint(request: Request) -> Response:
     try:
         report = decision_timeline(
             body["start"], body["end"], body["facts"], body["rules"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/decision-impact")
+async def decision_impact_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _IMPACT_KEYS:
+        return _invalid_request()
+    try:
+        report = decision_impact(
+            body["from"], body["to"], body["cases"], body["rules"]
         )
     except ValueError:
         return _invalid_request()
