@@ -20,6 +20,7 @@ _AUDIT_REPORT_KEYS = ("id", "start", "end", "root", "entries")
 _AUDIT_EXPECTED_KEYS = ("id", "start", "end", "root")
 _AUDIT_GENESIS = "0" * 64
 _HEX_DIGITS = frozenset("0123456789abcdef")
+_BUNDLE_LINK_KEYS = ("id", "root")
 
 
 def _check_trace_entry(value: Any, field: str) -> str:
@@ -398,3 +399,56 @@ class DecisionHistory:
             "root": previous,
             "entries": entries,
         }
+
+    def audit_bundle(
+        self, record_ids: Any, start: str, end: str
+    ) -> dict[str, Any]:
+        """Bundle per-id audit reports and link them with a cross-report hash.
+
+        Only already-persisted records are read; nothing is recomputed, written,
+        or otherwise mutated. ``record_ids`` must be a non-empty list whose
+        items are non-empty, unique strings, and ``start``/``end`` valid UTC
+        seconds with ``start <= end``; any violation raises ``ValueError`` and
+        leaves the input untouched.
+
+        :meth:`audit` is called once per id, in ascending Unicode code point
+        order of ``record_id``. If any id has no record in the closed interval
+        ``[start, end]``, ``KeyError`` is raised for the whole call and no
+        partial result is returned.
+
+        The result is a deep copy with top-level key order
+        ``start, end, root, reports``; ``reports`` preserves the id order and
+        each report is the complete :meth:`audit` result with its per-level
+        contract intact.
+
+        Let ``h0`` be 64 ASCII ``0`` characters. For the i-th report (i from
+        1), let ``Pi`` be the UTF-8 compact JSON bytes (non-ASCII unescaped, no
+        trailing newline) of that report restricted to ``id, root`` in that
+        key order; ``hi`` is the lowercase hexadecimal SHA-256 of
+        ``h{i-1}``'s ASCII bytes immediately followed by ``Pi``. The top-level
+        ``root`` is ``hn`` where ``n`` is the number of reports.
+        """
+        if not isinstance(record_ids, list) or not record_ids:
+            raise ValueError("record_ids must be a non-empty list")
+        seen: set[str] = set()
+        for index, record_id in enumerate(record_ids):
+            _check_non_empty_str(record_id, f"record_ids[{index}]")
+            if record_id in seen:
+                raise ValueError(f"record_ids[{index}] is duplicated: {record_id!r}")
+            seen.add(record_id)
+        _check_time(start, "start")
+        _check_time(end, "end")
+        if start > end:
+            raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+        ordered_ids = sorted(record_ids)
+        reports: list[dict[str, Any]] = []
+        previous = _AUDIT_GENESIS
+        for record_id in ordered_ids:
+            report = self.audit(record_id, start, end)
+            link = {key: report[key] for key in _BUNDLE_LINK_KEYS}
+            content = json.dumps(link, ensure_ascii=False, separators=(",", ":"))
+            previous = hashlib.sha256(
+                previous.encode("ascii") + content.encode("utf-8")
+            ).hexdigest()
+            reports.append(report)
+        return {"start": start, "end": end, "root": previous, "reports": reports}
