@@ -20,6 +20,7 @@ from .policy import (
     decision_impact,
     decision_timeline,
     explain,
+    policy_schedule,
 )
 
 app = FastAPI(title="Dynamic Regulation Policy Compiler")
@@ -34,6 +35,7 @@ _COMPILE_KEYS = {"at", "rules"}
 _COMPARE_KEYS = {"from", "to", "facts", "rules"}
 _TIMELINE_KEYS = {"start", "end", "facts", "rules"}
 _IMPACT_KEYS = {"from", "to", "cases", "rules"}
+_SCHEDULE_KEYS = {"start", "end", "rules"}
 _VERIFY_KEYS = {"report", "expected"}
 
 
@@ -72,6 +74,21 @@ async def compile_rules_endpoint(request: Request) -> Response:
     except ValueError:
         return _invalid_request()
     return _record_response(compiled)
+
+
+@app.post("/rules/schedule")
+async def policy_schedule_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _SCHEDULE_KEYS:
+        return _invalid_request()
+    try:
+        report = policy_schedule(body["start"], body["end"], body["rules"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
 
 
 @app.post("/explanations")

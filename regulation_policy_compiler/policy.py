@@ -479,6 +479,70 @@ def decision_timeline(
     return {"start": start, "end": end, "points": points}
 
 
+def policy_schedule(
+    start: str, end: str, rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Compile the policy at every effective boundary in a time range.
+
+    ``start`` and ``end`` must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``start <= end``; ``rules`` is validated
+    exactly as in :func:`compile_rules`. Any type, time, or rule-structure
+    violation raises ``ValueError`` without mutating the inputs.
+
+    The candidate timestamps are ``start`` plus every rule ``from`` and
+    non-``None`` ``to`` falling in ``(start, end]``, deduplicated and sorted
+    ascending; :func:`compile_rules` is called at each candidate. The first
+    point is always kept. For each later candidate, :func:`policy_delta` is
+    computed between the previously kept point and the candidate; the
+    candidate is dropped when that delta has ``rules == []`` and both
+    ``conflicts`` arrays empty, and kept otherwise.
+
+    Returns a deep copy with keys ``start``, ``end``, ``points``. Each point
+    has keys ``at``, ``rules``, ``conflicts``, ``delta``; ``rules`` and
+    ``conflicts`` are exactly the :func:`compile_rules` values at ``at``.
+    The first point's ``delta`` is ``None``; a later point's ``delta`` is the
+    full :func:`policy_delta` result from the previously kept point to ``at``.
+    """
+    _check_time(start, "start")
+    _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    first = compile_rules(start, rules)
+    candidates = {start}
+    for rule in rules:
+        for boundary in (rule["from"], rule["to"]):
+            if boundary is not None and start < boundary <= end:
+                candidates.add(boundary)
+    points = [
+        {
+            "at": first["at"],
+            "rules": first["rules"],
+            "conflicts": first["conflicts"],
+            "delta": None,
+        }
+    ]
+    previous_at = start
+    for at in sorted(candidates - {start}):
+        compiled = compile_rules(at, rules)
+        delta = policy_delta(previous_at, at, rules)
+        if (
+            not delta["rules"]
+            and not delta["conflicts"]["added"]
+            and not delta["conflicts"]["removed"]
+        ):
+            continue
+        points.append(
+            {
+                "at": compiled["at"],
+                "rules": compiled["rules"],
+                "conflicts": compiled["conflicts"],
+                "delta": delta,
+            }
+        )
+        previous_at = at
+    return {"start": start, "end": end, "points": points}
+
+
 _CASE_KEYS = frozenset({"id", "facts"})
 
 
