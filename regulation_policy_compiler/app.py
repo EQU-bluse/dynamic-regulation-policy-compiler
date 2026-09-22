@@ -20,6 +20,7 @@ from .policy import (
     decision_impact,
     decision_timeline,
     explain,
+    policy_attestation,
     policy_schedule,
 )
 
@@ -75,6 +76,21 @@ async def compile_rules_endpoint(request: Request) -> Response:
     except ValueError:
         return _invalid_request()
     return _record_response(compiled)
+
+
+@app.post("/rules/attest")
+async def policy_attestation_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _COMPILE_KEYS:
+        return _invalid_request()
+    try:
+        attestation = policy_attestation(body["at"], body["rules"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(attestation)
 
 
 @app.post("/rules/schedule")

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import re
 from datetime import datetime
 from functools import cmp_to_key
@@ -231,6 +234,28 @@ def compile_rules(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
     compiled_rules = [_snapshot_rule(rule) for rule in ranked]
     conflicts = _find_conflicts(ranked)
     return {"at": at, "rules": compiled_rules, "conflicts": conflicts}
+
+
+def policy_attestation(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """Attest a :func:`compile_rules` result with a SHA-256 digest.
+
+    ``at`` and ``rules`` are validated exactly as in :func:`compile_rules`;
+    any type, time, rule-field, ``[from, to)`` interval, or duplicate
+    ``(source, id, ver)`` error raises ``ValueError`` without mutating the
+    inputs.
+
+    Let ``policy`` be the :func:`compile_rules` result and let ``C`` be the
+    UTF-8 bytes of ``json.dumps(policy, ensure_ascii=False,
+    separators=(',', ':'))`` (with no trailing newline). Returns a deep copy
+    with keys ``at``, ``policy``, ``digest``; ``policy`` keeps every
+    :func:`compile_rules` key order, ordering, ``when`` Unicode code point
+    sort, and ``conflicts`` order, and ``digest`` is the lowercase 64-char
+    hex SHA-256 of ``C``. Equal-valued inputs yield byte-identical results.
+    """
+    policy = compile_rules(at, rules)
+    canonical = json.dumps(policy, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return {"at": at, "policy": copy.deepcopy(policy), "digest": digest}
 
 
 _SOURCE_ORDER = {"law": 0, "org": 1}
