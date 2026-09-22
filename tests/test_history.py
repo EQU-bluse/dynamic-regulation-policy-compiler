@@ -190,3 +190,154 @@ def test_failed_write_keeps_old_file(tmp_path, monkeypatch):
     # The failed record was rolled back in memory as well.
     with pytest.raises(KeyError):
         history.replay("rec-2", "2021-01-01T00:00:00Z")
+
+
+def _history_with_records(tmp_path, triples):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    for record_id, at, rules in triples:
+        history.record(record_id, at, {}, rules)
+    return history
+
+
+def test_evolution_returns_entries_in_closed_interval_ascending(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-03-01T00:00:00Z", {}, [])
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [_rule(result="first")])
+    history.record("rec-1", "2021-06-01T00:00:00Z", {}, [_rule(result="second")])
+    history.record("other", "2021-02-01T00:00:00Z", {}, [_rule(result="x")])
+    report = history.evolution(
+        "rec-1", "2021-01-01T00:00:00Z", "2021-06-01T00:00:00Z"
+    )
+    assert list(report) == ["id", "start", "end", "entries"]
+    assert report["id"] == "rec-1"
+    assert report["start"] == "2021-01-01T00:00:00Z"
+    assert report["end"] == "2021-06-01T00:00:00Z"
+    assert [entry["at"] for entry in report["entries"]] == [
+        "2021-01-01T00:00:00Z",
+        "2021-03-01T00:00:00Z",
+        "2021-06-01T00:00:00Z",
+    ]
+    for entry in report["entries"]:
+        assert list(entry) == ["at", "decision", "trace", "basis", "changes"]
+
+
+def test_evolution_interval_bounds_are_inclusive(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [_rule(result="a")])
+    history.record("rec-1", "2021-02-01T00:00:00Z", {}, [_rule(result="b")])
+    history.record("rec-1", "2021-03-01T00:00:00Z", {}, [_rule(result="c")])
+    report = history.evolution(
+        "rec-1", "2021-02-01T00:00:00Z", "2021-02-01T00:00:00Z"
+    )
+    assert [entry["at"] for entry in report["entries"]] == ["2021-02-01T00:00:00Z"]
+    assert report["entries"][0]["decision"] == "b"
+    assert report["entries"][0]["changes"] == []
+
+
+def test_evolution_changes_listed_in_fixed_order(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [_rule(id="r", result="allow")])
+    history.record("rec-1", "2021-02-01T00:00:00Z", {}, [_rule(id="r", result="allow")])
+    history.record("rec-1", "2021-03-01T00:00:00Z", {}, [])
+    report = history.evolution(
+        "rec-1", "2021-01-01T00:00:00Z", "2021-03-01T00:00:00Z"
+    )
+    first, second, third = report["entries"]
+    assert first["changes"] == []
+    # Identical decision/trace/basis values -> no changes.
+    assert second["changes"] == []
+    # decision, trace, basis all differ from the previous entry.
+    assert third["changes"] == ["decision", "trace", "basis"]
+
+
+def test_evolution_changes_compared_to_immediate_previous_entry(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [_rule(result="a")])
+    history.record("rec-1", "2021-02-01T00:00:00Z", {}, [_rule(result="b")])
+    history.record("rec-1", "2021-03-01T00:00:00Z", {}, [_rule(result="a")])
+    report = history.evolution(
+        "rec-1", "2021-01-01T00:00:00Z", "2021-03-01T00:00:00Z"
+    )
+    first, second, third = report["entries"]
+    assert first["changes"] == []
+    assert second["changes"] == ["decision", "basis"]
+    # Compared against the second entry, not the first.
+    assert third["changes"] == ["decision", "basis"]
+
+
+def test_evolution_trace_only_change(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record(
+        "rec-1",
+        "2021-01-01T00:00:00Z",
+        {"a": True},
+        [_rule(id="win", priority=9, result="allow"), _rule(id="loser", result="deny", when={"a": True})],
+    )
+    history.record(
+        "rec-1",
+        "2021-02-01T00:00:00Z",
+        {},
+        [_rule(id="win", priority=9, result="allow"), _rule(id="loser", result="deny", when={"a": True})],
+    )
+    report = history.evolution(
+        "rec-1", "2021-01-01T00:00:00Z", "2021-02-01T00:00:00Z"
+    )
+    assert report["entries"][0]["trace"] == ["win@1", "loser@1"]
+    assert report["entries"][1]["trace"] == ["win@1"]
+    assert report["entries"][1]["decision"] == "allow"
+    assert report["entries"][1]["changes"] == ["trace"]
+
+
+def test_evolution_empty_interval_raises_key_error(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-06-01T00:00:00Z", {}, [])
+    with pytest.raises(KeyError):
+        history.evolution("rec-1", "2021-01-01T00:00:00Z", "2021-02-01T00:00:00Z")
+    with pytest.raises(KeyError):
+        history.evolution("missing", "2021-01-01T00:00:00Z", "2022-01-01T00:00:00Z")
+
+
+def test_evolution_rejects_bad_arguments(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    with pytest.raises(ValueError):
+        history.evolution("", "2021-01-01T00:00:00Z", "2021-02-01T00:00:00Z")
+    with pytest.raises(ValueError):
+        history.evolution(None, "2021-01-01T00:00:00Z", "2021-02-01T00:00:00Z")
+    with pytest.raises(ValueError):
+        history.evolution("rec-1", "bad", "2021-02-01T00:00:00Z")
+    with pytest.raises(ValueError):
+        history.evolution("rec-1", "2021-01-01T00:00:00Z", "bad")
+    with pytest.raises(ValueError):
+        history.evolution(
+            "rec-1", "2021-02-01T00:00:00Z", "2021-01-01T00:00:00Z"
+        )
+
+
+def test_evolution_returns_deep_copies_and_does_not_mutate(tmp_path):
+    history = DecisionHistory(str(tmp_path / "history.json"))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [_rule(result="a")])
+    history.record("rec-1", "2021-02-01T00:00:00Z", {}, [_rule(result="b")])
+    report = history.evolution(
+        "rec-1", "2021-01-01T00:00:00Z", "2021-02-01T00:00:00Z"
+    )
+    report["entries"][0]["decision"] = "tampered"
+    report["entries"][0]["trace"].append("x@9")
+    report["entries"][0]["basis"]["result"] = "tampered"
+    again = history.evolution(
+        "rec-1", "2021-01-01T00:00:00Z", "2021-02-01T00:00:00Z"
+    )
+    assert again["entries"][0]["decision"] == "a"
+    assert again["entries"][0]["trace"] == ["r1@1"]
+    assert again["entries"][0]["basis"]["result"] == "a"
+    assert again["entries"][1]["changes"] == ["decision", "basis"]
+
+
+def test_evolution_is_read_only(tmp_path):
+    path = tmp_path / "history.json"
+    history = DecisionHistory(str(path))
+    history.record("rec-1", "2021-01-01T00:00:00Z", {}, [])
+    before = path.read_bytes()
+    history.evolution("rec-1", "2021-01-01T00:00:00Z", "2021-02-01T00:00:00Z")
+    with pytest.raises(KeyError):
+        history.evolution("rec-1", "2022-01-01T00:00:00Z", "2022-02-01T00:00:00Z")
+    assert path.read_bytes() == before

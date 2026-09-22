@@ -12,6 +12,7 @@ from .policy import _check_non_empty_str, _check_time, _matched_rules, _validate
 
 _RECORD_KEYS = ("id", "at", "decision", "trace", "basis")
 _BASIS_KEYS = ("id", "ver", "source", "priority", "from", "to", "when", "result")
+_EVOLUTION_FIELDS = ("decision", "trace", "basis")
 
 
 def _check_trace_entry(value: Any, field: str) -> str:
@@ -158,3 +159,52 @@ class DecisionHistory:
         if best is None:
             raise KeyError(record_id)
         return copy.deepcopy(best)
+
+    def evolution(self, record_id: str, start: str, end: str) -> dict[str, Any]:
+        """Return stored snapshots for ``record_id`` within the closed ``[start, end]``.
+
+        Only already-persisted records are read; nothing is recomputed, written,
+        or otherwise mutated. ``record_id`` must be a non-empty string and
+        ``start``/``end`` valid UTC seconds with ``start <= end``; otherwise
+        ``ValueError`` is raised. Matching records are returned in ascending
+        ``at`` order; when none match, ``KeyError`` is raised. The result is a
+        deep copy with keys ``id, start, end, entries``; each entry has keys
+        ``at, decision, trace, basis, changes``, where ``changes`` lists, in
+        the order ``decision, trace, basis``, the fields differing from the
+        previous entry (the first entry's ``changes`` is ``[]``).
+        """
+        _check_non_empty_str(record_id, "record_id")
+        _check_time(start, "start")
+        _check_time(end, "end")
+        if start > end:
+            raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+        matched = [
+            entry
+            for entry in self._records
+            if entry["id"] == record_id and start <= entry["at"] <= end
+        ]
+        if not matched:
+            raise KeyError(record_id)
+        matched.sort(key=lambda entry: entry["at"])
+        entries: list[dict[str, Any]] = []
+        previous: dict[str, Any] | None = None
+        for entry in matched:
+            if previous is None:
+                changes: list[str] = []
+            else:
+                changes = [
+                    field
+                    for field in _EVOLUTION_FIELDS
+                    if entry[field] != previous[field]
+                ]
+            entries.append(
+                {
+                    "at": entry["at"],
+                    "decision": copy.deepcopy(entry["decision"]),
+                    "trace": copy.deepcopy(entry["trace"]),
+                    "basis": copy.deepcopy(entry["basis"]),
+                    "changes": changes,
+                }
+            )
+            previous = entry
+        return {"id": record_id, "start": start, "end": end, "entries": entries}
