@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime
 from functools import cmp_to_key
@@ -695,3 +697,26 @@ def decision_matrix(
         points.append({"at": at, "changes": changes, "cases": current_cases})
         previous_cases = current_cases
     return {"start": start, "end": end, "points": points}
+
+
+def policy_attestation(at: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    """Attest the compiled policy at ``at`` with a content digest.
+
+    ``at`` and ``rules`` are validated exactly as in :func:`compile_rules`;
+    any type, time, rule-structure, ``[from, to)`` window, or duplicate
+    ``(source, id, ver)`` violation raises ``ValueError`` without mutating
+    the inputs.
+
+    Returns a deep copy with keys ``at``, ``policy``, ``digest``. ``policy``
+    is the full :func:`compile_rules` result and keeps its key order,
+    sorting, ``when`` Unicode code point ordering, and ``conflicts`` order
+    at every level. Let ``C`` be the UTF-8 bytes of
+    ``json.dumps(policy, ensure_ascii=False, separators=(",", ":"))`` (no
+    trailing newline); ``digest`` is the SHA-256 of ``C`` as 64 lowercase
+    hexadecimal characters. Equal-valued inputs always produce byte-identical
+    results.
+    """
+    policy = compile_rules(at, rules)
+    canonical = json.dumps(policy, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return {"at": at, "policy": policy, "digest": digest}
