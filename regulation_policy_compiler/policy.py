@@ -410,6 +410,74 @@ def compare_decisions(
     }
 
 
+_CASE_KEYS = frozenset({"id", "facts"})
+
+
+def _validate_cases(cases: Any) -> list[dict[str, Any]]:
+    if not isinstance(cases, list):
+        raise ValueError("cases must be a list of case dicts")
+    seen: set[str] = set()
+    for index, case in enumerate(cases):
+        field = f"cases[{index}]"
+        if not isinstance(case, dict) or set(case) != _CASE_KEYS:
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys id, facts"
+            )
+        case_id = _check_non_empty_str(case["id"], f"{field}.id")
+        if case_id in seen:
+            raise ValueError(f"duplicate case id: {case_id!r}")
+        seen.add(case_id)
+        _check_fact_map(case["facts"], f"{field}.facts")
+    return cases
+
+
+def decision_impact(
+    from_at: str,
+    to_at: str,
+    cases: list[dict[str, Any]],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Combine a policy diff with per-case decision changes across two times.
+
+    ``from_at`` and ``to_at`` must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``from_at <= to_at``; ``rules`` is
+    validated exactly as in :func:`compile_rules`. ``cases`` must be a list
+    whose items are dicts with exactly the keys ``id`` and ``facts``; ``id``
+    is a non-empty string unique across the list and ``facts`` is validated
+    exactly as in :func:`explain`. Any violation raises ``ValueError``
+    without mutating the inputs. An empty ``cases`` list is valid.
+
+    Returns a deep copy with keys ``from``, ``to``, ``policy``, ``cases``.
+    ``policy`` is the full :func:`policy_delta` result for the two
+    timestamps. ``cases`` is sorted by ``id`` in Unicode code point order;
+    each entry has keys ``id``, ``changes``, ``before``, ``after`` where
+    ``before``/``after`` are the full :func:`explain` results at
+    ``from_at``/``to_at`` for that case's facts, and ``changes`` lists, in
+    the order ``decision``, ``trace``, ``basis``, ``conflicts``, the fields
+    whose values differ between the two snapshots (empty when identical).
+    """
+    _check_time(from_at, "from_at")
+    _check_time(to_at, "to_at")
+    if from_at > to_at:
+        raise ValueError(f"from_at must not be after to_at: {from_at!r} > {to_at!r}")
+    cases = _validate_cases(cases)
+    policy = policy_delta(from_at, to_at, rules)
+    entries: list[dict[str, Any]] = []
+    for case in sorted(cases, key=lambda item: item["id"]):
+        before = explain(from_at, case["facts"], rules)
+        after = explain(to_at, case["facts"], rules)
+        changes = [field for field in _COMPARE_FIELDS if before[field] != after[field]]
+        entries.append(
+            {
+                "id": case["id"],
+                "changes": changes,
+                "before": before,
+                "after": after,
+            }
+        )
+    return {"from": from_at, "to": to_at, "policy": policy, "cases": entries}
+
+
 def decision_timeline(
     start: str,
     end: str,
