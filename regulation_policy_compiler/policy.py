@@ -476,6 +476,288 @@ def policy_schedule_attestation(
     }
 
 
+_SCHEDULE_ATTEST_REPORT_KEYS = ("start", "end", "root", "points")
+_SCHEDULE_ATTEST_EXPECTED_KEYS = ("start", "end", "root")
+_SCHEDULE_POINT_KEYS = (
+    "at",
+    "rules",
+    "conflicts",
+    "delta",
+    "previous",
+    "digest",
+)
+_SCHEDULE_POINT_CONTENT_KEYS = ("at", "rules", "conflicts", "delta")
+_SCHEDULE_GENESIS = "0" * 64
+_SCHEDULE_HEX_DIGITS = frozenset("0123456789abcdef")
+_CONFLICT_KEYS = frozenset({"winner", "loser"})
+_DELTA_KEYS = frozenset({"from", "to", "rules", "conflicts"})
+_DELTA_ENTRY_KEYS = frozenset({"source", "id", "kind", "before", "after"})
+_DELTA_DELTA_KEYS = frozenset({"added", "removed"})
+_DELTA_KINDS = frozenset({"added", "removed", "updated"})
+
+
+def _check_schedule_hex64(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in _SCHEDULE_HEX_DIGITS for char in value)
+    ):
+        raise ValueError(f"{field} must be 64 lowercase hexadecimal characters")
+    return value
+
+
+def _normalize_conflict_party(value: Any, field: str) -> list[Any]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"{field} must be a [source, id, ver] triple")
+    source, rule_id, ver = value
+    if source not in _SOURCES:
+        raise ValueError(f"{field} source must be 'law' or 'org'")
+    _check_non_empty_str(rule_id, f"{field} id")
+    _check_int(ver, f"{field} ver")
+    if ver < 1:
+        raise ValueError(f"{field} ver must be a positive integer")
+    return [source, rule_id, ver]
+
+
+def _normalize_conflicts(value: Any, field: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list of conflict dicts")
+    conflicts: list[dict[str, Any]] = []
+    for index, conflict in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(conflict, dict) or set(conflict) != _CONFLICT_KEYS:
+            raise ValueError(
+                f"{item_field} must be a dict with exactly the keys winner, loser"
+            )
+        conflicts.append(
+            {
+                "winner": _normalize_conflict_party(
+                    conflict["winner"], f"{item_field}.winner"
+                ),
+                "loser": _normalize_conflict_party(
+                    conflict["loser"], f"{item_field}.loser"
+                ),
+            }
+        )
+    return conflicts
+
+
+def _normalize_optional_rule(value: Any, field: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        _validate_rules([value])
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a valid rule snapshot or null") from exc
+    return _snapshot_rule(value)
+
+
+def _normalize_delta(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _DELTA_KEYS:
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys from, to, rules, conflicts"
+        )
+    frm = _check_time(value["from"], f"{field}.from")
+    to = _check_time(value["to"], f"{field}.to")
+    if frm > to:
+        raise ValueError(f"{field}.from must not be after {field}.to")
+    raw_entries = value["rules"]
+    if not isinstance(raw_entries, list):
+        raise ValueError(f"{field}.rules must be a list of delta entry dicts")
+    entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw_entries):
+        entry_field = f"{field}.rules[{index}]"
+        if not isinstance(entry, dict) or set(entry) != _DELTA_ENTRY_KEYS:
+            raise ValueError(
+                f"{entry_field} must be a dict with exactly the keys "
+                "source, id, kind, before, after"
+            )
+        source = entry["source"]
+        if source not in _SOURCES:
+            raise ValueError(f"{entry_field}.source must be 'law' or 'org'")
+        rule_id = _check_non_empty_str(entry["id"], f"{entry_field}.id")
+        kind = entry["kind"]
+        if kind not in _DELTA_KINDS:
+            raise ValueError(
+                f"{entry_field}.kind must be 'added', 'removed', or 'updated'"
+            )
+        before = _normalize_optional_rule(entry["before"], f"{entry_field}.before")
+        after = _normalize_optional_rule(entry["after"], f"{entry_field}.after")
+        if kind == "added" and (before is not None or after is None):
+            raise ValueError(
+                f"{entry_field} is 'added' but before/after do not match the contract"
+            )
+        if kind == "removed" and (before is None or after is not None):
+            raise ValueError(
+                f"{entry_field} is 'removed' but before/after do not match the contract"
+            )
+        if kind == "updated" and (before is None or after is None):
+            raise ValueError(
+                f"{entry_field} is 'updated' but before/after do not match the contract"
+            )
+        entries.append(
+            {
+                "source": source,
+                "id": rule_id,
+                "kind": kind,
+                "before": before,
+                "after": after,
+            }
+        )
+    raw_conflicts = value["conflicts"]
+    if not isinstance(raw_conflicts, dict) or set(raw_conflicts) != _DELTA_DELTA_KEYS:
+        raise ValueError(
+            f"{field}.conflicts must be a dict with exactly the keys added, removed"
+        )
+    return {
+        "from": frm,
+        "to": to,
+        "rules": entries,
+        "conflicts": {
+            "added": _normalize_conflicts(
+                raw_conflicts["added"], f"{field}.conflicts.added"
+            ),
+            "removed": _normalize_conflicts(
+                raw_conflicts["removed"], f"{field}.conflicts.removed"
+            ),
+        },
+    }
+
+
+def _normalize_schedule_point(
+    point: Any,
+    index: int,
+    start: str,
+    end: str,
+    previous_at: str | None,
+) -> tuple[dict[str, Any], str]:
+    """Validate one attestation point and return its normalized copy and ``at``."""
+    field = f"points[{index}]"
+    if not isinstance(point, dict) or set(point) != set(_SCHEDULE_POINT_KEYS):
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys "
+            "at, rules, conflicts, delta, previous, digest"
+        )
+    at = _check_time(point["at"], f"{field}.at")
+    if not start <= at <= end:
+        raise ValueError(f"{field}.at lies outside [start, end]")
+    if index == 0:
+        if at != start:
+            raise ValueError("points[0].at must equal start")
+    elif at <= previous_at:  # type: ignore[operator]
+        raise ValueError("points must be strictly increasing in at")
+    try:
+        _validate_rules(point["rules"])
+    except ValueError as exc:
+        raise ValueError(f"{field}.rules are not valid rule snapshots: {exc}") from exc
+    rules = [_snapshot_rule(rule) for rule in point["rules"]]
+    conflicts = _normalize_conflicts(point["conflicts"], f"{field}.conflicts")
+    raw_delta = point["delta"]
+    if index == 0:
+        if raw_delta is not None:
+            raise ValueError("points[0].delta must be null")
+        delta: dict[str, Any] | None = None
+    else:
+        if raw_delta is None:
+            raise ValueError(f"{field}.delta must be a policy_delta result")
+        delta = _normalize_delta(raw_delta, f"{field}.delta")
+    previous = _check_schedule_hex64(point["previous"], f"{field}.previous")
+    digest = _check_schedule_hex64(point["digest"], f"{field}.digest")
+    normalized = {
+        "at": at,
+        "rules": rules,
+        "conflicts": conflicts,
+        "delta": delta,
+        "previous": previous,
+        "digest": digest,
+    }
+    return normalized, at
+
+
+def verify_policy_schedule_attestation(report: Any, expected: Any) -> bool:
+    """Verify a :func:`policy_schedule_attestation` report by recomputation.
+
+    ``report`` must be a dict with exactly the keys ``start, end, root,
+    points``; ``start``/``end`` valid UTC seconds with ``start <= end``,
+    ``root`` 64 lowercase hexadecimal characters, and ``points`` a non-empty
+    list conforming level by level to the :func:`policy_schedule_attestation`
+    contract (exact key sets, types, and value domains, including the
+    :func:`compile_rules` rule/conflict shapes and the :func:`policy_delta`
+    delta shape). The points' ``at`` values must be strictly increasing, lie
+    in the closed interval ``[start, end]``, and the first point must have
+    ``at == start`` and ``delta == null``; later points must carry a full
+    delta. Each point's ``previous``/``digest`` must be 64 lowercase
+    hexadecimal characters. ``expected`` must have exactly the keys
+    ``start, end, root`` and is validated the same way. Any violation raises
+    ``ValueError`` without mutating the inputs.
+
+    Every dict is rebuilt in the contract key order (rule ``when`` keys in
+    Unicode code point order) and the hash chain is recomputed exactly as
+    :func:`policy_schedule_attestation` defines it: the first ``previous`` is
+    64 ASCII ``0`` characters, every later ``previous`` is the preceding
+    point's ``digest``, and each ``digest`` is the lowercase hexadecimal
+    SHA-256 of ``previous``'s ASCII bytes immediately followed by the point's
+    compact-JSON ``C`` over ``at, rules, conflicts, delta`` in that order.
+
+    Returns ``False`` when ``report`` and ``expected`` differ in ``start``,
+    ``end``, or ``root``, or when any chain link, digest, or the final root
+    does not match; otherwise ``True``. The function is pure: it touches no
+    files and does not mutate its inputs.
+    """
+    if not isinstance(report, dict) or set(report) != set(
+        _SCHEDULE_ATTEST_REPORT_KEYS
+    ):
+        raise ValueError(
+            "report must be a dict with exactly the keys start, end, root, points"
+        )
+    start = _check_time(report["start"], "report.start")
+    end = _check_time(report["end"], "report.end")
+    if start > end:
+        raise ValueError("report.start must not be after report.end")
+    _check_schedule_hex64(report["root"], "report.root")
+    points = report["points"]
+    if not isinstance(points, list) or not points:
+        raise ValueError("report.points must be a non-empty list")
+    normalized_points: list[dict[str, Any]] = []
+    previous_at: str | None = None
+    for index, point in enumerate(points):
+        normalized, at = _normalize_schedule_point(
+            point, index, start, end, previous_at
+        )
+        normalized_points.append(normalized)
+        previous_at = at
+    if not isinstance(expected, dict) or set(expected) != set(
+        _SCHEDULE_ATTEST_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys start, end, root"
+        )
+    expected_start = _check_time(expected["start"], "expected.start")
+    expected_end = _check_time(expected["end"], "expected.end")
+    if expected_start > expected_end:
+        raise ValueError("expected.start must not be after expected.end")
+    _check_schedule_hex64(expected["root"], "expected.root")
+    if (
+        start != expected_start
+        or end != expected_end
+        or report["root"] != expected["root"]
+    ):
+        return False
+    previous = _SCHEDULE_GENESIS
+    for point in normalized_points:
+        if point["previous"] != previous:
+            return False
+        content = {key: point[key] for key in _SCHEDULE_POINT_CONTENT_KEYS}
+        canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+        digest = hashlib.sha256(
+            previous.encode("ascii") + canonical.encode("utf-8")
+        ).hexdigest()
+        if point["digest"] != digest:
+            return False
+        previous = digest
+    return report["root"] == previous
+
+
 def explain(
     at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
 ) -> dict[str, Any]:
