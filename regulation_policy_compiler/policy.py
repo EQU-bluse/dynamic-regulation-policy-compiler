@@ -674,6 +674,146 @@ def _normalize_schedule_point(
     return normalized, at
 
 
+def _check_point_semantics(point: dict[str, Any], index: int) -> None:
+    """Check one point's rules/conflicts against the compile_rules semantics.
+
+    Every rule must be effective at ``at`` (``[from, to)``), ``(source, id)``
+    pairs must be unique, the rules must be in the canonical ranking order,
+    and the conflicts must be exactly those rebuilt from the rules over ranked
+    indices ``i < j``.
+    """
+    field = f"points[{index}]"
+    at = point["at"]
+    rules = point["rules"]
+    for rule in rules:
+        if not (rule["from"] <= at and (rule["to"] is None or at < rule["to"])):
+            raise ValueError(
+                f"{field}.rules contains {rule['source']!r}/{rule['id']!r} "
+                f"outside its [from, to) window at {at}"
+            )
+    seen: set[tuple[str, str]] = set()
+    for rule in rules:
+        key = (rule["source"], rule["id"])
+        if key in seen:
+            raise ValueError(f"{field}.rules contains duplicate (source, id): {key!r}")
+        seen.add(key)
+    ranked = sorted(rules, key=cmp_to_key(_compare))
+    if rules != ranked:
+        raise ValueError(
+            f"{field}.rules must be ordered by source, priority, from, id, ver"
+        )
+    if point["conflicts"] != _find_conflicts(rules):
+        raise ValueError(
+            f"{field}.conflicts must be exactly the conflicts rebuilt from its rules"
+        )
+
+
+def _check_delta_semantics(
+    delta: dict[str, Any],
+    previous_point: dict[str, Any],
+    point: dict[str, Any],
+    index: int,
+) -> None:
+    """Check a later point's delta against its two adjacent snapshots."""
+    field = f"points[{index}].delta"
+    if delta["from"] != previous_point["at"]:
+        raise ValueError(f"{field}.from must equal points[{index - 1}].at")
+    if delta["to"] != point["at"]:
+        raise ValueError(f"{field}.to must equal points[{index}].at")
+
+    before_rules = {
+        (rule["source"], rule["id"]): rule for rule in previous_point["rules"]
+    }
+    after_rules = {(rule["source"], rule["id"]): rule for rule in point["rules"]}
+    given_entries = delta["rules"]
+    given_keys = [(entry["source"], entry["id"]) for entry in given_entries]
+    if len(set(given_keys)) != len(given_keys):
+        raise ValueError(f"{field}.rules contains duplicate (source, id) entries")
+    expected_entries: list[dict[str, Any]] = []
+    for key in sorted(
+        set(before_rules) | set(after_rules),
+        key=lambda item: (_SOURCE_ORDER[item[0]], item[1]),
+    ):
+        before = before_rules.get(key)
+        after = after_rules.get(key)
+        if before is not None and after is not None:
+            if before == after:
+                continue
+            kind = "updated"
+        elif before is None:
+            kind = "added"
+        else:
+            kind = "removed"
+        expected_entries.append(
+            {
+                "source": key[0],
+                "id": key[1],
+                "kind": kind,
+                "before": before,
+                "after": after,
+            }
+        )
+    if given_entries != expected_entries:
+        raise ValueError(
+            f"{field}.rules must exactly list the adjacent snapshot "
+            "added/removed/updated differences"
+        )
+
+    before_conflicts = previous_point["conflicts"]
+    after_conflicts = point["conflicts"]
+    before_identities = {_conflict_identity(c) for c in before_conflicts}
+    after_identities = {_conflict_identity(c) for c in after_conflicts}
+    expected_added = [
+        conflict
+        for conflict in after_conflicts
+        if _conflict_identity(conflict) not in before_identities
+    ]
+    expected_removed = [
+        conflict
+        for conflict in before_conflicts
+        if _conflict_identity(conflict) not in after_identities
+    ]
+    conflicts = delta["conflicts"]
+    if conflicts["added"] != expected_added:
+        raise ValueError(
+            f"{field}.conflicts.added must be exactly the six-tuple identity "
+            "set difference in the current point's conflict order"
+        )
+    if conflicts["removed"] != expected_removed:
+        raise ValueError(
+            f"{field}.conflicts.removed must be exactly the six-tuple identity "
+            "set difference in the previous point's conflict order"
+        )
+    if not given_entries and not expected_added and not expected_removed:
+        raise ValueError(f"{field} must not be empty between adjacent points")
+
+    # Missing intermediate points: a rule in the previous snapshot is its id's
+    # latest version, so an expiry strictly inside the gap changes the
+    # snapshot and forces a kept point. A rule in the current snapshot whose
+    # start lies strictly inside the gap likewise forces one when the id was
+    # absent from the previous snapshot (if an older snapshot rule of the same
+    # id existed it would shadow the new one until its own expiry, which the
+    # previous rule already accounts for).
+    prev_at = previous_point["at"]
+    at = point["at"]
+    prev_ids = set(before_rules)
+    for rule in previous_point["rules"]:
+        if rule["to"] is not None and prev_at < rule["to"] < at:
+            raise ValueError(
+                f"{field} skips a required point at the intermediate expiry "
+                f"boundary {rule['to']}"
+            )
+    for rule in point["rules"]:
+        if (
+            prev_at < rule["from"] < at
+            and (rule["source"], rule["id"]) not in prev_ids
+        ):
+            raise ValueError(
+                f"{field} skips a required point at the intermediate start "
+                f"boundary {rule['from']}"
+            )
+
+
 def verify_policy_schedule_attestation(report: Any, expected: Any) -> bool:
     """Verify a :func:`policy_schedule_attestation` report by recomputation.
 
@@ -692,7 +832,24 @@ def verify_policy_schedule_attestation(report: Any, expected: Any) -> bool:
     ``ValueError`` without mutating the inputs.
 
     Every dict is rebuilt in the contract key order (rule ``when`` keys in
-    Unicode code point order) and the hash chain is recomputed exactly as
+    Unicode code point order) and the report's semantics are recomputed from
+    the reported rules: each point's rules must all lie in their ``[from,
+    to)`` window at the point's ``at``, ``(source, id)`` must be unique, the
+    rules must be in the canonical ranking order (``law`` before ``org``,
+    then priority descending, ``from`` descending, ``id`` ascending, ``ver``
+    descending), and the conflicts must equal those rebuilt over ranked
+    indices ``i < j`` (different results and simultaneously satisfiable
+    ``when``; the earlier rule wins). For every point after the first, the
+    delta must have ``from``/``to`` equal to the adjacent points' ``at``; its
+    rules must list exactly the adjacent snapshots' ``added`` (null/non-null),
+    ``removed`` (non-null/null), and ``updated`` (non-null on both sides with
+    differing values) entries in ``source`` then ``id`` order without
+    duplicates, and its conflict ``added``/``removed`` must be exactly the
+    six-tuple (winner then loser) identity set differences, in the current and
+    previous points' conflict orders respectively; a later delta must not be
+    empty. Missing, forged, duplicated, or misordered items are invalid.
+
+    The hash chain is then recomputed exactly as
     :func:`policy_schedule_attestation` defines it: the first ``previous`` is
     64 ASCII ``0`` characters, every later ``previous`` is the preceding
     point's ``digest``, and each ``digest`` is the lowercase hexadecimal
@@ -724,8 +881,20 @@ def verify_policy_schedule_attestation(report: Any, expected: Any) -> bool:
         normalized, at = _normalize_schedule_point(
             point, index, start, end, previous_at
         )
+        _check_point_semantics(normalized, index)
+        if index > 0:
+            _check_delta_semantics(
+                normalized["delta"], normalized_points[index - 1], normalized, index
+            )
         normalized_points.append(normalized)
         previous_at = at
+    last_point = normalized_points[-1]
+    for rule in last_point["rules"]:
+        if rule["to"] is not None and last_point["at"] < rule["to"] <= end:
+            raise ValueError(
+                "points are missing the required later point at expiry boundary "
+                f"{rule['to']} of {rule['source']!r}/{rule['id']!r}"
+            )
     if not isinstance(expected, dict) or set(expected) != set(
         _SCHEDULE_ATTEST_EXPECTED_KEYS
     ):
