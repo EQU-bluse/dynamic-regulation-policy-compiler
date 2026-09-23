@@ -674,6 +674,109 @@ def _normalize_schedule_point(
     return normalized, at
 
 
+def _check_schedule_point_semantics(
+    point: dict[str, Any],
+    index: int,
+    previous: dict[str, Any] | None,
+) -> None:
+    """Check one normalized point against the schedule semantics.
+
+    The point's ``rules`` must be effective at its ``at``, unique per
+    ``(source, id)``, and ranked exactly as :func:`compile_rules` ranks them;
+    ``conflicts`` must equal the conflicts derived from those rules. A later
+    point's ``delta`` must span from the previous point's ``at`` to this
+    point's ``at`` and exactly match the :func:`policy_delta` of the two
+    adjacent snapshots, and must not be empty.
+    """
+    field = f"points[{index}]"
+    at = point["at"]
+    rules = point["rules"]
+    seen: set[tuple[str, str]] = set()
+    for rule_index, rule in enumerate(rules):
+        if not (rule["from"] <= at and (rule["to"] is None or at < rule["to"])):
+            raise ValueError(
+                f"{field}.rules[{rule_index}] is not effective at {field}.at"
+            )
+        key = (rule["source"], rule["id"])
+        if key in seen:
+            raise ValueError(f"{field}.rules has duplicate (source, id): {key!r}")
+        seen.add(key)
+    for rule_index in range(len(rules) - 1):
+        if _compare(rules[rule_index], rules[rule_index + 1]) > 0:
+            raise ValueError(
+                f"{field}.rules are not in compile_rules ranking order"
+            )
+    if point["conflicts"] != _find_conflicts(rules):
+        raise ValueError(
+            f"{field}.conflicts do not equal the conflicts derived from "
+            f"{field}.rules"
+        )
+    if index == 0:
+        return
+    assert previous is not None
+    delta = point["delta"]
+    if delta["from"] != previous["at"] or delta["to"] != at:
+        raise ValueError(
+            f"{field}.delta from/to must equal the previous point's at and "
+            f"{field}.at"
+        )
+    before_rules = {
+        (rule["source"], rule["id"]): rule for rule in previous["rules"]
+    }
+    after_rules = {(rule["source"], rule["id"]): rule for rule in rules}
+    expected_entries: list[dict[str, Any]] = []
+    for key in sorted(
+        set(before_rules) | set(after_rules),
+        key=lambda item: (_SOURCE_ORDER[item[0]], item[1]),
+    ):
+        before = before_rules.get(key)
+        after = after_rules.get(key)
+        if before is not None and after is not None and before == after:
+            continue
+        if before is None:
+            kind = "added"
+        elif after is None:
+            kind = "removed"
+        else:
+            kind = "updated"
+        expected_entries.append(
+            {
+                "source": key[0],
+                "id": key[1],
+                "kind": kind,
+                "before": before,
+                "after": after,
+            }
+        )
+    if delta["rules"] != expected_entries:
+        raise ValueError(
+            f"{field}.delta.rules do not equal the diff of the adjacent "
+            "snapshots"
+        )
+    before_identities = {_conflict_identity(c) for c in previous["conflicts"]}
+    after_identities = {_conflict_identity(c) for c in point["conflicts"]}
+    expected_added = [
+        c for c in point["conflicts"] if _conflict_identity(c) not in before_identities
+    ]
+    expected_removed = [
+        c for c in previous["conflicts"] if _conflict_identity(c) not in after_identities
+    ]
+    if (
+        delta["conflicts"]["added"] != expected_added
+        or delta["conflicts"]["removed"] != expected_removed
+    ):
+        raise ValueError(
+            f"{field}.delta.conflicts do not equal the conflict identity "
+            "diff of the adjacent snapshots"
+        )
+    if (
+        not delta["rules"]
+        and not delta["conflicts"]["added"]
+        and not delta["conflicts"]["removed"]
+    ):
+        raise ValueError(f"{field}.delta must not be empty")
+
+
 def verify_policy_schedule_attestation(report: Any, expected: Any) -> bool:
     """Verify a :func:`policy_schedule_attestation` report by recomputation.
 
@@ -690,6 +793,22 @@ def verify_policy_schedule_attestation(report: Any, expected: Any) -> bool:
     hexadecimal characters. ``expected`` must have exactly the keys
     ``start, end, root`` and is validated the same way. Any violation raises
     ``ValueError`` without mutating the inputs.
+
+    Each point is also checked against the schedule semantics: its ``rules``
+    must be effective at its ``at`` (``from <= at < to`` or ``to`` null),
+    unique per ``(source, id)``, and ranked exactly as :func:`compile_rules`
+    ranks them (``law`` before ``org``, then ``priority`` descending,
+    ``from`` descending, ``id`` in Unicode code point order, ``ver``
+    descending); its ``conflicts`` must equal the conflicts derived from
+    those rules (ranked indices ``i < j``, differing results, compatible
+    ``when`` conditions, earlier rule wins) with none missing, forged,
+    duplicated, or misordered. A later point's ``delta`` must span from the
+    previous point's ``at`` to its own ``at`` and exactly match the
+    :func:`policy_delta` of the two adjacent snapshots — ``rules`` ordered by
+    ``source`` (``law`` before ``org``) then ``id`` in Unicode code point
+    order, ``conflicts.added`` in the current point's conflict order and
+    ``conflicts.removed`` in the previous point's — and must not be empty.
+    Any semantic violation raises ``ValueError``.
 
     Every dict is rebuilt in the contract key order (rule ``when`` keys in
     Unicode code point order) and the hash chain is recomputed exactly as
@@ -723,6 +842,9 @@ def verify_policy_schedule_attestation(report: Any, expected: Any) -> bool:
     for index, point in enumerate(points):
         normalized, at = _normalize_schedule_point(
             point, index, start, end, previous_at
+        )
+        _check_schedule_point_semantics(
+            normalized, index, normalized_points[-1] if normalized_points else None
         )
         normalized_points.append(normalized)
         previous_at = at
