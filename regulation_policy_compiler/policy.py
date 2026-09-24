@@ -2131,3 +2131,369 @@ def verify_decision_impact_attestation(report: Any, expected: Any) -> bool:
     canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
     recomputed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return digest == recomputed
+
+
+_MATRIX_ATTEST_REPORT_KEYS = frozenset(
+    {"start", "end", "cases", "matrix", "policy", "digest"}
+)
+_MATRIX_ATTEST_EXPECTED_KEYS = frozenset({"start", "end", "digest"})
+_MATRIX_RESULT_KEYS = frozenset({"start", "end", "points"})
+_MATRIX_POINT_KEYS = frozenset({"at", "changes", "cases"})
+_MATRIX_RESULT_CASE_KEYS = frozenset(
+    {"id", "decision", "trace", "basis", "conflicts"}
+)
+_MATRIX_ATTEST_CONTENT_KEYS = ("start", "end", "cases", "matrix", "policy")
+
+
+def decision_matrix_attestation(
+    start: str,
+    end: str,
+    cases: list[dict[str, Any]],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attest a :func:`decision_matrix` result together with its schedule.
+
+    ``start``, ``end``, ``cases``, and ``rules`` are validated exactly as in
+    :func:`decision_matrix`; any invalid time, case, fact, or rule raises
+    ``ValueError`` without mutating the inputs or touching history or files.
+    An empty ``cases`` list is valid.
+
+    Returns a deep copy with top-level keys ``start``, ``end``, ``cases``,
+    ``matrix``, ``policy``, ``digest``; no two levels share a mutable
+    container. ``cases`` lists the input cases in ``id`` Unicode code point
+    order with each case's fact keys sorted in Unicode code point order
+    (items keep the keys ``id``, ``facts``); ``matrix`` is the complete
+    :func:`decision_matrix` result for the same inputs, keeping its first
+    point, change points, case order, explanations, and ``changes``
+    semantics; ``policy`` is the complete
+    :func:`policy_schedule_attestation` result over the same time window,
+    including its snapshots, deltas, conflicts, and hash chain.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) over a payload containing exactly ``start``,
+    ``end``, ``cases``, ``matrix``, ``policy`` in that key order. ``digest``
+    is the lowercase 64-char hex SHA-256 of ``C``. Equal-valued inputs yield
+    byte-identical attestations regardless of input dict key order.
+    """
+    _check_time(start, "start")
+    _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    _validate_cases(cases)
+    matrix = decision_matrix(start, end, cases, rules)
+    policy = policy_schedule_attestation(start, end, rules)
+    attested_cases = [
+        {"id": case["id"], "facts": _sorted_fact_map(case["facts"])}
+        for case in sorted(cases, key=lambda item: item["id"])
+    ]
+    payload = {
+        "start": start,
+        "end": end,
+        "cases": attested_cases,
+        "matrix": matrix,
+        "policy": policy,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    attestation = copy.deepcopy(payload)
+    attestation["digest"] = digest
+    return attestation
+
+
+def _normalize_verified_matrix_cases(value: Any, field: str) -> list[dict[str, Any]]:
+    """Structurally validate the attested matrix input case list.
+
+    Each item must have exactly the keys ``id``, ``facts``; ids must be
+    non-empty, unique, and strictly ascending in Unicode code point order,
+    and facts must map non-empty string keys to bool values. Returns fresh
+    normalized copies with sorted fact keys. Any violation raises
+    ``ValueError``.
+    """
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list of case dicts")
+    cases: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    previous_id: str | None = None
+    for index, case in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(case, dict) or set(case) != _CASE_KEYS:
+            raise ValueError(
+                f"{item_field} must be a dict with exactly the keys id, facts"
+            )
+        case_id = _check_non_empty_str(case["id"], f"{item_field}.id")
+        if case_id in seen:
+            raise ValueError(f"{field} has a duplicate case id: {case_id!r}")
+        if previous_id is not None and case_id <= previous_id:
+            raise ValueError(f"{field} case ids must be strictly ascending")
+        _check_fact_map(case["facts"], f"{item_field}.facts")
+        cases.append({"id": case_id, "facts": _sorted_fact_map(case["facts"])})
+        seen.add(case_id)
+        previous_id = case_id
+    return cases
+
+
+def _normalize_verified_matrix(
+    value: Any,
+    start: str,
+    end: str,
+    input_cases: list[dict[str, Any]],
+    field: str,
+) -> list[dict[str, Any]]:
+    """Validate an embedded decision matrix structurally.
+
+    Returns the normalized matrix points. The matrix must have exactly the
+    :func:`decision_matrix` keys with its window equal to the report window;
+    ``points`` must be a non-empty list with strictly increasing ``at``
+    values inside ``[start, end]`` and the first point at ``start``. Each
+    point must have exactly the keys ``at``, ``changes``, ``cases``;
+    ``changes`` must be a list of distinct non-empty strings and ``cases``
+    must contain one entry per attested input case, in the same strictly
+    ascending id order, with each entry conforming to the :func:`explain`
+    contract at the point's ``at``. Semantic agreement with a matrix rebuilt
+    from the attested schedule is checked separately. Any violation raises
+    ``ValueError``.
+    """
+    if not isinstance(value, dict) or set(value) != _MATRIX_RESULT_KEYS:
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys start, end, points"
+        )
+    matrix_start = _check_time(value["start"], f"{field}.start")
+    matrix_end = _check_time(value["end"], f"{field}.end")
+    if matrix_start != start or matrix_end != end:
+        raise ValueError(f"{field}.start/end must equal report.start/end")
+    raw_points = value["points"]
+    if not isinstance(raw_points, list) or not raw_points:
+        raise ValueError(f"{field}.points must be a non-empty list")
+    points: list[dict[str, Any]] = []
+    previous_at: str | None = None
+    for index, point in enumerate(raw_points):
+        point_field = f"{field}.points[{index}]"
+        if not isinstance(point, dict) or set(point) != _MATRIX_POINT_KEYS:
+            raise ValueError(
+                f"{point_field} must be a dict with exactly the keys "
+                "at, changes, cases"
+            )
+        at = _check_time(point["at"], f"{point_field}.at")
+        if not start <= at <= end:
+            raise ValueError(f"{point_field}.at lies outside [start, end]")
+        if index == 0:
+            if at != start:
+                raise ValueError(f"{field}.points[0].at must equal start")
+        elif at <= previous_at:  # type: ignore[operator]
+            raise ValueError(f"{field} points must be strictly increasing in at")
+        raw_changes = point["changes"]
+        if not isinstance(raw_changes, list):
+            raise ValueError(f"{point_field}.changes must be a list")
+        changes: list[str] = []
+        for change_index, change in enumerate(raw_changes):
+            change_field = f"{point_field}.changes[{change_index}]"
+            if not isinstance(change, str) or not change:
+                raise ValueError(f"{change_field} must be a non-empty case id")
+            if change in changes:
+                raise ValueError(f"{point_field}.changes must not repeat case ids")
+            changes.append(change)
+        raw_cases = point["cases"]
+        if not isinstance(raw_cases, list):
+            raise ValueError(f"{point_field}.cases must be a list of case dicts")
+        if len(raw_cases) != len(input_cases):
+            raise ValueError(
+                f"{point_field}.cases must contain one entry per attested "
+                "input case"
+            )
+        entries: list[dict[str, Any]] = []
+        for case_index, entry in enumerate(raw_cases):
+            entry_field = f"{point_field}.cases[{case_index}]"
+            if not isinstance(entry, dict) or set(entry) != _MATRIX_RESULT_CASE_KEYS:
+                raise ValueError(
+                    f"{entry_field} must be a dict with exactly the keys "
+                    "id, decision, trace, basis, conflicts"
+                )
+            case_id = _check_non_empty_str(entry["id"], f"{entry_field}.id")
+            if case_id != input_cases[case_index]["id"]:
+                raise ValueError(
+                    f"{entry_field}.id must match the attested input case id "
+                    "at the same position"
+                )
+            explanation = _normalize_verified_explanation(
+                {
+                    "at": at,
+                    "decision": entry["decision"],
+                    "trace": entry["trace"],
+                    "basis": entry["basis"],
+                    "conflicts": entry["conflicts"],
+                },
+                at,
+                entry_field,
+            )
+            entries.append(
+                {
+                    "id": case_id,
+                    "decision": explanation["decision"],
+                    "trace": explanation["trace"],
+                    "basis": explanation["basis"],
+                    "conflicts": explanation["conflicts"],
+                }
+            )
+        points.append({"at": at, "changes": changes, "cases": entries})
+        previous_at = at
+    return points
+
+
+def _rebuild_matrix_from_schedule(
+    start: str,
+    end: str,
+    cases: list[dict[str, Any]],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Rebuild the full decision matrix implied by an attested schedule.
+
+    The candidate timestamps are ``start`` plus every rule ``from``/non-empty
+    ``to`` boundary visible in the schedule's attested snapshots that falls in
+    ``(start, end]``; :func:`explain` is re-evaluated at each candidate for
+    every case in attested ``id`` order, the first point is always kept, and
+    later points are kept exactly when at least one case's ``decision``,
+    ``trace``, ``basis``, or ``conflicts`` changes — the
+    :func:`decision_matrix` rule. The original rules are not needed; the
+    union of the attested snapshots supplies every rule.
+    """
+    rules: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for point in policy["points"]:
+        for rule in point["rules"]:
+            key = (rule["source"], rule["id"], rule["ver"])
+            if key not in seen:
+                seen.add(key)
+                rules.append(rule)
+    candidates = {start}
+    for rule in rules:
+        for boundary in (rule["from"], rule["to"]):
+            if boundary is not None and start < boundary <= end:
+                candidates.add(boundary)
+
+    def explain_cases(at: str) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for case in cases:
+            report = explain(at, case["facts"], rules)
+            entries.append(
+                {
+                    "id": case["id"],
+                    "decision": report["decision"],
+                    "trace": report["trace"],
+                    "basis": report["basis"],
+                    "conflicts": report["conflicts"],
+                }
+            )
+        return entries
+
+    first_cases = explain_cases(start)
+    points = [{"at": start, "changes": [], "cases": first_cases}]
+    previous_cases = first_cases
+    for at in sorted(candidates - {start}):
+        current_cases = explain_cases(at)
+        changed = [
+            entry["id"]
+            for entry, previous in zip(current_cases, previous_cases)
+            if any(previous[field] != entry[field] for field in _COMPARE_FIELDS)
+        ]
+        if not changed:
+            continue
+        points.append({"at": at, "changes": changed, "cases": current_cases})
+        previous_cases = current_cases
+    return {"start": start, "end": end, "points": points}
+
+
+def verify_decision_matrix_attestation(report: Any, expected: Any) -> bool:
+    """Verify a :func:`decision_matrix_attestation` report by recomputation.
+
+    Pure function: it only inspects its arguments, needs no original rules
+    (the attested schedule snapshots are sufficient), touches neither
+    history nor files, and never mutates an input object at any level.
+
+    ``report`` must be a dict with exactly the keys ``start``, ``end``,
+    ``cases``, ``matrix``, ``policy``, ``digest`` and conform level by level
+    to the :func:`decision_matrix_attestation` contract. ``start``/``end``
+    must be valid UTC seconds with ``start <= end`` and ``digest`` must be 64
+    lowercase hexadecimal characters. ``cases`` must list ``id``/``facts``
+    items whose ids are non-empty, unique, and strictly ascending in Unicode
+    code point order and whose fact values are bool (an empty list is
+    valid). ``policy`` must be a full :func:`policy_schedule_attestation`
+    report over the same window and pass the existing schedule checks,
+    including snapshots, deltas, conflicts, and the hash chain. ``matrix``
+    must have exactly the keys ``start``, ``end``, ``points`` with the same
+    window; its points must be strictly increasing inside ``[start, end]``
+    (first point at ``start``), each with exactly the keys ``at``,
+    ``changes``, ``cases``; ``changes`` must be distinct non-empty strings
+    and ``cases`` must hold one structurally valid :func:`explain`-shaped
+    entry per attested input case in the same id order. ``expected`` must
+    have exactly the keys ``start``, ``end``, ``digest`` and is validated the
+    same way. All key-set, type, value-domain, and time checks complete
+    before any semantic rebuild or comparison.
+
+    The matrix is then rebuilt by re-evaluating the attested facts against
+    the rules visible in the policy snapshots, following the
+    :func:`decision_matrix` candidate and filtering rules; the reported
+    points must match the rebuilt matrix item by item — times, per-case
+    explanations, retained points, and the ``changes`` case-id lists — in
+    order. Any structural or semantic forgery raises ``ValueError``.
+
+    Afterwards the embedded schedule hash chain and the report digest are
+    recomputed as the lowercase hexadecimal SHA-256 of the compact UTF-8
+    JSON bytes over ``start``, ``end``, ``cases``, ``matrix``, ``policy`` in
+    that key order. Returns ``False`` when the declared digest, a timestamp,
+    the window, an ``expected`` value, a chain link, or the root does not
+    match; otherwise ``True``.
+    """
+    if not isinstance(report, dict) or set(report) != _MATRIX_ATTEST_REPORT_KEYS:
+        raise ValueError(
+            "report must be a dict with exactly the keys "
+            "start, end, cases, matrix, policy, digest"
+        )
+    start = _check_time(report["start"], "report.start")
+    end = _check_time(report["end"], "report.end")
+    if start > end:
+        raise ValueError("report.start must not be after report.end")
+    digest = _check_hex64(report["digest"], "report.digest")
+    cases = _normalize_verified_matrix_cases(report["cases"], "report.cases")
+    policy = _normalize_verified_schedule_report(report["policy"], "report.policy")
+    if policy["start"] != start or policy["end"] != end:
+        raise ValueError("report.policy.start/end must equal report.start/end")
+    matrix_points = _normalize_verified_matrix(
+        report["matrix"], start, end, cases, "report.matrix"
+    )
+
+    if not isinstance(expected, dict) or set(expected) != (
+        _MATRIX_ATTEST_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys start, end, digest"
+        )
+    expected_start = _check_time(expected["start"], "expected.start")
+    expected_end = _check_time(expected["end"], "expected.end")
+    if expected_start > expected_end:
+        raise ValueError("expected.start must not be after expected.end")
+    expected_digest = _check_hex64(expected["digest"], "expected.digest")
+
+    rebuilt_matrix = _rebuild_matrix_from_schedule(start, end, cases, policy)
+    declared_matrix = {"start": start, "end": end, "points": matrix_points}
+    if declared_matrix != rebuilt_matrix:
+        raise ValueError(
+            "report.matrix does not match the matrix rebuilt from "
+            "report.cases and report.policy under the decision_matrix "
+            "contract"
+        )
+
+    if start != expected_start or end != expected_end or digest != expected_digest:
+        return False
+    chain_ok, chain_root = _recompute_schedule_root(policy["points"])
+    if not chain_ok or policy["root"] != chain_root:
+        return False
+    content = {
+        "start": start,
+        "end": end,
+        "cases": cases,
+        "matrix": rebuilt_matrix,
+        "policy": policy,
+    }
+    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    recomputed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest == recomputed

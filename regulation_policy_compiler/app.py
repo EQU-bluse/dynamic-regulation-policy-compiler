@@ -20,6 +20,7 @@ from .policy import (
     decision_attestation,
     decision_impact,
     decision_impact_attestation,
+    decision_matrix_attestation,
     decision_timeline,
     decision_timeline_attestation,
     explain,
@@ -28,6 +29,7 @@ from .policy import (
     policy_schedule_attestation,
     verify_decision_attestation,
     verify_decision_impact_attestation,
+    verify_decision_matrix_attestation,
     verify_decision_timeline_attestation,
 )
 
@@ -44,6 +46,7 @@ _SCHEDULE_KEYS = {"start", "end", "rules"}
 _COMPARE_KEYS = {"from", "to", "facts", "rules"}
 _TIMELINE_KEYS = {"start", "end", "facts", "rules"}
 _IMPACT_KEYS = {"from", "to", "cases", "rules"}
+_MATRIX_KEYS = {"start", "end", "cases", "rules"}
 _VERIFY_KEYS = {"report", "expected"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
 
@@ -293,6 +296,42 @@ async def verify_decision_impact_attestation_endpoint(
         return _invalid_request()
     try:
         valid = verify_decision_impact_attestation(
+            body["report"], body["expected"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post("/decision-matrix/attest")
+async def decision_matrix_attestation_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _MATRIX_KEYS:
+        return _invalid_request()
+    try:
+        report = decision_matrix_attestation(
+            body["start"], body["end"], body["cases"], body["rules"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/decision-matrix/attest/verify")
+async def verify_decision_matrix_attestation_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_decision_matrix_attestation(
             body["report"], body["expected"]
         )
     except ValueError:
