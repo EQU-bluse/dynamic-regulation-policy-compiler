@@ -964,6 +964,200 @@ def decision_attestation(
     return attestation
 
 
+_DECISION_ATTEST_REPORT_KEYS = frozenset(
+    {"at", "facts", "explanation", "policy", "digest"}
+)
+_DECISION_ATTEST_EXPECTED_KEYS = frozenset({"at", "digest"})
+_COMPILED_POLICY_KEYS = frozenset({"at", "rules", "conflicts"})
+_EXPLANATION_KEYS = frozenset({"at", "decision", "trace", "basis", "conflicts"})
+_DECISION_ATTEST_CONTENT_KEYS = ("at", "facts", "explanation", "policy")
+
+
+def _check_hex64(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in _SCHEDULE_HEX_DIGITS for char in value)
+    ):
+        raise ValueError(f"{field} must be 64 lowercase hexadecimal characters")
+    return value
+
+
+def _check_trace_ref(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string of the form id@ver")
+    rule_id, sep, ver = value.rpartition("@")
+    if not sep or not rule_id or not ver.isdigit() or int(ver) < 1:
+        raise ValueError(f"{field} must be a string of the form id@ver")
+    return value
+
+
+def _normalize_verified_policy(
+    value: Any, at: str, field: str
+) -> dict[str, Any]:
+    """Validate a ``compile_rules`` snapshot structurally and semantically.
+
+    Returns a fresh normalized copy with the contract key order. The rules
+    must be valid snapshots, all effective at ``at``, unique per
+    ``(source, id)``, and ranked exactly as :func:`compile_rules` ranks them;
+    ``conflicts`` must equal the conflicts rebuilt from those rules. Any
+    violation raises ``ValueError``.
+    """
+    if not isinstance(value, dict) or set(value) != _COMPILED_POLICY_KEYS:
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys at, rules, conflicts"
+        )
+    policy_at = _check_time(value["at"], f"{field}.at")
+    if policy_at != at:
+        raise ValueError(f"{field}.at must equal report.at")
+    raw_rules = value["rules"]
+    try:
+        _validate_rules(raw_rules)
+    except ValueError as exc:
+        raise ValueError(f"{field}.rules are not valid rule snapshots: {exc}") from exc
+    rules = [_snapshot_rule(rule) for rule in raw_rules]
+    seen: set[tuple[str, str]] = set()
+    for index, rule in enumerate(rules):
+        if not (rule["from"] <= at and (rule["to"] is None or at < rule["to"])):
+            raise ValueError(f"{field}.rules[{index}] is not effective at report.at")
+        key = (rule["source"], rule["id"])
+        if key in seen:
+            raise ValueError(f"{field}.rules has a duplicate (source, id): {key!r}")
+        seen.add(key)
+    for index in range(len(rules) - 1):
+        if _compare(rules[index], rules[index + 1]) > 0:
+            raise ValueError(f"{field}.rules are not in compile_rules ranking order")
+    conflicts = _normalize_conflicts(value["conflicts"], f"{field}.conflicts")
+    if conflicts != _find_conflicts(rules):
+        raise ValueError(
+            f"{field}.conflicts do not equal the conflicts derived from "
+            f"{field}.rules"
+        )
+    return {"at": at, "rules": rules, "conflicts": conflicts}
+
+
+def _normalize_verified_explanation(
+    value: Any, at: str, field: str
+) -> dict[str, Any]:
+    """Validate an ``explain`` snapshot structurally and return a fresh copy."""
+    if not isinstance(value, dict) or set(value) != _EXPLANATION_KEYS:
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys "
+            "at, decision, trace, basis, conflicts"
+        )
+    explanation_at = _check_time(value["at"], f"{field}.at")
+    if explanation_at != at:
+        raise ValueError(f"{field}.at must equal report.at")
+    decision = value["decision"]
+    if decision is not None and not isinstance(decision, str):
+        raise ValueError(f"{field}.decision must be a string or null")
+    raw_trace = value["trace"]
+    if not isinstance(raw_trace, list):
+        raise ValueError(f"{field}.trace must be a list of id@ver strings")
+    trace = [
+        _check_trace_ref(item, f"{field}.trace[{index}]")
+        for index, item in enumerate(raw_trace)
+    ]
+    raw_basis = value["basis"]
+    if raw_basis is None:
+        basis = None
+    else:
+        try:
+            _validate_rules([raw_basis])
+        except ValueError as exc:
+            raise ValueError(
+                f"{field}.basis is not a valid rule snapshot: {exc}"
+            ) from exc
+        basis = _snapshot_rule(raw_basis)
+    conflicts = _normalize_conflicts(value["conflicts"], f"{field}.conflicts")
+    return {
+        "at": at,
+        "decision": decision,
+        "trace": trace,
+        "basis": basis,
+        "conflicts": conflicts,
+    }
+
+
+def verify_decision_attestation(report: Any, expected: Any) -> bool:
+    """Verify a :func:`decision_attestation` report by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level.
+
+    ``report`` must be a dict with exactly the keys ``at``, ``facts``,
+    ``explanation``, ``policy``, ``digest`` and conform level by level to the
+    :func:`decision_attestation` contract. ``at`` must be a valid UTC second;
+    ``facts`` must map non-empty string keys to bool values (an empty dict is
+    valid); ``digest`` must be 64 lowercase hexadecimal characters. ``policy``
+    must have exactly the keys ``at``, ``rules``, ``conflicts`` with its
+    ``at`` equal to the report ``at``; its rules must be effective at that
+    time (``from <= at < to`` or ``to`` null), unique per ``(source, id)``,
+    and ranked exactly as :func:`compile_rules` ranks them, and its
+    ``conflicts`` must equal the conflicts fully rebuilt from those rules
+    (ranked indices ``i < j``, differing results, compatible ``when``
+    conditions, earlier rule wins) — missing, forged, duplicated, or
+    misordered entries are all illegal. ``explanation`` must have exactly the
+    keys ``at``, ``decision``, ``trace``, ``basis``, ``conflicts`` with its
+    ``at`` equal to the report ``at``; it is re-evaluated against the policy
+    rules with the report facts, so with no match ``decision``/``basis`` are
+    null and ``trace``/``conflicts`` empty, while with a match ``decision`` is
+    the top-ranked matching rule's result, ``trace`` lists every matching
+    rule, ``basis`` is that rule's snapshot, and ``conflicts`` keeps the
+    policy conflicts involving that basis in their original order.
+    ``expected`` must have exactly the keys ``at`` and ``digest``, validated
+    the same way.
+
+    Any key-set, type, time, fact, rule, conflict, or explanation-semantic
+    violation raises ``ValueError``. Both inputs complete structural and
+    semantic validation before any comparison, so a bad report is never
+    masked by short-circuiting. Afterwards the canonical key order is rebuilt
+    (``facts`` and ``when`` keys in Unicode code point order) and the digest
+    is recomputed as the lowercase hexadecimal SHA-256 of the compact UTF-8
+    JSON bytes over ``at``, ``facts``, ``explanation``, ``policy`` in that
+    order. Returns ``False`` when the declared digest differs from the
+    recomputed value or the report's ``at``/``digest`` differ from
+    ``expected``; otherwise ``True``.
+    """
+    if not isinstance(report, dict) or set(report) != _DECISION_ATTEST_REPORT_KEYS:
+        raise ValueError(
+            "report must be a dict with exactly the keys "
+            "at, facts, explanation, policy, digest"
+        )
+    at = _check_time(report["at"], "report.at")
+    _check_fact_map(report["facts"], "report.facts")
+    facts = _sorted_fact_map(report["facts"])
+    policy = _normalize_verified_policy(report["policy"], at, "report.policy")
+    explanation = _normalize_verified_explanation(
+        report["explanation"], at, "report.explanation"
+    )
+    recomputed_explanation = explain(at, facts, policy["rules"])
+    if explanation != recomputed_explanation:
+        raise ValueError(
+            "report.explanation does not follow from report.facts and "
+            "report.policy under the explain contract"
+        )
+    _check_hex64(report["digest"], "report.digest")
+    if not isinstance(expected, dict) or set(expected) != (
+        _DECISION_ATTEST_EXPECTED_KEYS
+    ):
+        raise ValueError("expected must be a dict with exactly the keys at, digest")
+    expected_at = _check_time(expected["at"], "expected.at")
+    expected_digest = _check_hex64(expected["digest"], "expected.digest")
+
+    if at != expected_at or report["digest"] != expected_digest:
+        return False
+    content = {
+        "at": at,
+        "facts": facts,
+        "explanation": recomputed_explanation,
+        "policy": policy,
+    }
+    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return report["digest"] == digest
+
+
 _COMPARE_FIELDS = ("decision", "trace", "basis", "conflicts")
 
 
