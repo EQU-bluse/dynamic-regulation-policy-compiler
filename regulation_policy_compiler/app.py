@@ -17,6 +17,7 @@ from .policy import (
     _validate_rules,
     compare_decisions,
     compile_rules,
+    decision_attestation,
     decision_impact,
     decision_timeline,
     explain,
@@ -139,6 +140,21 @@ async def explain_decision(request: Request) -> Response:
     except ValueError:
         return _invalid_request()
     return _record_response(report)
+
+
+@app.post("/explanations/attest")
+async def decision_attestation_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _POST_KEYS:
+        return _invalid_request()
+    try:
+        attestation = decision_attestation(body["at"], body["facts"], body["rules"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(attestation)
 
 
 @app.post("/decision-changes")

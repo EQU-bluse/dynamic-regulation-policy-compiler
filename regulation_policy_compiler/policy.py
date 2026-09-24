@@ -919,6 +919,47 @@ def explain(
     }
 
 
+def decision_attestation(
+    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Bind facts, explanation, and effective policy into one decision voucher.
+
+    A single-point-in-time, independently recomputable attestation. The inputs
+    are validated exactly as in :func:`explain` (and :func:`compile_rules`);
+    any invalid time, fact type, rule structure, ``[from, to)`` interval, or
+    duplicate rule version raises ``ValueError`` without mutating the inputs.
+    Only the passed values are read: no history or files are touched.
+
+    Returns a deep copy with top-level keys ``at``, ``facts``,
+    ``explanation``, ``policy``, ``digest``. ``facts`` is a deep copy of the
+    input facts with keys sorted in Unicode code point order (an empty object
+    stays valid). ``explanation`` is the complete deep-copied
+    :func:`explain` result keeping its canonical key order at every level.
+    ``policy`` is the complete deep-copied :func:`compile_rules` result at the
+    same point, conflicts included.
+
+    The digest payload contains only the first four keys in that order,
+    encoded as UTF-8 bytes of the compact JSON
+    (``ensure_ascii=False``, ``separators=(',', ':')``); ``digest`` is its
+    lowercase 64-char hex SHA-256. Equal-valued inputs — regardless of the
+    original dict key order — yield byte-identical vouchers. The returned
+    branches share no mutable containers with the inputs or each other.
+    """
+    explanation = explain(at, facts, rules)
+    policy = compile_rules(at, rules)
+    sorted_facts = {key: facts[key] for key in sorted(facts)}
+    payload = {
+        "at": at,
+        "facts": copy.deepcopy(sorted_facts),
+        "explanation": copy.deepcopy(explanation),
+        "policy": copy.deepcopy(policy),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    payload["digest"] = digest
+    return payload
+
+
 _COMPARE_FIELDS = ("decision", "trace", "basis", "conflicts")
 
 
