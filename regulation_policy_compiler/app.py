@@ -25,6 +25,7 @@ from .policy import (
     decision_timeline,
     decision_timeline_attestation,
     explain,
+    matrix_bundle_diff,
     policy_attestation,
     policy_schedule,
     policy_schedule_attestation,
@@ -33,6 +34,7 @@ from .policy import (
     verify_decision_matrix_attestation,
     verify_decision_matrix_attestation_bundle,
     verify_decision_timeline_attestation,
+    verify_matrix_bundle_diff,
 )
 
 app = FastAPI(title="Dynamic Regulation Policy Compiler")
@@ -50,6 +52,7 @@ _TIMELINE_KEYS = {"start", "end", "facts", "rules"}
 _IMPACT_KEYS = {"from", "to", "cases", "rules"}
 _MATRIX_KEYS = {"start", "end", "cases", "rules"}
 _MATRIX_BUNDLE_ITEMS_KEYS = {"items"}
+_MATRIX_BUNDLE_DIFF_KEYS = {"before", "after"}
 _VERIFY_KEYS = {"report", "expected"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
 
@@ -371,6 +374,36 @@ async def verify_decision_matrix_attestation_bundle_endpoint(
         valid = verify_decision_matrix_attestation_bundle(
             body["report"], body["expected"]
         )
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post("/decision-matrix/attest/bundle/diff")
+async def matrix_bundle_diff_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _MATRIX_BUNDLE_DIFF_KEYS:
+        return _invalid_request()
+    try:
+        report = matrix_bundle_diff(body["before"], body["after"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/decision-matrix/attest/bundle/diff/verify")
+async def verify_matrix_bundle_diff_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_matrix_bundle_diff(body["report"], body["expected"])
     except ValueError:
         return _invalid_request()
     return _record_response({"valid": valid})

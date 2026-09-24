@@ -2661,6 +2661,82 @@ def _validate_matrix_bundle_report_ids(value: Any, field: str) -> list[str]:
     return ids
 
 
+def _normalize_verified_matrix_bundle(
+    report: Any, field: str = "report"
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run every structural and single-report check on a matrix bundle.
+
+    Enforces the full :func:`decision_matrix_attestation_bundle` report
+    contract exactly as :func:`verify_decision_matrix_attestation_bundle`
+    does: exact key sets, root/member digest formats, unique strictly
+    ascending member ids, and every member sub-report's single-report
+    structural and semantic checks. A false sub-report digest or a broken
+    embedded policy chain is structural data, so it is carried back via the
+    returned member entries (``sub_recomputed``, ``sub_chain_ok``,
+    ``sub_chain_root``) rather than raised, mirroring the ``False``
+    semantics. Returns ``(root, members)`` where each member carries a fresh
+    canonical-order deep copy of its sub-report. Any structural or semantic
+    violation raises ``ValueError`` and the input is never mutated.
+    """
+    if not isinstance(report, dict) or set(report) != set(_MATRIX_BUNDLE_REPORT_KEYS):
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys root, reports"
+        )
+    bundle_root = _check_hex64(report["root"], f"{field}.root")
+    raw_reports = report["reports"]
+    if not isinstance(raw_reports, list) or not raw_reports:
+        raise ValueError(f"{field}.reports must be a non-empty list")
+    members: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    previous_id: str | None = None
+    for index, member in enumerate(raw_reports):
+        member_field = f"{field}.reports[{index}]"
+        if not isinstance(member, dict) or set(member) != set(
+            _MATRIX_BUNDLE_MEMBER_KEYS
+        ):
+            raise ValueError(
+                f"{member_field} must be a dict with exactly the keys "
+                "id, report, previous, digest"
+            )
+        item_id = _check_non_empty_str(member["id"], f"{member_field}.id")
+        if item_id in seen_ids:
+            raise ValueError(
+                f"{field}.reports contains a duplicate id: {item_id!r}"
+            )
+        if previous_id is not None and item_id <= previous_id:
+            raise ValueError(
+                f"{field}.reports must be ordered by id in ascending "
+                "Unicode code point order"
+            )
+        # Structural and single-report semantic violations raise; a false
+        # sub-report digest or broken embedded chain is reported back as data
+        # so it can yield False only after every input validates.
+        content, sub_digest, sub_recomputed, sub_chain_ok, sub_chain_root = (
+            _check_verified_matrix_attestation(
+                member["report"], f"{member_field}.report"
+            )
+        )
+        previous = _check_hex64(member["previous"], f"{member_field}.previous")
+        digest = _check_hex64(member["digest"], f"{member_field}.digest")
+        canonical_sub_report = copy.deepcopy(content)
+        canonical_sub_report["digest"] = sub_digest
+        members.append(
+            {
+                "id": item_id,
+                "report": canonical_sub_report,
+                "previous": previous,
+                "digest": digest,
+                "sub_recomputed": sub_recomputed,
+                "sub_chain_ok": sub_chain_ok,
+                "sub_chain_root": sub_chain_root,
+                "sub_declared_root": content["policy"]["root"],
+            }
+        )
+        seen_ids.add(item_id)
+        previous_id = item_id
+    return bundle_root, members
+
+
 def verify_decision_matrix_attestation_bundle(report: Any, expected: Any) -> bool:
     """Verify a :func:`decision_matrix_attestation_bundle` by recomputation.
 
@@ -2691,56 +2767,8 @@ def verify_decision_matrix_attestation_bundle(report: Any, expected: Any) -> boo
     ``expected`` (ids compared after code point sorting); otherwise
     ``True``.
     """
-    if not isinstance(report, dict) or set(report) != set(_MATRIX_BUNDLE_REPORT_KEYS):
-        raise ValueError("report must be a dict with exactly the keys root, reports")
-    bundle_root = _check_hex64(report["root"], "report.root")
-    raw_reports = report["reports"]
-    if not isinstance(raw_reports, list) or not raw_reports:
-        raise ValueError("report.reports must be a non-empty list")
-    members: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    previous_id: str | None = None
-    for index, member in enumerate(raw_reports):
-        field = f"report.reports[{index}]"
-        if not isinstance(member, dict) or set(member) != set(
-            _MATRIX_BUNDLE_MEMBER_KEYS
-        ):
-            raise ValueError(
-                f"{field} must be a dict with exactly the keys "
-                "id, report, previous, digest"
-            )
-        item_id = _check_non_empty_str(member["id"], f"{field}.id")
-        if item_id in seen_ids:
-            raise ValueError(f"report.reports contains a duplicate id: {item_id!r}")
-        if previous_id is not None and item_id <= previous_id:
-            raise ValueError(
-                "report.reports must be ordered by id in ascending Unicode "
-                "code point order"
-            )
-        # Structural and single-report semantic violations raise; a false
-        # sub-report digest or broken embedded chain is reported back as data
-        # so it can yield False only after every input validates.
-        content, sub_digest, sub_recomputed, sub_chain_ok, sub_chain_root = (
-            _check_verified_matrix_attestation(member["report"], f"{field}.report")
-        )
-        previous = _check_hex64(member["previous"], f"{field}.previous")
-        digest = _check_hex64(member["digest"], f"{field}.digest")
-        canonical_sub_report = copy.deepcopy(content)
-        canonical_sub_report["digest"] = sub_digest
-        members.append(
-            {
-                "id": item_id,
-                "report": canonical_sub_report,
-                "previous": previous,
-                "digest": digest,
-                "sub_recomputed": sub_recomputed,
-                "sub_chain_ok": sub_chain_ok,
-                "sub_chain_root": sub_chain_root,
-                "sub_declared_root": content["policy"]["root"],
-            }
-        )
-        seen_ids.add(item_id)
-        previous_id = item_id
+    bundle_root, members = _normalize_verified_matrix_bundle(report, "report")
+    seen_ids = {member["id"] for member in members}
 
     if not isinstance(expected, dict) or set(expected) != set(
         _MATRIX_BUNDLE_EXPECTED_KEYS
@@ -2777,5 +2805,517 @@ def verify_decision_matrix_attestation_bundle(report: Any, expected: Any) -> boo
     if bundle_root != expected_root:
         return False
     if seen_ids != set(expected_ids):
+        return False
+    return True
+
+
+_MATRIX_BUNDLE_DIFF_KEYS = frozenset({"before", "after"})
+_MATRIX_BUNDLE_DIFF_REPORT_KEYS = (
+    "before_root",
+    "after_root",
+    "before",
+    "after",
+    "changes",
+    "digest",
+)
+_MATRIX_BUNDLE_DIFF_CHANGE_KEYS = frozenset({"id", "kind", "before", "after"})
+_MATRIX_BUNDLE_DIFF_EXPECTED_KEYS = (
+    "before_root",
+    "after_root",
+    "before_ids",
+    "after_ids",
+    "digest",
+)
+_MATRIX_BUNDLE_DIFF_KINDS = frozenset({"added", "removed", "changed"})
+
+
+def _matrix_bundle_is_truthful(
+    bundle_root: str, members: list[dict[str, Any]]
+) -> bool:
+    """Recompute a structurally normalized bundle's full hash chain.
+
+    Every sub-report digest and embedded policy chain must verify, each
+    ``previous``/``digest`` link must chain from the 64-zero genesis, and the
+    declared bundle ``root`` must equal the final member digest.
+    """
+    previous = _MATRIX_BUNDLE_GENESIS
+    for member in members:
+        if (
+            not member["sub_chain_ok"]
+            or member["sub_declared_root"] != member["sub_chain_root"]
+            or member["report"]["digest"] != member["sub_recomputed"]
+        ):
+            return False
+        if member["previous"] != previous:
+            return False
+        recomputed = _matrix_bundle_member_digest(
+            previous, member["id"], member["report"]
+        )
+        if member["digest"] != recomputed:
+            return False
+        previous = recomputed
+    return bundle_root == previous
+
+
+def _canonical_bundle_from_members(
+    bundle_root: str, members: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Rebuild a fresh ``root, reports`` bundle from normalized members."""
+    return {
+        "root": bundle_root,
+        "reports": [
+            {
+                "id": member["id"],
+                "report": copy.deepcopy(member["report"]),
+                "previous": member["previous"],
+                "digest": member["digest"],
+            }
+            for member in members
+        ],
+    }
+
+
+def _matrix_member_content(member: dict[str, Any]) -> dict[str, Any]:
+    """Return a normalized bundle member's sub-report without its digest."""
+    return {key: member["report"][key] for key in _MATRIX_ATTEST_CONTENT_KEYS}
+
+
+def _matrix_credential_semantics(content: dict[str, Any]) -> dict[str, Any]:
+    """Project a normalized matrix credential to its summary-free content.
+
+    The credential's own digest and the embedded schedule's ``root``,
+    ``previous``, and per-point ``digest`` fields are summaries, not
+    semantics: two credentials with the same facts, matrix, rules,
+    conflicts, and deltas but different hash fields describe the same
+    member. Change-side credentials are compared with bundle members on
+    this projection, so a false summary yields ``False`` at recomputation
+    rather than a structural mismatch, while genuinely different content
+    still raises ``ValueError``.
+    """
+    policy = content["policy"]
+    return {
+        "start": content["start"],
+        "end": content["end"],
+        "cases": copy.deepcopy(content["cases"]),
+        "matrix": copy.deepcopy(content["matrix"]),
+        "policy": {
+            "start": policy["start"],
+            "end": policy["end"],
+            "points": [
+                {key: point[key] for key in _SCHEDULE_POINT_CONTENT_KEYS}
+                for point in policy["points"]
+            ],
+        },
+    }
+
+
+def _matrix_member_semantics(member: dict[str, Any]) -> dict[str, Any]:
+    """Summary-free semantic projection of a normalized bundle member."""
+    return _matrix_credential_semantics(_matrix_member_content(member))
+
+
+def matrix_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
+    """Attest the difference between two decision matrix attestation bundles.
+
+    Pure function: it only processes its arguments, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    Both ``before`` and ``after`` must be complete
+    :func:`decision_matrix_attestation_bundle` reports. Before anything is
+    produced, both sides pass the full
+    :func:`verify_decision_matrix_attestation_bundle` structural and semantic
+    checks: key sets, digest formats, unique strictly ascending member ids,
+    and every embedded single matrix credential; the second side is still
+    fully checked when the first side merely carries a false digest. Any
+    structural or semantic violation, and any false sub-report digest, chain
+    link, or bundle root on either side, raises ``ValueError``.
+
+    Returns a deep copy with keys ``before_root``, ``after_root``,
+    ``before``, ``after``, ``changes``, ``digest`` in that order;
+    ``before_root``/``after_root`` are the two bundles' roots and
+    ``before``/``after`` are independent deep copies of the normalized
+    bundles. Members are matched by ``id``; ``changes`` keeps only the
+    ``added`` (only in ``after``), ``removed`` (only in ``before``), and
+    ``changed`` (present in both but with a different matrix credential)
+    members, ordered by ``id`` in ascending Unicode code point order. Each
+    change has keys ``id``, ``kind``, ``before``, ``after``; the two sides
+    are deep copies of the single matrix credential or ``null``. Identical
+    bundles yield an empty ``changes`` list.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) with no newline over a payload containing
+    exactly the first five keys in order. ``digest`` is the lowercase
+    64-char hex SHA-256 of ``C``. Equal-valued inputs yield byte-identical
+    results regardless of input dict key order, and no two levels share a
+    mutable container.
+    """
+    before_root, before_members = _normalize_verified_matrix_bundle(
+        before, "before"
+    )
+    after_root, after_members = _normalize_verified_matrix_bundle(
+        after, "after"
+    )
+    if not _matrix_bundle_is_truthful(before_root, before_members):
+        raise ValueError("before bundle root or hash chain does not verify")
+    if not _matrix_bundle_is_truthful(after_root, after_members):
+        raise ValueError("after bundle root or hash chain does not verify")
+
+    before_bundle = _canonical_bundle_from_members(before_root, before_members)
+    after_bundle = _canonical_bundle_from_members(after_root, after_members)
+    before_by_id = {member["id"]: member for member in before_members}
+    after_by_id = {member["id"]: member for member in after_members}
+
+    changes: list[dict[str, Any]] = []
+    for member_id in sorted(set(before_by_id) | set(after_by_id)):
+        before_member = before_by_id.get(member_id)
+        after_member = after_by_id.get(member_id)
+        if (
+            before_member is not None
+            and after_member is not None
+            and before_member["report"] == after_member["report"]
+        ):
+            continue
+        if before_member is None:
+            kind = "added"
+        elif after_member is None:
+            kind = "removed"
+        else:
+            kind = "changed"
+        changes.append(
+            {
+                "id": member_id,
+                "kind": kind,
+                "before": (
+                    copy.deepcopy(before_member["report"])
+                    if before_member is not None
+                    else None
+                ),
+                "after": (
+                    copy.deepcopy(after_member["report"])
+                    if after_member is not None
+                    else None
+                ),
+            }
+        )
+
+    payload = {
+        "before_root": before_root,
+        "after_root": after_root,
+        "before": before_bundle,
+        "after": after_bundle,
+        "changes": changes,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    result = copy.deepcopy(payload)
+    result["digest"] = digest
+    return result
+
+
+def _normalize_diff_change_credential(
+    value: Any, field: str
+) -> tuple[dict[str, Any], str, str, bool, str] | None:
+    """Validate one non-null change-side matrix credential.
+
+    Returns the same tuple :func:`_check_verified_matrix_attestation`
+    returns (canonical content, declared digest, recomputed digest, embedded
+    chain ok, embedded chain root), or ``None`` for an explicit null.
+    Structural and single-report semantic violations raise ``ValueError``; a
+    false digest is carried back as data.
+    """
+    if value is None:
+        return None
+    return _check_verified_matrix_attestation(value, field)
+
+
+def _normalize_verified_matrix_bundle_diff_changes(
+    value: Any,
+    before_members: list[dict[str, Any]],
+    after_members: list[dict[str, Any]],
+    field: str,
+) -> list[dict[str, Any]]:
+    """Structurally validate a diff ``changes`` list against both bundles.
+
+    Each change must have exactly the keys ``id``, ``kind``, ``before``,
+    ``after``; ids non-empty, bundle-wide unique, and strictly ascending in
+    Unicode code point order; ``kind`` one of ``added``, ``removed``,
+    ``changed``; each non-null side a fully valid single matrix credential.
+    Every change must agree with the two bundles — right kind for its id's
+    presence, correct null sides, and credential content equal to the
+    corresponding bundle member's credential — and the list must be
+    complete: every added or removed member and every present-in-both member
+    whose credential content differs must appear, unchanged members must
+    not. Returns fresh normalized entries carrying canonical declared
+    credentials and their digest-truth data. Any violation raises
+    ``ValueError``.
+    """
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list of change dicts")
+    before_by_id = {member["id"]: member for member in before_members}
+    after_by_id = {member["id"]: member for member in after_members}
+
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    previous_id: str | None = None
+    for index, change in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(change, dict) or set(change) != _MATRIX_BUNDLE_DIFF_CHANGE_KEYS:
+            raise ValueError(
+                f"{item_field} must be a dict with exactly the keys "
+                "id, kind, before, after"
+            )
+        member_id = _check_non_empty_str(change["id"], f"{item_field}.id")
+        if member_id in seen:
+            raise ValueError(f"{field} contains a duplicate change id: {member_id!r}")
+        if previous_id is not None and member_id <= previous_id:
+            raise ValueError(
+                f"{field} must be ordered by id in ascending Unicode code "
+                "point order"
+            )
+        kind = change["kind"]
+        if kind not in _MATRIX_BUNDLE_DIFF_KINDS:
+            raise ValueError(
+                f"{item_field}.kind must be 'added', 'removed', or 'changed'"
+            )
+        before_data = _normalize_diff_change_credential(
+            change["before"], f"{item_field}.before"
+        )
+        after_data = _normalize_diff_change_credential(
+            change["after"], f"{item_field}.after"
+        )
+        before_member = before_by_id.get(member_id)
+        after_member = after_by_id.get(member_id)
+        if kind == "added":
+            if before_data is not None or after_data is None:
+                raise ValueError(
+                    f"{item_field} is 'added' but before/after do not match "
+                    "the contract"
+                )
+            if before_member is not None or after_member is None:
+                raise ValueError(
+                    f"{item_field} id {member_id!r} is not added between the "
+                    "two bundles"
+                )
+            if _matrix_credential_semantics(after_data[0]) != _matrix_member_semantics(
+                after_member
+            ):
+                raise ValueError(
+                    f"{item_field}.after does not equal the after bundle's "
+                    f"credential for id {member_id!r}"
+                )
+        elif kind == "removed":
+            if before_data is None or after_data is not None:
+                raise ValueError(
+                    f"{item_field} is 'removed' but before/after do not "
+                    "match the contract"
+                )
+            if before_member is None or after_member is not None:
+                raise ValueError(
+                    f"{item_field} id {member_id!r} is not removed between "
+                    "the two bundles"
+                )
+            if _matrix_credential_semantics(
+                before_data[0]
+            ) != _matrix_member_semantics(before_member):
+                raise ValueError(
+                    f"{item_field}.before does not equal the before bundle's "
+                    f"credential for id {member_id!r}"
+                )
+        else:
+            if before_data is None or after_data is None:
+                raise ValueError(
+                    f"{item_field} is 'changed' but before/after do not "
+                    "match the contract"
+                )
+            if before_member is None or after_member is None:
+                raise ValueError(
+                    f"{item_field} id {member_id!r} must exist in both "
+                    "bundles to be 'changed'"
+                )
+            if _matrix_credential_semantics(
+                before_data[0]
+            ) != _matrix_member_semantics(before_member):
+                raise ValueError(
+                    f"{item_field}.before does not equal the before bundle's "
+                    f"credential for id {member_id!r}"
+                )
+            if _matrix_credential_semantics(after_data[0]) != _matrix_member_semantics(
+                after_member
+            ):
+                raise ValueError(
+                    f"{item_field}.after does not equal the after bundle's "
+                    f"credential for id {member_id!r}"
+                )
+
+        def canonical_credential(data: Any) -> dict[str, Any] | None:
+            if data is None:
+                return None
+            credential = copy.deepcopy(data[0])
+            credential["digest"] = data[1]
+            return credential
+
+        entries.append(
+            {
+                "id": member_id,
+                "kind": kind,
+                "before": canonical_credential(before_data),
+                "after": canonical_credential(after_data),
+                "before_truth": None if before_data is None else before_data[1:],
+                "after_truth": None if after_data is None else after_data[1:],
+            }
+        )
+        seen.add(member_id)
+        previous_id = member_id
+
+    expected_ids: set[str] = set(before_by_id) ^ set(after_by_id)
+    for member_id in sorted(set(before_by_id) & set(after_by_id)):
+        # Membership in the diff is a semantic question; false summaries are
+        # recomputed afterwards and must not fabricate "changed" members.
+        if _matrix_member_semantics(
+            before_by_id[member_id]
+        ) != _matrix_member_semantics(after_by_id[member_id]):
+            expected_ids.add(member_id)
+    if seen != expected_ids:
+        raise ValueError(
+            "changes must list exactly the added, removed, and changed "
+            "members, with unchanged members omitted"
+        )
+    return entries
+
+
+def verify_matrix_bundle_diff(report: Any, expected: Any) -> bool:
+    """Verify a :func:`matrix_bundle_diff` report by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level.
+
+    ``report`` must be a dict with exactly the keys ``before_root``,
+    ``after_root``, ``before``, ``after``, ``changes``, ``digest`` and
+    conform level by level to the :func:`matrix_bundle_diff` contract. The
+    two roots and ``digest`` must be 64 lowercase hexadecimal characters,
+    and each root must equal the root declared by its embedded bundle.
+    ``before``/``after`` must be complete matrix bundles that pass every
+    structural, member-order, digest-format, and embedded single-credential
+    semantic check. ``changes`` items must have exactly the keys ``id``,
+    ``kind``, ``before``, ``after`` with non-empty unique strictly ascending
+    ids, legal kinds, null sides matching each kind, and non-null sides that
+    are valid single matrix credentials and exactly reproduce the
+    corresponding bundle members; the list must be complete and omit
+    unchanged members. ``expected`` must have exactly the keys
+    ``before_root``, ``after_root``, ``before_ids``, ``after_ids``,
+    ``digest``; both id arrays must be non-empty lists of unique non-empty
+    strings (caller order is arbitrary; comparison is by code point). Any
+    structural, value-domain, uniqueness, ordering, or change-consistency
+    violation raises ``ValueError``, and both inputs finish structural
+    validation before any comparison.
+
+    Only afterwards are values recomputed rather than trusted: every
+    embedded sub-report digest and policy chain, both bundle hash chains and
+    roots, and the diff digest over the five declared prefix items in their
+    canonical compact-JSON form. Returns ``False`` when a sub-report digest,
+    chain link, bundle root, the diff digest, or an ``expected`` value (the
+    two roots, the digest, or either id set after code point sorting) does
+    not match; otherwise ``True``.
+    """
+    if not isinstance(report, dict) or set(report) != set(
+        _MATRIX_BUNDLE_DIFF_REPORT_KEYS
+    ):
+        raise ValueError(
+            "report must be a dict with exactly the keys "
+            "before_root, after_root, before, after, changes, digest"
+        )
+    before_root = _check_hex64(report["before_root"], "report.before_root")
+    after_root = _check_hex64(report["after_root"], "report.after_root")
+    digest = _check_hex64(report["digest"], "report.digest")
+    before_bundle_root, before_members = _normalize_verified_matrix_bundle(
+        report["before"], "report.before"
+    )
+    after_bundle_root, after_members = _normalize_verified_matrix_bundle(
+        report["after"], "report.after"
+    )
+    if before_bundle_root != before_root:
+        raise ValueError(
+            "report.before_root must equal report.before.root"
+        )
+    if after_bundle_root != after_root:
+        raise ValueError("report.after_root must equal report.after.root")
+    changes = _normalize_verified_matrix_bundle_diff_changes(
+        report["changes"], before_members, after_members, "report.changes"
+    )
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _MATRIX_BUNDLE_DIFF_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys "
+            "before_root, after_root, before_ids, after_ids, digest"
+        )
+    expected_before_root = _check_hex64(
+        expected["before_root"], "expected.before_root"
+    )
+    expected_after_root = _check_hex64(
+        expected["after_root"], "expected.after_root"
+    )
+    expected_digest = _check_hex64(expected["digest"], "expected.digest")
+    expected_before_ids = _validate_matrix_bundle_report_ids(
+        expected["before_ids"], "expected.before_ids"
+    )
+    expected_after_ids = _validate_matrix_bundle_report_ids(
+        expected["after_ids"], "expected.after_ids"
+    )
+
+    # Both inputs have now passed every key-set, type, digest-format,
+    # ordering, and embedded-credential semantic check. Only now recompute
+    # and compare; any mismatch yields False rather than raising.
+    if not _matrix_bundle_is_truthful(before_root, before_members):
+        return False
+    if not _matrix_bundle_is_truthful(after_root, after_members):
+        return False
+    for change in changes:
+        for credential, truth in (
+            (change["before"], change["before_truth"]),
+            (change["after"], change["after_truth"]),
+        ):
+            if truth is None:
+                continue
+            declared_digest, recomputed, chain_ok, chain_root = truth
+            # The non-null change side is a standalone credential: its
+            # declared digest must match, its embedded policy chain must
+            # verify, and the declared policy root must end that chain.
+            if (
+                not chain_ok
+                or declared_digest != recomputed
+                or credential["policy"]["root"] != chain_root
+            ):
+                return False
+    declared_changes = [
+        {
+            "id": change["id"],
+            "kind": change["kind"],
+            "before": change["before"],
+            "after": change["after"],
+        }
+        for change in changes
+    ]
+    content = {
+        "before_root": before_root,
+        "after_root": after_root,
+        "before": _canonical_bundle_from_members(before_root, before_members),
+        "after": _canonical_bundle_from_members(after_root, after_members),
+        "changes": declared_changes,
+    }
+    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    recomputed_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if digest != recomputed_digest:
+        return False
+    if (
+        before_root != expected_before_root
+        or after_root != expected_after_root
+        or digest != expected_digest
+    ):
+        return False
+    if {member["id"] for member in before_members} != set(expected_before_ids):
+        return False
+    if {member["id"] for member in after_members} != set(expected_after_ids):
         return False
     return True
