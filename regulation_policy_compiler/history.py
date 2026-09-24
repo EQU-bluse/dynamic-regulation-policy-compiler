@@ -18,6 +18,8 @@ _AUDIT_PAYLOAD_KEYS = ("at", "decision", "trace", "basis")
 _AUDIT_ENTRY_KEYS = ("at", "decision", "trace", "basis", "previous", "digest")
 _AUDIT_REPORT_KEYS = ("id", "start", "end", "root", "entries")
 _AUDIT_EXPECTED_KEYS = ("id", "start", "end", "root")
+_BUNDLE_REPORT_KEYS = ("start", "end", "root", "reports")
+_BUNDLE_EXPECTED_KEYS = ("start", "end", "root", "record_ids")
 _AUDIT_GENESIS = "0" * 64
 _HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -203,6 +205,156 @@ def verify_audit(report: Any, expected: Any) -> bool:
             return False
         previous = entry["digest"]
     return report["root"] == previous
+
+
+def _bundle_link(previous: str, record_id: str, report_root: str) -> str:
+    payload = json.dumps(
+        {"id": record_id, "root": report_root},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(
+        previous.encode("ascii") + payload.encode("utf-8")
+    ).hexdigest()
+
+
+def verify_audit_bundle(report: Any, expected: Any) -> bool:
+    """Verify a batch audit bundle against an expected summary.
+
+    Pure function: it touches neither history nor files and never mutates its
+    inputs. ``report`` must be a dict with exactly the keys
+    ``start, end, root, reports``; ``start``/``end`` valid UTC seconds with
+    ``start <= end`` and ``root`` a 64-character lowercase hexadecimal string.
+    ``reports`` must be a non-empty list of audit reports. Each sub-report must
+    conform exactly to the :func:`verify_audit` report contract: its ``id`` is
+    a non-empty string unique within the bundle, its time window equals the
+    bundle window, and its entries lie in that closed interval in strictly
+    increasing order. The sub-reports must be ordered by their ``id`` in
+    ascending Unicode code point order; duplicate ids or misordered reports are
+    illegal. ``expected`` must have exactly the keys
+    ``start, end, root, record_ids``; ``record_ids`` must be a non-empty list of
+    unique non-empty strings (caller order is arbitrary; comparison is by code
+    point). Any key-set, type, time, id, or digest-format violation at any
+    level raises ``ValueError``.
+
+    Structural validation completes before any comparison. Afterwards each
+    record's chain is recomputed with the same semantics as
+    :func:`verify_audit` (never trusting the declared digests), and the bundle
+    ``root`` is recomputed from the canonically ordered sub-reports using the
+    public batch chaining algorithm: starting from 64 ASCII ``0`` characters,
+    link each report's ``{"id","root"}`` payload. A ``previous``, ``digest``,
+    per-report ``root``, or bundle ``root`` mismatch returns ``False``, as do
+    differing time windows, roots, or record-id sets between ``report`` and
+    ``expected``; otherwise the result is ``True``.
+    """
+    if not isinstance(report, dict) or set(report) != set(_BUNDLE_REPORT_KEYS):
+        raise ValueError(
+            "report must be a dict with exactly the keys start, end, root, reports"
+        )
+    _check_time_window(report["start"], report["end"], "report")
+    _check_hex64(report["root"], "report.root")
+    reports = report["reports"]
+    if not isinstance(reports, list) or not reports:
+        raise ValueError("report.reports must be a non-empty list")
+
+    # Validate every sub-report structurally (exact audit-report contract) and
+    # confirm the canonical id ordering and bundle-wide uniqueness. Deep copies
+    # are normalized here so the caller's objects are never modified.
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    previous_id: str | None = None
+    for index, sub in enumerate(reports):
+        label = f"report.reports[{index}]"
+        if not isinstance(sub, dict) or set(sub) != set(_AUDIT_REPORT_KEYS):
+            raise ValueError(
+                f"{label} must be a dict with exactly the keys "
+                "id, start, end, root, entries"
+            )
+        record_id = sub["id"]
+        _check_non_empty_str(record_id, f"{label}.id")
+        if record_id in seen_ids:
+            raise ValueError(f"report.reports contains a duplicate id: {record_id!r}")
+        if previous_id is not None and not previous_id < record_id:
+            raise ValueError(
+                "report.reports must be ordered by id in ascending Unicode "
+                "code point order"
+            )
+        if sub["start"] != report["start"] or sub["end"] != report["end"]:
+            raise ValueError(f"{label} time window must equal the bundle window")
+        _check_hex64(sub["root"], f"{label}.root")
+        entries = sub["entries"]
+        if not isinstance(entries, list) or not entries:
+            raise ValueError(f"{label}.entries must be a non-empty list")
+        normalized_entries: list[dict[str, Any]] = []
+        previous_at: str | None = None
+        for entry_index, entry in enumerate(entries):
+            normalized_entries.append(
+                _validate_audit_entry(entry, entry_index)
+            )
+            at = entry["at"]
+            if previous_at is not None and at <= previous_at:
+                raise ValueError(f"{label}.entries must be strictly increasing in at")
+            if not report["start"] <= at <= report["end"]:
+                raise ValueError(
+                    f"{label}.entries[{entry_index}].at lies outside [start, end]"
+                )
+            previous_at = at
+        normalized.append(
+            {
+                "id": record_id,
+                "start": sub["start"],
+                "end": sub["end"],
+                "root": sub["root"],
+                "entries": normalized_entries,
+            }
+        )
+        seen_ids.add(record_id)
+        previous_id = record_id
+
+    if not isinstance(expected, dict) or set(expected) != set(_BUNDLE_EXPECTED_KEYS):
+        raise ValueError(
+            "expected must be a dict with exactly the keys "
+            "start, end, root, record_ids"
+        )
+    _check_time_window(expected["start"], expected["end"], "expected")
+    _check_hex64(expected["root"], "expected.root")
+    record_ids = expected["record_ids"]
+    if not isinstance(record_ids, list) or not record_ids:
+        raise ValueError("expected.record_ids must be a non-empty list")
+    expected_ids: set[str] = set()
+    for index, record_id in enumerate(record_ids):
+        _check_non_empty_str(record_id, f"expected.record_ids[{index}]")
+        if record_id in expected_ids:
+            raise ValueError("expected.record_ids must not contain duplicates")
+        expected_ids.add(record_id)
+
+    # All structural checks have passed; only now compare against expected.
+    if expected["start"] != report["start"] or expected["end"] != report["end"]:
+        return False
+    if expected["root"] != report["root"]:
+        return False
+    if expected_ids != seen_ids:
+        return False
+
+    # Recompute each record's chain rather than trusting declared digests.
+    recomputed_roots: list[str] = []
+    for sub in normalized:
+        previous = _AUDIT_GENESIS
+        for entry in sub["entries"]:
+            if entry["previous"] != previous:
+                return False
+            if entry["digest"] != _audit_digest(previous, entry):
+                return False
+            previous = entry["digest"]
+        if sub["root"] != previous:
+            return False
+        recomputed_roots.append(previous)
+
+    # Recompute the batch root from the canonically ordered sub-reports.
+    bundle_root = _AUDIT_GENESIS
+    for sub, recomputed_root in zip(normalized, recomputed_roots):
+        bundle_root = _bundle_link(bundle_root, sub["id"], recomputed_root)
+    return report["root"] == bundle_root
 
 
 class DecisionHistory:
