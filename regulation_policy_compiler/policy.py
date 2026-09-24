@@ -1267,6 +1267,316 @@ def decision_timeline(
     return {"start": start, "end": end, "points": points}
 
 
+def decision_timeline_attestation(
+    start: str,
+    end: str,
+    facts: dict[str, bool],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attest a :func:`decision_timeline` result together with its schedule.
+
+    ``start``, ``end``, ``facts``, and ``rules`` are validated exactly as in
+    :func:`decision_timeline`; any invalid time, fact, or rule raises
+    ``ValueError`` without mutating the inputs. Only the passed values are
+    used; no history or file is accessed.
+
+    Returns a deep copy with top-level keys ``start``, ``end``, ``facts``,
+    ``timeline``, ``policy``, ``digest``. ``facts`` is a deep copy of the
+    input facts with keys sorted in Unicode code point order (an empty dict
+    is valid); ``timeline`` is the full deep-copied :func:`decision_timeline`
+    result for the interval; ``policy`` is the full
+    :func:`policy_schedule_attestation` result for the same interval (snapshot
+    points, deltas, and hash chain included), and empty rule sets attest
+    normally.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) over a payload containing exactly ``start``,
+    ``end``, ``facts``, ``timeline``, ``policy`` in that key order. ``digest``
+    is the lowercase 64-char hex SHA-256 of ``C``. Equal-valued inputs yield
+    byte-identical attestations with stable key order at every level.
+    """
+    timeline = decision_timeline(start, end, facts, rules)
+    policy = policy_schedule_attestation(start, end, rules)
+    payload = {
+        "start": start,
+        "end": end,
+        "facts": _sorted_fact_map(facts),
+        "timeline": timeline,
+        "policy": policy,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    attestation = copy.deepcopy(payload)
+    attestation["digest"] = digest
+    return attestation
+
+
+_TIMELINE_ATTEST_REPORT_KEYS = frozenset(
+    {"start", "end", "facts", "timeline", "policy", "digest"}
+)
+_TIMELINE_ATTEST_EXPECTED_KEYS = frozenset({"start", "end", "digest"})
+_TIMELINE_OBJECT_KEYS = frozenset({"start", "end", "points"})
+_TIMELINE_POINT_KEYS = frozenset(
+    {"at", "decision", "trace", "basis", "conflicts", "changes"}
+)
+
+
+def _normalize_timeline_point(
+    point: Any,
+    index: int,
+    start: str,
+    end: str,
+    previous_at: str | None,
+) -> tuple[dict[str, Any], str]:
+    """Validate one decision-timeline point and return a normalized copy."""
+    field = f"timeline.points[{index}]"
+    if not isinstance(point, dict) or set(point) != _TIMELINE_POINT_KEYS:
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys "
+            "at, decision, trace, basis, conflicts, changes"
+        )
+    at = _check_time(point["at"], f"{field}.at")
+    if not start <= at <= end:
+        raise ValueError(f"{field}.at lies outside [start, end]")
+    if index == 0:
+        if at != start:
+            raise ValueError("timeline.points[0].at must equal start")
+    elif at <= previous_at:  # type: ignore[operator]
+        raise ValueError("timeline points must be strictly increasing in at")
+    decision = point["decision"]
+    if decision is not None and not isinstance(decision, str):
+        raise ValueError(f"{field}.decision must be a string or null")
+    raw_trace = point["trace"]
+    if not isinstance(raw_trace, list):
+        raise ValueError(f"{field}.trace must be a list of id@ver strings")
+    trace = [
+        _check_trace_ref(item, f"{field}.trace[{trace_index}]")
+        for trace_index, item in enumerate(raw_trace)
+    ]
+    basis = _normalize_optional_rule(point["basis"], f"{field}.basis")
+    conflicts = _normalize_conflicts(point["conflicts"], f"{field}.conflicts")
+    raw_changes = point["changes"]
+    if not isinstance(raw_changes, list) or any(
+        not isinstance(item, str) or item not in _COMPARE_FIELDS
+        for item in raw_changes
+    ):
+        raise ValueError(
+            f"{field}.changes must be a list of field names from "
+            "decision, trace, basis, conflicts"
+        )
+    normalized = {
+        "at": at,
+        "decision": decision,
+        "trace": trace,
+        "basis": basis,
+        "conflicts": conflicts,
+        "changes": list(raw_changes),
+    }
+    return normalized, at
+
+
+def _rebuild_timeline_from_schedule(
+    start: str,
+    end: str,
+    facts: dict[str, bool],
+    schedule_points: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Re-evaluate the facts at each attested schedule point and filter.
+
+    Mirrors :func:`decision_timeline`: the first point is always kept and a
+    later point only when its explanation differs from the previously kept
+    one. Schedule points already omit every boundary at which the compiled
+    policy is unchanged, so evaluating at them yields the same timeline as
+    evaluating at every rule boundary.
+    """
+    first = explain(start, facts, schedule_points[0]["rules"])
+    points = [
+        {
+            "at": first["at"],
+            "decision": first["decision"],
+            "trace": first["trace"],
+            "basis": first["basis"],
+            "conflicts": first["conflicts"],
+            "changes": [],
+        }
+    ]
+    previous = first
+    for point in schedule_points[1:]:
+        report = explain(point["at"], facts, point["rules"])
+        changes = [
+            field for field in _COMPARE_FIELDS if previous[field] != report[field]
+        ]
+        if not changes:
+            continue
+        points.append(
+            {
+                "at": report["at"],
+                "decision": report["decision"],
+                "trace": report["trace"],
+                "basis": report["basis"],
+                "conflicts": report["conflicts"],
+                "changes": changes,
+            }
+        )
+        previous = report
+    return {"start": start, "end": end, "points": points}
+
+
+def verify_decision_timeline_attestation(report: Any, expected: Any) -> bool:
+    """Verify a :func:`decision_timeline_attestation` report by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level.
+
+    ``report`` must be a dict with exactly the keys ``start``, ``end``,
+    ``facts``, ``timeline``, ``policy``, ``digest`` and conform level by
+    level to the :func:`decision_timeline_attestation` contract. ``start``/
+    ``end`` must be valid UTC seconds with ``start <= end``; ``facts`` must
+    map non-empty string keys to bool values (an empty dict is valid);
+    ``digest`` must be 64 lowercase hexadecimal characters. ``timeline`` must
+    be the embedded :func:`decision_timeline` result (exact keys
+    ``start, end, points`` matching the report interval; points non-empty,
+    strictly increasing, starting at ``start``) and ``policy`` the embedded
+    :func:`policy_schedule_attestation` result for the same interval, which
+    must pass the existing schedule-attestation verification — rule
+    snapshots, deltas, ordering, and the SHA-256 hash chain. The timeline is
+    rebuilt by re-evaluating the facts at every attested policy point with
+    the existing filtering rule; the reported point order, explanations, and
+    ``changes`` must match it item by item.
+
+    ``expected`` must have exactly the keys ``start``, ``end``, ``digest``,
+    validated the same way. Any key-set, type, value-domain, time, or
+    semantic violation (in either input) raises ``ValueError``; both inputs
+    complete structural and semantic validation before any comparison.
+
+    Afterwards the canonical key order is rebuilt (``facts`` and ``when``
+    keys in Unicode code point order) and the digest is recomputed as the
+    lowercase hexadecimal SHA-256 of the compact UTF-8 JSON bytes over
+    ``start``, ``end``, ``facts``, ``timeline``, ``policy`` in that order.
+    Returns ``False`` when the schedule chain or its declared root fails, the
+    declared report digest differs from the recomputed value, or the report's
+    ``start``/``end``/``digest`` differ from ``expected``; otherwise ``True``.
+    """
+    if not isinstance(report, dict) or set(report) != _TIMELINE_ATTEST_REPORT_KEYS:
+        raise ValueError(
+            "report must be a dict with exactly the keys "
+            "start, end, facts, timeline, policy, digest"
+        )
+    start = _check_time(report["start"], "report.start")
+    end = _check_time(report["end"], "report.end")
+    if start > end:
+        raise ValueError("report.start must not be after report.end")
+    _check_fact_map(report["facts"], "report.facts")
+    facts = _sorted_fact_map(report["facts"])
+    _check_hex64(report["digest"], "report.digest")
+
+    if not isinstance(expected, dict) or set(expected) != (
+        _TIMELINE_ATTEST_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys start, end, digest"
+        )
+    expected_start = _check_time(expected["start"], "expected.start")
+    expected_end = _check_time(expected["end"], "expected.end")
+    if expected_start > expected_end:
+        raise ValueError("expected.start must not be after expected.end")
+    expected_digest = _check_hex64(expected["digest"], "expected.digest")
+
+    raw_timeline = report["timeline"]
+    if not isinstance(raw_timeline, dict) or set(raw_timeline) != _TIMELINE_OBJECT_KEYS:
+        raise ValueError(
+            "report.timeline must be a dict with exactly the keys start, end, points"
+        )
+    timeline_start = _check_time(raw_timeline["start"], "report.timeline.start")
+    timeline_end = _check_time(raw_timeline["end"], "report.timeline.end")
+    if timeline_start != start or timeline_end != end:
+        raise ValueError(
+            "report.timeline start/end must equal report start/end"
+        )
+    raw_points = raw_timeline["points"]
+    if not isinstance(raw_points, list) or not raw_points:
+        raise ValueError("report.timeline.points must be a non-empty list")
+    normalized_points: list[dict[str, Any]] = []
+    previous_at: str | None = None
+    for index, point in enumerate(raw_points):
+        normalized, at = _normalize_timeline_point(
+            point, index, start, end, previous_at
+        )
+        normalized_points.append(normalized)
+        previous_at = at
+    timeline = {"start": start, "end": end, "points": normalized_points}
+
+    raw_policy = report["policy"]
+    if not isinstance(raw_policy, dict) or set(raw_policy) != set(
+        _SCHEDULE_ATTEST_REPORT_KEYS
+    ):
+        raise ValueError(
+            "report.policy must be a dict with exactly the keys "
+            "start, end, root, points"
+        )
+    policy_start = _check_time(raw_policy["start"], "report.policy.start")
+    policy_end = _check_time(raw_policy["end"], "report.policy.end")
+    if policy_start != start or policy_end != end:
+        raise ValueError("report.policy start/end must equal report start/end")
+    policy_root = _check_schedule_hex64(raw_policy["root"], "report.policy.root")
+    if not isinstance(raw_policy["points"], list) or not raw_policy["points"]:
+        raise ValueError("report.policy.points must be a non-empty list")
+
+    # The embedded schedule attestation must pass the existing verification
+    # contract in full: snapshots, deltas, ordering semantics, and hash chain.
+    schedule_expected = {"start": start, "end": end, "root": policy_root}
+    if not verify_policy_schedule_attestation(raw_policy, schedule_expected):
+        return False
+
+    normalized_schedule_points: list[dict[str, Any]] = []
+    schedule_previous_at: str | None = None
+    for index, point in enumerate(raw_policy["points"]):
+        normalized, at = _normalize_schedule_point(
+            point, index, start, end, schedule_previous_at
+        )
+        _check_schedule_point_semantics(
+            normalized,
+            index,
+            normalized_schedule_points[-1] if normalized_schedule_points else None,
+        )
+        normalized_schedule_points.append(normalized)
+        schedule_previous_at = at
+    policy = {
+        "start": start,
+        "end": end,
+        "root": policy_root,
+        "points": normalized_schedule_points,
+    }
+
+    rebuilt_timeline = _rebuild_timeline_from_schedule(
+        start, end, facts, normalized_schedule_points
+    )
+    if timeline != rebuilt_timeline:
+        raise ValueError(
+            "report.timeline does not match the timeline rebuilt from "
+            "report.facts and report.policy"
+        )
+
+    payload = {
+        "start": start,
+        "end": end,
+        "facts": facts,
+        "timeline": timeline,
+        "policy": policy,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if report["digest"] != digest:
+        return False
+    if (
+        start != expected_start
+        or end != expected_end
+        or report["digest"] != expected_digest
+    ):
+        return False
+    return True
+
+
 _CASE_KEYS = frozenset({"id", "facts"})
 
 

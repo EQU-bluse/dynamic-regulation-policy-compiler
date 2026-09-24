@@ -20,11 +20,13 @@ from .policy import (
     decision_attestation,
     decision_impact,
     decision_timeline,
+    decision_timeline_attestation,
     explain,
     policy_attestation,
     policy_schedule,
     policy_schedule_attestation,
     verify_decision_attestation,
+    verify_decision_timeline_attestation,
 )
 
 app = FastAPI(title="Dynamic Regulation Policy Compiler")
@@ -205,6 +207,38 @@ async def decision_timeline_endpoint(request: Request) -> Response:
     except ValueError:
         return _invalid_request()
     return _record_response(report)
+
+
+@app.post("/decision-timeline/attest")
+async def decision_timeline_attestation_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _TIMELINE_KEYS:
+        return _invalid_request()
+    try:
+        report = decision_timeline_attestation(
+            body["start"], body["end"], body["facts"], body["rules"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/decision-timeline/attest/verify")
+async def verify_decision_timeline_attestation_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_decision_timeline_attestation(body["report"], body["expected"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
 
 
 @app.post("/decision-impact")
