@@ -19,6 +19,7 @@ from .policy import (
     compile_rules,
     decision_attestation,
     decision_impact,
+    decision_impact_attestation,
     decision_timeline,
     decision_timeline_attestation,
     explain,
@@ -26,6 +27,7 @@ from .policy import (
     policy_schedule,
     policy_schedule_attestation,
     verify_decision_attestation,
+    verify_decision_impact_attestation,
     verify_decision_timeline_attestation,
 )
 
@@ -260,6 +262,42 @@ async def decision_impact_endpoint(request: Request) -> Response:
     except ValueError:
         return _invalid_request()
     return _record_response(report)
+
+
+@app.post("/decision-impact/attest")
+async def decision_impact_attestation_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _IMPACT_KEYS:
+        return _invalid_request()
+    try:
+        report = decision_impact_attestation(
+            body["from"], body["to"], body["cases"], body["rules"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/decision-impact/attest/verify")
+async def verify_decision_impact_attestation_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_decision_impact_attestation(
+            body["report"], body["expected"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
 
 
 @app.post("/decisions/{record_id}")
