@@ -15,6 +15,7 @@ from .policy import (
     _check_non_empty_str,
     _check_time,
     _validate_rules,
+    checkpoint_chain,
     compare_decisions,
     compile_rules,
     decision_attestation,
@@ -33,6 +34,7 @@ from .policy import (
     policy_attestation,
     policy_schedule,
     policy_schedule_attestation,
+    verify_checkpoint_chain,
     verify_decision_attestation,
     verify_decision_impact_attestation,
     verify_decision_matrix_attestation,
@@ -67,6 +69,7 @@ _VERIFY_KEYS = {"report", "expected"}
 _EVOLUTION_CHECKPOINT_VERIFY_KEYS = {"proof", "expected"}
 _CHECKPOINT_BUNDLE_ITEMS_KEYS = {"items"}
 _CHECKPOINT_BUNDLE_DIFF_KEYS = {"before", "after"}
+_CHECKPOINT_CHAIN_KEYS = {"stages"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
 
 
@@ -547,6 +550,38 @@ async def verify_evolution_checkpoint_bundle_diff_endpoint(
         valid = verify_evolution_checkpoint_bundle_diff(
             body["report"], body["expected"]
         )
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain")
+async def checkpoint_chain_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _CHECKPOINT_CHAIN_KEYS:
+        return _invalid_request()
+    try:
+        report = checkpoint_chain(body["stages"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain/verify"
+)
+async def verify_checkpoint_chain_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_checkpoint_chain(body["report"], body["expected"])
     except ValueError:
         return _invalid_request()
     return _record_response({"valid": valid})

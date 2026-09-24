@@ -4527,7 +4527,7 @@ def _normalize_verified_checkpoint_diff_changes(
     before_members: list[dict[str, Any]],
     after_members: list[dict[str, Any]],
     field: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     """Structurally validate a checkpoint diff ``changes`` list.
 
     Each change must have exactly the keys ``id``, ``kind``, ``before``,
@@ -4536,11 +4536,14 @@ def _normalize_verified_checkpoint_diff_changes(
     ``changed``; each non-null side a fully valid checkpoint proof. Every
     change must agree with the two bundles — right kind for its id's
     presence, correct null sides, and proof semantics equal to the
-    corresponding bundle member's proof — and the list must be complete:
-    every added or removed member and every present-in-both member whose
-    proof semantics differ must appear, unchanged members must not. Returns
-    fresh normalized entries carrying canonical deep-copy proofs. Any
-    violation raises ``ValueError``.
+    corresponding bundle member's proof. Returns ``(entries, complete)``
+    with fresh normalized entries carrying canonical deep-copy proofs;
+    ``complete`` is whether the list covers exactly the added, removed, and
+    changed members with unchanged members omitted. Any per-item structural,
+    ordering, or side-value violation raises ``ValueError``; a legal list
+    that merely misses an expected change (or lists an extra one) is
+    structural data carried back in ``complete`` so it yields ``False``
+    only after every input validates.
     """
     if not isinstance(value, list):
         raise ValueError(f"{field} must be a list of change dicts")
@@ -4660,29 +4663,34 @@ def _normalize_verified_checkpoint_diff_changes(
             _checkpoint_proof_semantics(after_by_id[member_id]["proof"])
         ):
             expected_ids.add(member_id)
-    if seen != expected_ids:
-        raise ValueError(
-            "changes must list exactly the added, removed, and changed "
-            "members, with unchanged members omitted"
-        )
-    return entries
+    # Completeness is not a structural property: a legal list that omits an
+    # expected change (or adds an extra one) yields False at recomputation.
+    return entries, seen == expected_ids
 
 
 def _normalize_verified_checkpoint_diff_report(
     value: Any, field: str
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    bool,
+]:
     """Run every structural and semantic check on a checkpoint diff report.
 
     Validates an :func:`evolution_checkpoint_bundle_diff`-shaped report
     exactly as :func:`verify_evolution_checkpoint_bundle_diff` does: the six
     exact keys, hex64 summaries, root fields matching their embedded
     bundles, both bundles' full structural and embedded-proof checks, and
-    the complete change-list consistency rules. Returns ``(content,
-    before_members, after_members, change_entries)`` where ``content`` is a
-    fresh canonical-order dict with the six diff keys (its ``before``/
-    ``after`` bundles and change proofs are independent deep copies).
-    False summaries are not detected here — callers recompute them
-    afterwards, yielding ``False`` rather than ``ValueError``.
+    the per-item change consistency rules. Returns ``(content,
+    before_members, after_members, change_entries, changes_complete)``
+    where ``content`` is a fresh canonical-order dict with the six diff keys
+    (its ``before``/``after`` bundles and change proofs are independent deep
+    copies) and ``changes_complete`` records whether the legal change list
+    covers exactly the added, removed, and changed members. False summaries
+    and incomplete change lists are not detected here — callers recompute
+    them afterwards, yielding ``False`` rather than ``ValueError``.
     """
     if not isinstance(value, dict) or set(value) != set(
         _CHECKPOINT_BUNDLE_DIFF_REPORT_KEYS
@@ -4704,7 +4712,7 @@ def _normalize_verified_checkpoint_diff_report(
         raise ValueError(f"{field}.before_root must equal {field}.before.root")
     if after_bundle_root != after_root:
         raise ValueError(f"{field}.after_root must equal {field}.after.root")
-    change_entries = _normalize_verified_checkpoint_diff_changes(
+    change_entries, changes_complete = _normalize_verified_checkpoint_diff_changes(
         value["changes"], before_members, after_members, f"{field}.changes"
     )
     content = {
@@ -4727,7 +4735,7 @@ def _normalize_verified_checkpoint_diff_report(
         ],
         "digest": digest,
     }
-    return content, before_members, after_members, change_entries
+    return content, before_members, after_members, change_entries, changes_complete
 
 
 def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
@@ -4747,7 +4755,9 @@ def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
     ``kind``, ``before``, ``after`` with non-empty unique strictly ascending
     ids, legal kinds, null sides matching each kind, and non-null sides that
     are valid checkpoint proofs exactly reproducing the corresponding bundle
-    members; the list must be complete and omit unchanged members.
+    members. A structurally legal change list that omits an expected change
+    or lists an extra one is not a structural error: it yields ``False``
+    after validation.
     ``expected`` must have exactly the keys ``before_root``, ``after_root``,
     ``before_ids``, ``after_ids``, ``digest``; both id arrays must be
     non-empty lists of unique non-empty strings (caller order is arbitrary;
@@ -4764,7 +4774,7 @@ def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
     value (the two roots, the digest, or either id set after code point
     sorting) does not match; otherwise ``True``.
     """
-    content, before_members, after_members, changes = (
+    content, before_members, after_members, changes, changes_complete = (
         _normalize_verified_checkpoint_diff_report(report, "report")
     )
     before_root = content["before_root"]
@@ -4799,6 +4809,8 @@ def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
         return False
     if not _checkpoint_bundle_is_truthful(after_root, after_members):
         return False
+    if not changes_complete:
+        return False
     for change in changes:
         for proof in (change["before"], change["after"]):
             if proof is None:
@@ -4824,5 +4836,357 @@ def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
     if {member["id"] for member in before_members} != set(expected_before_ids):
         return False
     if {member["id"] for member in after_members} != set(expected_after_ids):
+        return False
+    return True
+
+
+_CHECKPOINT_CHAIN_STAGE_ITEM_KEYS = frozenset({"at", "bundle"})
+_CHECKPOINT_CHAIN_REPORT_KEYS = ("root", "stages")
+_CHECKPOINT_CHAIN_STAGE_KEYS = ("at", "bundle", "diff", "previous", "digest")
+_CHECKPOINT_CHAIN_EXPECTED_KEYS = ("root", "stages")
+_CHECKPOINT_CHAIN_EXPECTED_STAGE_KEYS = frozenset(
+    {"at", "bundle_root", "diff_digest"}
+)
+_CHECKPOINT_CHAIN_GENESIS = "0" * 64
+
+
+def _checkpoint_chain_stage_digest(
+    previous: str, at: str, bundle: dict[str, Any], diff: dict[str, Any] | None
+) -> str:
+    """Compute one checkpoint chain stage digest.
+
+    The payload contains exactly ``at``, ``bundle``, ``diff`` in that key
+    order, encoded as compact UTF-8 JSON with no newline; the digest is the
+    lowercase hexadecimal SHA-256 of ``previous``'s ASCII bytes immediately
+    followed by those payload bytes.
+    """
+    payload = {"at": at, "bundle": bundle, "diff": diff}
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(
+        previous.encode("ascii") + canonical.encode("utf-8")
+    ).hexdigest()
+
+
+def _checkpoint_bundle_semantics(bundle: dict[str, Any]) -> list[tuple[str, Any]]:
+    """Summary-free semantic projection of a canonical checkpoint bundle.
+
+    Projects a ``root, proofs`` bundle to the ordered list of member ids and
+    their summary-free proof semantics, so a bundle embedded inside a stage
+    diff can be checked against the neighboring stage bundle on semantics: a
+    false member or root summary then yields ``False`` at recomputation
+    instead of a structural ``ValueError``.
+    """
+    return [
+        (member["id"], _checkpoint_proof_semantics(member["proof"]))
+        for member in bundle["proofs"]
+    ]
+
+
+def checkpoint_chain(stages: Any) -> dict[str, Any]:
+    """Chain evolution checkpoint bundles across release stages.
+
+    Pure function: it only processes its argument, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    ``stages`` must be a non-empty list whose items are dicts with exactly
+    the keys ``at`` and ``bundle``; array order is the release order. Each
+    ``at`` must be a valid UTC second strictly increasing (a non-list, an
+    empty list, duplicates, disorder, or missing/extra fields raise
+    ``ValueError``), and every ``bundle`` must pass every existing
+    :func:`evolution_checkpoint_bundle` structural, embedded-proof,
+    member-chain, and root check — a false proof, member link, or root
+    digest raises ``ValueError``.
+
+    Returns a deep copy with keys ``root``, ``stages`` in that order; each
+    stage has keys ``at``, ``bundle``, ``diff``, ``previous``, ``digest``.
+    The first stage's ``diff`` is ``null``; every later ``diff`` is the
+    complete :func:`evolution_checkpoint_bundle_diff` credential from the
+    preceding bundle to the current one under the existing diff semantics.
+    The first stage's ``previous`` is 64 ASCII ``0`` characters; every later
+    stage's ``previous`` is the preceding stage's ``digest``. The per-stage
+    payload contains exactly ``at``, ``bundle``, ``diff`` in that key order,
+    encoded as compact UTF-8 JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) with no newline; ``digest`` is the lowercase
+    hexadecimal SHA-256 of ``previous``'s ASCII bytes immediately followed
+    by that payload, and ``root`` is the last stage's ``digest``.
+    Equal-valued inputs yield byte-identical results and no level shares an
+    input object.
+    """
+    if not isinstance(stages, list) or not stages:
+        raise ValueError("stages must be a non-empty list of {at, bundle} dicts")
+    normalized: list[tuple[str, dict[str, Any]]] = []
+    previous_at: str | None = None
+    for index, stage in enumerate(stages):
+        field = f"stages[{index}]"
+        if not isinstance(stage, dict) or set(stage) != (
+            _CHECKPOINT_CHAIN_STAGE_ITEM_KEYS
+        ):
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys at, bundle"
+            )
+        at = _check_time(stage["at"], f"{field}.at")
+        if previous_at is not None and at <= previous_at:
+            raise ValueError(
+                f"{field}.at must be strictly greater than the preceding at"
+            )
+        # Every bundle must fully verify (structure, embedded proofs, member
+        # chain, and root) before anything is produced.
+        bundle_root, bundle_members = _normalize_verified_checkpoint_bundle(
+            stage["bundle"], f"{field}.bundle"
+        )
+        if not _checkpoint_bundle_is_truthful(bundle_root, bundle_members):
+            raise ValueError(f"{field}.bundle root or hash chain does not verify")
+        normalized.append(
+            (
+                at,
+                _canonical_checkpoint_bundle_from_members(
+                    bundle_root, bundle_members
+                ),
+            )
+        )
+        previous_at = at
+
+    result_stages: list[dict[str, Any]] = []
+    previous = _CHECKPOINT_CHAIN_GENESIS
+    digest = previous
+    prior_bundle: dict[str, Any] | None = None
+    for at, bundle in normalized:
+        diff = (
+            None
+            if prior_bundle is None
+            else evolution_checkpoint_bundle_diff(prior_bundle, bundle)
+        )
+        digest = _checkpoint_chain_stage_digest(previous, at, bundle, diff)
+        result_stages.append(
+            {
+                "at": at,
+                "bundle": copy.deepcopy(bundle),
+                "diff": None if diff is None else copy.deepcopy(diff),
+                "previous": previous,
+                "digest": digest,
+            }
+        )
+        prior_bundle = bundle
+        previous = digest
+    return {"root": digest, "stages": result_stages}
+
+
+def _normalize_verified_checkpoint_chain(
+    report: Any, field: str = "report"
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run every structural and semantic check on a checkpoint chain report.
+
+    Enforces the full :func:`checkpoint_chain` report contract: exact
+    top-level and per-stage key sets, hex64 ``root``/``previous``/``digest``
+    fields, a non-empty strictly increasing ``at`` chain, fully valid
+    checkpoint bundles, a ``null`` diff on the first stage and a complete
+    structurally valid adjacent checkpoint diff credential on every later
+    stage whose embedded bundles reproduce the neighboring stage bundles on
+    semantics. Returns ``(root, stages)`` with fresh normalized entries
+    (canonical bundle and diff copies). A false declared bundle summary,
+    broken bundle chain, or incomplete legal change list is carried back as
+    data so it yields ``False`` only after every input validates. Any
+    structural or semantic violation raises ``ValueError`` and the input is
+    never mutated.
+    """
+    if not isinstance(report, dict) or set(report) != set(
+        _CHECKPOINT_CHAIN_REPORT_KEYS
+    ):
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys root, stages"
+        )
+    root = _check_hex64(report["root"], f"{field}.root")
+    raw_stages = report["stages"]
+    if not isinstance(raw_stages, list) or not raw_stages:
+        raise ValueError(f"{field}.stages must be a non-empty list")
+
+    normalized_stages: list[dict[str, Any]] = []
+    previous_at: str | None = None
+    for index, stage in enumerate(raw_stages):
+        stage_field = f"{field}.stages[{index}]"
+        if not isinstance(stage, dict) or set(stage) != set(
+            _CHECKPOINT_CHAIN_STAGE_KEYS
+        ):
+            raise ValueError(
+                f"{stage_field} must be a dict with exactly the keys "
+                "at, bundle, diff, previous, digest"
+            )
+        at = _check_time(stage["at"], f"{stage_field}.at")
+        if previous_at is not None and at <= previous_at:
+            raise ValueError(
+                f"{stage_field}.at must be strictly greater than the "
+                "preceding stage at"
+            )
+        previous = _check_hex64(stage["previous"], f"{stage_field}.previous")
+        digest = _check_hex64(stage["digest"], f"{stage_field}.digest")
+        bundle_root, bundle_members = _normalize_verified_checkpoint_bundle(
+            stage["bundle"], f"{stage_field}.bundle"
+        )
+        bundle = _canonical_checkpoint_bundle_from_members(
+            bundle_root, bundle_members
+        )
+        bundle_truthful = _checkpoint_bundle_is_truthful(
+            bundle_root, bundle_members
+        )
+
+        diff: dict[str, Any] | None
+        diff_complete = True
+        if index == 0:
+            if stage["diff"] is not None:
+                raise ValueError(
+                    f"{stage_field}.diff must be null on the first stage"
+                )
+            diff = None
+        else:
+            diff_content, _, _, _, diff_complete = (
+                _normalize_verified_checkpoint_diff_report(
+                    stage["diff"], f"{stage_field}.diff"
+                )
+            )
+            if diff_content["before_root"] != normalized_stages[-1]["bundle_root"]:
+                raise ValueError(
+                    f"{stage_field}.diff.before_root must equal the preceding "
+                    "stage bundle root"
+                )
+            if diff_content["after_root"] != bundle_root:
+                raise ValueError(
+                    f"{stage_field}.diff.after_root must equal this stage "
+                    "bundle root"
+                )
+            if _checkpoint_bundle_semantics(
+                diff_content["before"]
+            ) != _checkpoint_bundle_semantics(normalized_stages[-1]["bundle"]):
+                raise ValueError(
+                    f"{stage_field}.diff.before must reproduce the preceding "
+                    "stage bundle"
+                )
+            if _checkpoint_bundle_semantics(
+                diff_content["after"]
+            ) != _checkpoint_bundle_semantics(bundle):
+                raise ValueError(
+                    f"{stage_field}.diff.after must reproduce this stage bundle"
+                )
+            diff = diff_content
+
+        normalized_stages.append(
+            {
+                "at": at,
+                "bundle": bundle,
+                "bundle_root": bundle_root,
+                "bundle_truthful": bundle_truthful,
+                "diff": diff,
+                "diff_complete": diff_complete,
+                "previous": previous,
+                "digest": digest,
+            }
+        )
+        previous_at = at
+    return root, normalized_stages
+
+
+def verify_checkpoint_chain(report: Any, expected: Any) -> bool:
+    """Verify a :func:`checkpoint_chain` report by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level.
+
+    ``report`` must be a dict with exactly the keys ``root``, ``stages`` and
+    conform level by level to the :func:`checkpoint_chain` contract.
+    ``expected`` must have exactly the keys ``root``, ``stages`` with a
+    non-empty stage list whose items contain only ``at``, ``bundle_root``,
+    and ``diff_digest``: strictly increasing valid ``at`` values, ``root``
+    and every ``bundle_root`` 64 lowercase hexadecimal characters, the first
+    ``diff_digest`` ``null`` and every later one 64 lowercase hexadecimal
+    characters. Every structure and embedded-proof semantic check — key
+    sets, types, digest formats, strictly increasing timestamps, fully
+    valid per-stage bundles and their embedded credentials, a ``null``
+    first diff, and each later stage's complete adjacent diff credential
+    reproducing its neighbors on semantics — completes on both inputs
+    before any comparison; any violation raises ``ValueError``.
+
+    Only afterwards are values recomputed rather than trusted: every
+    bundle's embedded proofs and member chain, each adjacent
+    :func:`evolution_checkpoint_bundle_diff` credential (its digest
+    included), every stage digest over the ``previous`` bytes plus the
+    compact JSON of ``at``, ``bundle``, ``diff``, the stage
+    ``previous``/``digest`` chain from the 64-zero genesis, the final
+    ``root``, and the ``expected`` timestamp/bundle-root/diff-digest
+    triples and overall root. Returns ``False`` when any chain link, stage
+    digest, bundle, diff, root, or expected value does not match, or a
+    stage is skipped; otherwise ``True``.
+    """
+    report_root, stages = _normalize_verified_checkpoint_chain(report, "report")
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _CHECKPOINT_CHAIN_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys root, stages"
+        )
+    expected_root = _check_hex64(expected["root"], "expected.root")
+    raw_expected_stages = expected["stages"]
+    if not isinstance(raw_expected_stages, list) or not raw_expected_stages:
+        raise ValueError("expected.stages must be a non-empty list")
+    expected_stages: list[tuple[str, str, str | None]] = []
+    previous_at: str | None = None
+    for index, stage in enumerate(raw_expected_stages):
+        field = f"expected.stages[{index}]"
+        if not isinstance(stage, dict) or set(stage) != (
+            _CHECKPOINT_CHAIN_EXPECTED_STAGE_KEYS
+        ):
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys "
+                "at, bundle_root, diff_digest"
+            )
+        at = _check_time(stage["at"], f"{field}.at")
+        if previous_at is not None and at <= previous_at:
+            raise ValueError(
+                f"{field}.at must be strictly greater than the preceding at"
+            )
+        bundle_root = _check_hex64(stage["bundle_root"], f"{field}.bundle_root")
+        diff_digest = stage["diff_digest"]
+        if index == 0:
+            if diff_digest is not None:
+                raise ValueError(
+                    f"{field}.diff_digest must be null on the first stage"
+                )
+        else:
+            _check_hex64(diff_digest, f"{field}.diff_digest")
+        expected_stages.append((at, bundle_root, diff_digest))
+        previous_at = at
+
+    # Both inputs have now passed every key-set, type, digest-format, time,
+    # ordering, bundle, and adjacent-diff structural/semantic check. Only
+    # now recompute and compare; any mismatch yields False rather than raising.
+    if len(expected_stages) != len(stages):
+        return False
+    if any(not stage["bundle_truthful"] for stage in stages):
+        return False
+    previous = _CHECKPOINT_CHAIN_GENESIS
+    for index, stage in enumerate(stages):
+        expected_at, expected_bundle_root, expected_diff_digest = (
+            expected_stages[index]
+        )
+        if index > 0:
+            if not stage["diff_complete"]:
+                return False
+            recomputed_diff = evolution_checkpoint_bundle_diff(
+                stages[index - 1]["bundle"], stage["bundle"]
+            )
+            if stage["diff"] != recomputed_diff:
+                return False
+            if recomputed_diff["digest"] != expected_diff_digest:
+                return False
+        recomputed_digest = _checkpoint_chain_stage_digest(
+            previous, stage["at"], stage["bundle"], stage["diff"]
+        )
+        if stage["previous"] != previous:
+            return False
+        if stage["digest"] != recomputed_digest:
+            return False
+        if stage["at"] != expected_at or stage["bundle_root"] != expected_bundle_root:
+            return False
+        previous = recomputed_digest
+    if report_root != previous or report_root != expected_root:
         return False
     return True

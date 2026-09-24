@@ -524,11 +524,10 @@ def test_change_for_unchanged_member_raises():
         verify_evolution_checkpoint_bundle_diff(report, _expected(report))
 
 
-def test_missing_change_raises():
+def test_missing_change_returns_false():
     report = _diff()
     report["changes"] = []
-    with pytest.raises(ValueError):
-        verify_evolution_checkpoint_bundle_diff(report, _expected(report))
+    assert verify_evolution_checkpoint_bundle_diff(report, _expected(report)) is False
 
 
 def test_change_for_unknown_id_raises():
@@ -697,7 +696,7 @@ def test_http_bad_body_is_422(body):
 
 def test_http_value_error_in_function_is_422():
     report = _diff()
-    report["changes"] = []
+    report["changes"][0]["kind"] = "nope"
     response = client.post(
         "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/verify",
         json={"report": report, "expected": _expected(_diff())},
