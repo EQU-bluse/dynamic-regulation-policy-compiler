@@ -302,20 +302,40 @@ def policy_delta(
         raise ValueError(f"from_at must not be after to_at: {from_at!r} > {to_at!r}")
     before_compiled = compile_rules(from_at, rules)
     after_compiled = compile_rules(to_at, rules)
+    return _build_delta_from_snapshots(
+        before_compiled["rules"],
+        after_compiled["rules"],
+        before_compiled["conflicts"],
+        after_compiled["conflicts"],
+        from_at,
+        to_at,
+    )
 
-    before_rules = {
-        (rule["source"], rule["id"]): rule for rule in before_compiled["rules"]
-    }
-    after_rules = {
-        (rule["source"], rule["id"]): rule for rule in after_compiled["rules"]
-    }
+
+def _build_delta_from_snapshots(
+    before_rules: list[dict[str, Any]],
+    after_rules: list[dict[str, Any]],
+    before_conflicts: list[dict[str, Any]],
+    after_conflicts: list[dict[str, Any]],
+    from_at: str,
+    to_at: str,
+) -> dict[str, Any]:
+    """Rebuild a :func:`policy_delta` result from two validated snapshots.
+
+    The snapshots must already be normalized (contract key order, unique
+    ``(source, id)``, ranked rules). Returns fresh deep-copied structures;
+    rule entries are ordered by ``source`` (``law`` before ``org``) then ``id``
+    in Unicode code point order, conflict diffs keep each side's order.
+    """
+    before_map = {(rule["source"], rule["id"]): rule for rule in before_rules}
+    after_map = {(rule["source"], rule["id"]): rule for rule in after_rules}
     entries: list[dict[str, Any]] = []
     for key in sorted(
-        set(before_rules) | set(after_rules),
+        set(before_map) | set(after_map),
         key=lambda item: (_SOURCE_ORDER[item[0]], item[1]),
     ):
-        before = before_rules.get(key)
-        after = after_rules.get(key)
+        before = before_map.get(key)
+        after = after_map.get(key)
         if before is not None and after is not None and before == after:
             continue
         if before is None:
@@ -329,21 +349,18 @@ def policy_delta(
                 "source": key[0],
                 "id": key[1],
                 "kind": kind,
-                "before": before,
-                "after": after,
+                "before": copy.deepcopy(before),
+                "after": copy.deepcopy(after),
             }
         )
-
-    before_conflicts = before_compiled["conflicts"]
-    after_conflicts = after_compiled["conflicts"]
     before_identities = {_conflict_identity(c) for c in before_conflicts}
     after_identities = {_conflict_identity(c) for c in after_conflicts}
-    added_conflicts = [
+    added = [
         {"winner": list(c["winner"]), "loser": list(c["loser"])}
         for c in after_conflicts
         if _conflict_identity(c) not in before_identities
     ]
-    removed_conflicts = [
+    removed = [
         {"winner": list(c["winner"]), "loser": list(c["loser"])}
         for c in before_conflicts
         if _conflict_identity(c) not in after_identities
@@ -352,7 +369,7 @@ def policy_delta(
         "from": from_at,
         "to": to_at,
         "rules": entries,
-        "conflicts": {"added": added_conflicts, "removed": removed_conflicts},
+        "conflicts": {"added": added, "removed": removed},
     }
 
 
@@ -720,50 +737,22 @@ def _check_schedule_point_semantics(
             f"{field}.delta from/to must equal the previous point's at and "
             f"{field}.at"
         )
-    before_rules = {
-        (rule["source"], rule["id"]): rule for rule in previous["rules"]
-    }
-    after_rules = {(rule["source"], rule["id"]): rule for rule in rules}
-    expected_entries: list[dict[str, Any]] = []
-    for key in sorted(
-        set(before_rules) | set(after_rules),
-        key=lambda item: (_SOURCE_ORDER[item[0]], item[1]),
-    ):
-        before = before_rules.get(key)
-        after = after_rules.get(key)
-        if before is not None and after is not None and before == after:
-            continue
-        if before is None:
-            kind = "added"
-        elif after is None:
-            kind = "removed"
-        else:
-            kind = "updated"
-        expected_entries.append(
-            {
-                "source": key[0],
-                "id": key[1],
-                "kind": kind,
-                "before": before,
-                "after": after,
-            }
-        )
-    if delta["rules"] != expected_entries:
+    expected_delta = _build_delta_from_snapshots(
+        previous["rules"],
+        rules,
+        previous["conflicts"],
+        point["conflicts"],
+        previous["at"],
+        at,
+    )
+    if delta["rules"] != expected_delta["rules"]:
         raise ValueError(
             f"{field}.delta.rules do not equal the diff of the adjacent "
             "snapshots"
         )
-    before_identities = {_conflict_identity(c) for c in previous["conflicts"]}
-    after_identities = {_conflict_identity(c) for c in point["conflicts"]}
-    expected_added = [
-        c for c in point["conflicts"] if _conflict_identity(c) not in before_identities
-    ]
-    expected_removed = [
-        c for c in previous["conflicts"] if _conflict_identity(c) not in after_identities
-    ]
     if (
-        delta["conflicts"]["added"] != expected_added
-        or delta["conflicts"]["removed"] != expected_removed
+        delta["conflicts"]["added"] != expected_delta["conflicts"]["added"]
+        or delta["conflicts"]["removed"] != expected_delta["conflicts"]["removed"]
     ):
         raise ValueError(
             f"{field}.delta.conflicts do not equal the conflict identity "
@@ -1390,13 +1379,6 @@ def verify_decision_timeline_attestation(report: Any, expected: Any) -> bool:
     timeline_points = _normalize_verified_timeline(
         report["timeline"], start, end, "report.timeline"
     )
-    rebuilt_points = _rebuild_timeline_from_schedule(start, end, facts, policy)
-    if timeline_points != rebuilt_points:
-        raise ValueError(
-            "report.timeline does not match the timeline rebuilt from "
-            "report.facts and report.policy under the decision_timeline "
-            "contract"
-        )
     if not isinstance(expected, dict) or set(expected) != (
         _TIMELINE_ATTEST_EXPECTED_KEYS
     ):
@@ -1408,6 +1390,14 @@ def verify_decision_timeline_attestation(report: Any, expected: Any) -> bool:
     if expected_start > expected_end:
         raise ValueError("expected.start must not be after expected.end")
     expected_digest = _check_hex64(expected["digest"], "expected.digest")
+
+    rebuilt_points = _rebuild_timeline_from_schedule(start, end, facts, policy)
+    if timeline_points != rebuilt_points:
+        raise ValueError(
+            "report.timeline does not match the timeline rebuilt from "
+            "report.facts and report.policy under the decision_timeline "
+            "contract"
+        )
 
     if (
         start != expected_start
@@ -1648,6 +1638,312 @@ def decision_impact(
             }
         )
     return {"from": from_at, "to": to_at, "policy": policy, "cases": entries}
+
+
+_IMPACT_ATTEST_REPORT_KEYS = frozenset(
+    {"from", "to", "cases", "policy", "impact", "digest"}
+)
+_IMPACT_ATTEST_EXPECTED_KEYS = frozenset({"from", "to", "digest"})
+_IMPACT_ATTEST_CASE_KEYS = frozenset({"id", "facts"})
+_IMPACT_ATTEST_POLICY_KEYS = frozenset({"before", "after", "delta"})
+_IMPACT_ATTEST_IMPACT_KEYS = frozenset({"from", "to", "policy", "cases"})
+_IMPACT_ATTEST_ENTRY_KEYS = frozenset({"id", "changes", "before", "after"})
+_IMPACT_ATTEST_CONTENT_KEYS = ("from", "to", "cases", "policy", "impact")
+
+
+def decision_impact_attestation(
+    from_at: str,
+    to_at: str,
+    cases: list[dict[str, Any]],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attest a :func:`decision_impact` result with standalone policy evidence.
+
+    ``from_at``, ``to_at``, ``cases``, and ``rules`` are validated exactly as
+    in :func:`decision_impact`; any invalid time, case, fact, or rule raises
+    ``ValueError`` without mutating the inputs or touching history or files.
+    An empty ``cases`` list is valid.
+
+    Returns a deep copy with top-level keys ``from``, ``to``, ``cases``,
+    ``policy``, ``impact``, ``digest``. ``cases`` lists the input cases
+    ordered by ``id`` in Unicode code point order, each with keys ``id`` and
+    a deep-copied ``facts`` map whose keys are sorted in Unicode code point
+    order. ``policy`` has keys ``before``, ``after``, ``delta``: the full
+    :func:`compile_rules` snapshots at the two timestamps and the full
+    :func:`policy_delta` result between them. ``impact`` is the complete
+    :func:`decision_impact` result for the same inputs, keeping the public
+    case order, explanations, and ``changes`` semantics.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) over a payload containing exactly ``from``,
+    ``to``, ``cases``, ``policy``, ``impact`` in that key order. ``digest``
+    is the lowercase 64-char hex SHA-256 of ``C``. Equal-valued inputs yield
+    byte-identical attestations.
+    """
+    _check_time(from_at, "from_at")
+    _check_time(to_at, "to_at")
+    if from_at > to_at:
+        raise ValueError(f"from_at must not be after to_at: {from_at!r} > {to_at!r}")
+    _validate_cases(cases)
+
+    impact = decision_impact(from_at, to_at, cases, rules)
+    payload = {
+        "from": from_at,
+        "to": to_at,
+        "cases": [
+            {"id": case["id"], "facts": _sorted_fact_map(case["facts"])}
+            for case in sorted(cases, key=lambda item: item["id"])
+        ],
+        "policy": {
+            "before": compile_rules(from_at, rules),
+            "after": compile_rules(to_at, rules),
+            "delta": copy.deepcopy(impact["policy"]),
+        },
+        "impact": impact,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    attestation = copy.deepcopy(payload)
+    attestation["digest"] = digest
+    return attestation
+
+
+def _normalize_impact_attest_cases(value: Any, field: str) -> list[dict[str, Any]]:
+    """Validate the attestation ``cases`` list structurally.
+
+    Items must have exactly the keys ``id`` and ``facts``; ids are non-empty
+    strings, unique, and strictly ascending in Unicode code point order;
+    facts map non-empty string keys to bool values. Returns fresh normalized
+    copies with fact keys sorted. An empty list is valid.
+    """
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list of case dicts")
+    normalized: list[dict[str, Any]] = []
+    previous_id: str | None = None
+    seen: set[str] = set()
+    for index, case in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(case, dict) or set(case) != _IMPACT_ATTEST_CASE_KEYS:
+            raise ValueError(
+                f"{item_field} must be a dict with exactly the keys id, facts"
+            )
+        case_id = _check_non_empty_str(case["id"], f"{item_field}.id")
+        if case_id in seen:
+            raise ValueError(f"{field} has a duplicate case id: {case_id!r}")
+        if previous_id is not None and case_id <= previous_id:
+            raise ValueError(f"{field} case ids must be strictly ascending")
+        _check_fact_map(case["facts"], f"{item_field}.facts")
+        normalized.append({"id": case_id, "facts": _sorted_fact_map(case["facts"])})
+        seen.add(case_id)
+        previous_id = case_id
+    return normalized
+
+
+def _normalize_impact_changes(value: Any, field: str) -> list[str]:
+    """Validate a ``changes`` list structurally: distinct compare fields."""
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list")
+    changes: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or item not in _COMPARE_FIELDS:
+            raise ValueError(
+                f"{field}[{index}] must be one of decision, trace, basis, "
+                "conflicts"
+            )
+        if item in changes:
+            raise ValueError(f"{field} must not repeat fields")
+        changes.append(item)
+    return changes
+
+
+def verify_decision_impact_attestation(report: Any, expected: Any) -> bool:
+    """Verify a :func:`decision_impact_attestation` report by recomputation.
+
+    Pure function: it only inspects its arguments, needs no original rules
+    (the before/after policy snapshots carry the complete evidence), touches
+    neither history nor files, and never mutates an input at any level.
+
+    ``report`` must be a dict with exactly the keys ``from``, ``to``,
+    ``cases``, ``policy``, ``impact``, ``digest`` and conform level by level
+    to the :func:`decision_impact_attestation` contract. ``from``/``to``
+    must be valid UTC seconds with ``from <= to`` and ``digest`` 64 lowercase
+    hexadecimal characters. ``cases`` items must have exactly ``id`` and
+    ``facts``; ids are non-empty, unique, and strictly ascending in Unicode
+    code point order, and facts map non-empty string keys to bool values.
+    ``policy`` must have exactly the keys ``before``, ``after``, ``delta``:
+    two complete :func:`compile_rules` snapshots at ``from``/``to`` (rules
+    effective at their time, unique per ``(source, id)``, ranked exactly as
+    :func:`compile_rules` ranks them, conflicts fully rebuilt from the rules)
+    and a :func:`policy_delta` structure that is rebuilt from the two
+    snapshots. ``impact`` must have exactly the keys ``from``, ``to``,
+    ``policy``, ``cases``: its endpoints and delta must match, and each case
+    entry (exactly ``id``, ``changes``, ``before``, ``after``) is rebuilt from
+    the attested case facts against the snapshot rules — both explanations,
+    the ``changes`` list, and therefore the full impact result. Case ids in
+    ``impact.cases`` must pair exactly, in order, with ``cases``.
+
+    ``expected`` must have exactly the keys ``from``, ``to``, ``digest`` and
+    is validated the same way. Both inputs complete their full structural
+    validation before any semantic rebuild or comparison. Any structural or
+    semantic violation raises ``ValueError``. Afterwards the digest is
+    recomputed as the lowercase hexadecimal SHA-256 of the compact UTF-8 JSON
+    bytes over ``from``, ``to``, ``cases``, ``policy``, ``impact`` in that
+    key order (fact and ``when`` keys in Unicode code point order). Returns
+    ``False`` when the declared digest, a timestamp, or an ``expected`` value
+    does not match; otherwise ``True``.
+    """
+    if not isinstance(report, dict) or set(report) != _IMPACT_ATTEST_REPORT_KEYS:
+        raise ValueError(
+            "report must be a dict with exactly the keys "
+            "from, to, cases, policy, impact, digest"
+        )
+    from_at = _check_time(report["from"], "report.from")
+    to_at = _check_time(report["to"], "report.to")
+    if from_at > to_at:
+        raise ValueError("report.from must not be after report.to")
+    cases = _normalize_impact_attest_cases(report["cases"], "report.cases")
+    _check_hex64(report["digest"], "report.digest")
+
+    raw_policy = report["policy"]
+    if not isinstance(raw_policy, dict) or set(raw_policy) != _IMPACT_ATTEST_POLICY_KEYS:
+        raise ValueError(
+            "report.policy must be a dict with exactly the keys "
+            "before, after, delta"
+        )
+    before_snapshot = _normalize_verified_policy(
+        raw_policy["before"], from_at, "report.policy.before"
+    )
+    after_snapshot = _normalize_verified_policy(
+        raw_policy["after"], to_at, "report.policy.after"
+    )
+    delta = _normalize_delta(raw_policy["delta"], "report.policy.delta")
+    if delta["from"] != from_at or delta["to"] != to_at:
+        raise ValueError("report.policy.delta from/to must equal report.from/to")
+
+    raw_impact = report["impact"]
+    if not isinstance(raw_impact, dict) or set(raw_impact) != (
+        _IMPACT_ATTEST_IMPACT_KEYS
+    ):
+        raise ValueError(
+            "report.impact must be a dict with exactly the keys "
+            "from, to, policy, cases"
+        )
+    impact_from = _check_time(raw_impact["from"], "report.impact.from")
+    impact_to = _check_time(raw_impact["to"], "report.impact.to")
+    if impact_from != from_at or impact_to != to_at:
+        raise ValueError("report.impact from/to must equal report.from/to")
+    impact_delta = _normalize_delta(raw_impact["policy"], "report.impact.policy")
+    if not isinstance(raw_impact["cases"], list):
+        raise ValueError("report.impact.cases must be a list")
+    declared_entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw_impact["cases"]):
+        field = f"report.impact.cases[{index}]"
+        if not isinstance(entry, dict) or set(entry) != _IMPACT_ATTEST_ENTRY_KEYS:
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys "
+                "id, changes, before, after"
+            )
+        entry_id = _check_non_empty_str(entry["id"], f"{field}.id")
+        changes = _normalize_impact_changes(entry["changes"], f"{field}.changes")
+        before_explanation = _normalize_verified_explanation(
+            entry["before"], from_at, f"{field}.before"
+        )
+        after_explanation = _normalize_verified_explanation(
+            entry["after"], to_at, f"{field}.after"
+        )
+        declared_entries.append(
+            {
+                "id": entry_id,
+                "changes": changes,
+                "before": before_explanation,
+                "after": after_explanation,
+            }
+        )
+
+    if not isinstance(expected, dict) or set(expected) != (
+        _IMPACT_ATTEST_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys from, to, digest"
+        )
+    expected_from = _check_time(expected["from"], "expected.from")
+    expected_to = _check_time(expected["to"], "expected.to")
+    if expected_from > expected_to:
+        raise ValueError("expected.from must not be after expected.to")
+    expected_digest = _check_hex64(expected["digest"], "expected.digest")
+
+    rebuilt_delta = _build_delta_from_snapshots(
+        before_snapshot["rules"],
+        after_snapshot["rules"],
+        before_snapshot["conflicts"],
+        after_snapshot["conflicts"],
+        from_at,
+        to_at,
+    )
+    if delta != rebuilt_delta:
+        raise ValueError(
+            "report.policy.delta does not equal the delta rebuilt from "
+            "report.policy.before and report.policy.after"
+        )
+    if impact_delta != rebuilt_delta:
+        raise ValueError(
+            "report.impact.policy does not equal the delta rebuilt from the "
+            "policy snapshots"
+        )
+
+    rebuilt_entries: list[dict[str, Any]] = []
+    if len(declared_entries) != len(cases):
+        raise ValueError(
+            "report.impact.cases must pair one-to-one with report.cases"
+        )
+    for case, declared in zip(cases, declared_entries):
+        if declared["id"] != case["id"]:
+            raise ValueError(
+                "report.impact.cases ids must match report.cases ids in order"
+            )
+        facts = case["facts"]
+        before = explain(from_at, facts, before_snapshot["rules"])
+        after = explain(to_at, facts, after_snapshot["rules"])
+        changes = [
+            field_name
+            for field_name in _COMPARE_FIELDS
+            if before[field_name] != after[field_name]
+        ]
+        rebuilt = {"id": case["id"], "changes": changes, "before": before, "after": after}
+        if declared != rebuilt:
+            raise ValueError(
+                "report.impact case does not follow from report.cases and "
+                "the policy snapshots under the explain/decision_impact "
+                "contract"
+            )
+        rebuilt_entries.append(rebuilt)
+
+    rebuilt_impact = {
+        "from": from_at,
+        "to": to_at,
+        "policy": rebuilt_delta,
+        "cases": rebuilt_entries,
+    }
+    if (
+        from_at != expected_from
+        or to_at != expected_to
+        or report["digest"] != expected_digest
+    ):
+        return False
+    content = {
+        "from": from_at,
+        "to": to_at,
+        "cases": cases,
+        "policy": {
+            "before": before_snapshot,
+            "after": after_snapshot,
+            "delta": rebuilt_delta,
+        },
+        "impact": rebuilt_impact,
+    }
+    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return report["digest"] == digest
 
 
 def decision_matrix(
