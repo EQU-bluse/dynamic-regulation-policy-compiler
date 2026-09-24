@@ -18,6 +18,7 @@ from .policy import (
     checkpoint_chain,
     checkpoint_chain_checkpoint,
     checkpoint_chain_checkpoint_bundle,
+    checkpoint_chain_checkpoint_bundle_diff,
     compare_decisions,
     compile_rules,
     decision_attestation,
@@ -39,6 +40,7 @@ from .policy import (
     verify_checkpoint_chain,
     verify_checkpoint_chain_checkpoint,
     verify_checkpoint_chain_checkpoint_bundle,
+    verify_checkpoint_chain_checkpoint_bundle_diff,
     verify_decision_attestation,
     verify_decision_impact_attestation,
     verify_decision_matrix_attestation,
@@ -673,6 +675,50 @@ async def verify_checkpoint_chain_checkpoint_bundle_endpoint(
         return _invalid_request()
     try:
         valid = verify_checkpoint_chain_checkpoint_bundle(
+            body["report"], body["expected"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
+    "chain/checkpoint/bundle/diff"
+)
+async def checkpoint_chain_checkpoint_bundle_diff_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_DIFF_KEYS:
+        return _invalid_request()
+    try:
+        report = checkpoint_chain_checkpoint_bundle_diff(
+            body["before"], body["after"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
+    "chain/checkpoint/bundle/diff/verify"
+)
+async def verify_checkpoint_chain_checkpoint_bundle_diff_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_checkpoint_chain_checkpoint_bundle_diff(
             body["report"], body["expected"]
         )
     except ValueError:
