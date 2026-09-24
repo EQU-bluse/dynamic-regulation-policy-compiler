@@ -2914,52 +2914,18 @@ def _matrix_member_semantics(member: dict[str, Any]) -> dict[str, Any]:
     return _matrix_credential_semantics(_matrix_member_content(member))
 
 
-def matrix_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
-    """Attest the difference between two decision matrix attestation bundles.
+def _matrix_bundle_diff_from_members(
+    before_root: str,
+    before_members: list[dict[str, Any]],
+    after_root: str,
+    after_members: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the diff credential from two normalized bundles.
 
-    Pure function: it only processes its arguments, accesses neither history
-    nor files, and never mutates an input object at any level.
-
-    Both ``before`` and ``after`` must be complete
-    :func:`decision_matrix_attestation_bundle` reports. Before anything is
-    produced, both sides pass the full
-    :func:`verify_decision_matrix_attestation_bundle` structural and semantic
-    checks: key sets, digest formats, unique strictly ascending member ids,
-    and every embedded single matrix credential; the second side is still
-    fully checked when the first side merely carries a false digest. Any
-    structural or semantic violation, and any false sub-report digest, chain
-    link, or bundle root on either side, raises ``ValueError``.
-
-    Returns a deep copy with keys ``before_root``, ``after_root``,
-    ``before``, ``after``, ``changes``, ``digest`` in that order;
-    ``before_root``/``after_root`` are the two bundles' roots and
-    ``before``/``after`` are independent deep copies of the normalized
-    bundles. Members are matched by ``id``; ``changes`` keeps only the
-    ``added`` (only in ``after``), ``removed`` (only in ``before``), and
-    ``changed`` (present in both but with a different matrix credential)
-    members, ordered by ``id`` in ascending Unicode code point order. Each
-    change has keys ``id``, ``kind``, ``before``, ``after``; the two sides
-    are deep copies of the single matrix credential or ``null``. Identical
-    bundles yield an empty ``changes`` list.
-
-    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
-    ``separators=(',', ':')``) with no newline over a payload containing
-    exactly the first five keys in order. ``digest`` is the lowercase
-    64-char hex SHA-256 of ``C``. Equal-valued inputs yield byte-identical
-    results regardless of input dict key order, and no two levels share a
-    mutable container.
+    Both inputs must already have passed the full bundle checks. The result
+    is a fresh deep copy: its embedded bundles, change credentials, and no
+    two levels share a mutable container.
     """
-    before_root, before_members = _normalize_verified_matrix_bundle(
-        before, "before"
-    )
-    after_root, after_members = _normalize_verified_matrix_bundle(
-        after, "after"
-    )
-    if not _matrix_bundle_is_truthful(before_root, before_members):
-        raise ValueError("before bundle root or hash chain does not verify")
-    if not _matrix_bundle_is_truthful(after_root, after_members):
-        raise ValueError("after bundle root or hash chain does not verify")
-
     before_bundle = _canonical_bundle_from_members(before_root, before_members)
     after_bundle = _canonical_bundle_from_members(after_root, after_members)
     before_by_id = {member["id"]: member for member in before_members}
@@ -3010,6 +2976,56 @@ def matrix_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
     result = copy.deepcopy(payload)
     result["digest"] = digest
     return result
+
+
+def matrix_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
+    """Attest the difference between two decision matrix attestation bundles.
+
+    Pure function: it only processes its arguments, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    Both ``before`` and ``after`` must be complete
+    :func:`decision_matrix_attestation_bundle` reports. Before anything is
+    produced, both sides pass the full
+    :func:`verify_decision_matrix_attestation_bundle` structural and semantic
+    checks: key sets, digest formats, unique strictly ascending member ids,
+    and every embedded single matrix credential; the second side is still
+    fully checked when the first side merely carries a false digest. Any
+    structural or semantic violation, and any false sub-report digest, chain
+    link, or bundle root on either side, raises ``ValueError``.
+
+    Returns a deep copy with keys ``before_root``, ``after_root``,
+    ``before``, ``after``, ``changes``, ``digest`` in that order;
+    ``before_root``/``after_root`` are the two bundles' roots and
+    ``before``/``after`` are independent deep copies of the normalized
+    bundles. Members are matched by ``id``; ``changes`` keeps only the
+    ``added`` (only in ``after``), ``removed`` (only in ``before``), and
+    ``changed`` (present in both but with a different matrix credential)
+    members, ordered by ``id`` in ascending Unicode code point order. Each
+    change has keys ``id``, ``kind``, ``before``, ``after``; the two sides
+    are deep copies of the single matrix credential or ``null``. Identical
+    bundles yield an empty ``changes`` list.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) with no newline over a payload containing
+    exactly the first five keys in order. ``digest`` is the lowercase
+    64-char hex SHA-256 of ``C``. Equal-valued inputs yield byte-identical
+    results regardless of input dict key order, and no two levels share a
+    mutable container.
+    """
+    before_root, before_members = _normalize_verified_matrix_bundle(
+        before, "before"
+    )
+    after_root, after_members = _normalize_verified_matrix_bundle(
+        after, "after"
+    )
+    if not _matrix_bundle_is_truthful(before_root, before_members):
+        raise ValueError("before bundle root or hash chain does not verify")
+    if not _matrix_bundle_is_truthful(after_root, after_members):
+        raise ValueError("after bundle root or hash chain does not verify")
+    return _matrix_bundle_diff_from_members(
+        before_root, before_members, after_root, after_members
+    )
 
 
 def _normalize_diff_change_credential(
@@ -3318,4 +3334,421 @@ def verify_matrix_bundle_diff(report: Any, expected: Any) -> bool:
         return False
     if {member["id"] for member in after_members} != set(expected_after_ids):
         return False
+    return True
+
+
+_MATRIX_EVOLUTION_STAGE_INPUT_KEYS = frozenset({"at", "bundle"})
+_MATRIX_EVOLUTION_REPORT_KEYS = ("root", "stages")
+_MATRIX_EVOLUTION_STAGE_KEYS = ("at", "bundle", "diff", "previous", "digest")
+_MATRIX_EVOLUTION_EXPECTED_KEYS = ("root", "stages")
+_MATRIX_EVOLUTION_EXPECTED_STAGE_KEYS = frozenset({"at", "root"})
+_MATRIX_EVOLUTION_GENESIS = "0" * 64
+
+
+def _validate_evolution_stage_inputs(stages: Any) -> list[tuple[str, Any]]:
+    """Validate the ``stages`` argument of :func:`matrix_bundle_evolution`.
+
+    ``stages`` must be a non-empty list whose items are dicts with exactly
+    the keys ``at`` and ``bundle``; every ``at`` must be a valid UTC second
+    strictly increasing in array order (duplicates and out-of-order values
+    are rejected). Bundles themselves are validated separately with the
+    existing bundle contract. Any violation raises ``ValueError``.
+    """
+    if not isinstance(stages, list) or not stages:
+        raise ValueError("stages must be a non-empty list of {at, bundle} dicts")
+    result: list[tuple[str, Any]] = []
+    previous_at: str | None = None
+    for index, stage in enumerate(stages):
+        field = f"stages[{index}]"
+        if not isinstance(stage, dict) or set(stage) != _MATRIX_EVOLUTION_STAGE_INPUT_KEYS:
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys at, bundle"
+            )
+        at = _check_time(stage["at"], f"{field}.at")
+        if previous_at is not None and at <= previous_at:
+            raise ValueError(
+                f"{field}.at must be strictly greater than the previous stage at"
+            )
+        result.append((at, stage["bundle"]))
+        previous_at = at
+    return result
+
+
+def _evolution_stage_digest(previous: str, at: str, bundle: Any, diff: Any) -> str:
+    """Compute one evolution stage digest.
+
+    The payload contains exactly ``at``, ``bundle``, ``diff`` in that key
+    order, encoded as compact UTF-8 JSON with no newline; the digest is the
+    lowercase hexadecimal SHA-256 of ``previous``'s ASCII bytes immediately
+    followed by those payload bytes.
+    """
+    payload = {"at": at, "bundle": bundle, "diff": diff}
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(
+        previous.encode("ascii") + canonical.encode("utf-8")
+    ).hexdigest()
+
+
+def matrix_bundle_evolution(stages: Any) -> dict[str, Any]:
+    """Attest the evolution of matrix attestation bundles across releases.
+
+    Pure function: it only processes its argument, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    ``stages`` must be a non-empty list; array order is release order. Each
+    item must be a dict with exactly the keys ``at`` and ``bundle``; ``at``
+    must be a valid UTC second and the values must be strictly increasing
+    (duplicates, missing fields, out-of-order values, and extra keys all
+    raise ``ValueError``). Every ``bundle`` must pass the full published
+    :func:`decision_matrix_attestation_bundle` structural, matrix-semantic,
+    sub-digest, and chain-root verification; any violation raises
+    ``ValueError``.
+
+    Returns a deep copy with keys ``root``, ``stages``; each stage has keys
+    ``at``, ``bundle``, ``diff``, ``previous``, ``digest``. The first
+    stage's ``diff`` is ``null``; every later ``diff`` is the complete
+    :func:`matrix_bundle_diff` credential from the preceding bundle to the
+    current one under the existing diff semantics. The first stage's
+    ``previous`` is 64 ASCII ``0`` characters and every later one is the
+    preceding stage's ``digest``. The stage digest payload contains exactly
+    ``at``, ``bundle``, ``diff`` in that key order, encoded as compact
+    newline-free UTF-8 JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``); ``digest`` is the lowercase hexadecimal
+    SHA-256 of ``previous``'s ASCII bytes immediately followed by that
+    payload. ``root`` is the last stage's ``digest``. No level shares a
+    mutable container, and equal-valued inputs yield byte-identical
+    results.
+    """
+    stage_inputs = _validate_evolution_stage_inputs(stages)
+    # Every bundle first completes the full structural and matrix-semantic
+    # validation, and only afterwards are claimed summaries checked, so a
+    # false digest never masks a structural problem in a later bundle.
+    normalized: list[tuple[str, str, list[dict[str, Any]]]] = []
+    for index, (at, bundle) in enumerate(stage_inputs):
+        bundle_root, members = _normalize_verified_matrix_bundle(
+            bundle, f"stages[{index}].bundle"
+        )
+        normalized.append((at, bundle_root, members))
+    for index, (_, bundle_root, members) in enumerate(normalized):
+        if not _matrix_bundle_is_truthful(bundle_root, members):
+            raise ValueError(
+                f"stages[{index}].bundle root or hash chain does not verify"
+            )
+
+    result_stages: list[dict[str, Any]] = []
+    previous = _MATRIX_EVOLUTION_GENESIS
+    root = previous
+    for index, (at, bundle_root, members) in enumerate(normalized):
+        bundle = _canonical_bundle_from_members(bundle_root, members)
+        if index == 0:
+            diff: dict[str, Any] | None = None
+        else:
+            prev_root, prev_members = normalized[index - 1][1], normalized[
+                index - 1
+            ][2]
+            diff = _matrix_bundle_diff_from_members(
+                prev_root, prev_members, bundle_root, members
+            )
+        digest = _evolution_stage_digest(previous, at, bundle, diff)
+        result_stages.append(
+            {
+                "at": at,
+                "bundle": copy.deepcopy(bundle),
+                "diff": copy.deepcopy(diff),
+                "previous": previous,
+                "digest": digest,
+            }
+        )
+        previous = digest
+        root = digest
+    return {"root": root, "stages": result_stages}
+
+
+def _normalize_verified_evolution_stage_diff(
+    diff: Any,
+    prev_members: list[dict[str, Any]],
+    cur_members: list[dict[str, Any]],
+    field: str,
+) -> dict[str, Any]:
+    """Structurally validate one adjacent-stage diff credential.
+
+    The value must conform level by level to the :func:`matrix_bundle_diff`
+    contract and describe exactly the two adjacent stage bundles: its
+    embedded ``before``/``after`` bundles must be semantically identical to
+    the previous/current stage bundles, and its ``changes`` must be the
+    complete change list between them. Any violation raises
+    ``ValueError``; a false diff digest is carried back as data so it can
+    yield ``False`` only after every input validates.
+    """
+    if not isinstance(diff, dict) or set(diff) != set(
+        _MATRIX_BUNDLE_DIFF_REPORT_KEYS
+    ):
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys "
+            "before_root, after_root, before, after, changes, digest"
+        )
+    before_root = _check_hex64(diff["before_root"], f"{field}.before_root")
+    after_root = _check_hex64(diff["after_root"], f"{field}.after_root")
+    digest = _check_hex64(diff["digest"], f"{field}.digest")
+    embedded_before_root, embedded_before_members = (
+        _normalize_verified_matrix_bundle(diff["before"], f"{field}.before")
+    )
+    embedded_after_root, embedded_after_members = (
+        _normalize_verified_matrix_bundle(diff["after"], f"{field}.after")
+    )
+    if embedded_before_root != before_root:
+        raise ValueError(f"{field}.before_root must equal {field}.before.root")
+    if embedded_after_root != after_root:
+        raise ValueError(f"{field}.after_root must equal {field}.after.root")
+    # The embedded bundles must describe the adjacent stage bundles on
+    # summary-free member semantics. Claimed root/digest values are compared
+    # afterwards by recomputation: a false claimed root or member digest is
+    # data that yields False, never a structural shortcut.
+    prev_semantics = [
+        (member["id"], _matrix_member_semantics(member)) for member in prev_members
+    ]
+    cur_semantics = [
+        (member["id"], _matrix_member_semantics(member)) for member in cur_members
+    ]
+    embedded_before_semantics = [
+        (member["id"], _matrix_member_semantics(member))
+        for member in embedded_before_members
+    ]
+    embedded_after_semantics = [
+        (member["id"], _matrix_member_semantics(member))
+        for member in embedded_after_members
+    ]
+    if embedded_before_semantics != prev_semantics:
+        raise ValueError(
+            f"{field}.before must be the previous stage's bundle"
+        )
+    if embedded_after_semantics != cur_semantics:
+        raise ValueError(f"{field}.after must be the current stage's bundle")
+    changes = _normalize_verified_matrix_bundle_diff_changes(
+        diff["changes"],
+        embedded_before_members,
+        embedded_after_members,
+        f"{field}.changes",
+    )
+    return {
+        "declared_before_root": before_root,
+        "declared_after_root": after_root,
+        "before_members": embedded_before_members,
+        "after_members": embedded_after_members,
+        "changes": changes,
+        "digest": digest,
+    }
+
+
+def verify_matrix_bundle_evolution(report: Any, expected: Any) -> bool:
+    """Verify a :func:`matrix_bundle_evolution` report by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level.
+
+    ``report`` must be a dict with exactly the keys ``root``, ``stages``;
+    ``root`` must be 64 lowercase hexadecimal characters and ``stages`` a
+    non-empty list. Each stage must have exactly the keys ``at``,
+    ``bundle``, ``diff``, ``previous``, ``digest``; stage ``at`` values
+    must be valid UTC seconds strictly increasing, ``previous``/``digest``
+    must be 64 lowercase hexadecimal characters, and every ``bundle`` must
+    pass the full structural and matrix-semantic bundle checks. The first
+    stage's ``diff`` must be ``null``; every later ``diff`` must be a
+    complete :func:`matrix_bundle_diff` credential whose roots and embedded
+    before/after bundles are exactly the adjacent stage bundles and whose
+    changes are complete for them. ``expected`` must be a dict with exactly
+    the keys ``root``, ``stages``; its ``stages`` must be a non-empty list
+    of items with exactly the keys ``at``, ``root``, with strictly
+    increasing valid timestamps and 64-char lowercase hexadecimal roots.
+    Every structural and semantic check on both inputs completes before
+    any recomputation or comparison; any violation raises ``ValueError``.
+
+    Only afterwards are values recomputed rather than trusted: each
+    bundle's sub-report digests, embedded schedule chains, member chain
+    and bundle root; each adjacent diff's change-side credentials and diff
+    digest; and each stage digest chained from the 64-zero genesis with
+    ``previous`` equal to the preceding recomputed stage digest, over the
+    compact newline-free UTF-8 JSON payload containing exactly ``at``,
+    ``bundle``, ``diff`` in that key order. Returns ``False`` when any
+    chain link, bundle root, adjacent diff, stage digest, the final root,
+    or an ``expected`` value (root, stage count, or any stage ``at``/bundle
+    root pair) does not match; otherwise ``True``.
+    """
+    if not isinstance(report, dict) or set(report) != set(
+        _MATRIX_EVOLUTION_REPORT_KEYS
+    ):
+        raise ValueError(
+            "report must be a dict with exactly the keys root, stages"
+        )
+    report_root = _check_hex64(report["root"], "report.root")
+    raw_stages = report["stages"]
+    if not isinstance(raw_stages, list) or not raw_stages:
+        raise ValueError("report.stages must be a non-empty list")
+
+    stage_entries: list[dict[str, Any]] = []
+    previous_at: str | None = None
+    for index, stage in enumerate(raw_stages):
+        field = f"report.stages[{index}]"
+        if not isinstance(stage, dict) or set(stage) != set(
+            _MATRIX_EVOLUTION_STAGE_KEYS
+        ):
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys "
+                "at, bundle, diff, previous, digest"
+            )
+        at = _check_time(stage["at"], f"{field}.at")
+        if previous_at is not None and at <= previous_at:
+            raise ValueError(
+                f"{field}.at must be strictly greater than the previous stage at"
+            )
+        previous = _check_hex64(stage["previous"], f"{field}.previous")
+        digest = _check_hex64(stage["digest"], f"{field}.digest")
+        bundle_root, members = _normalize_verified_matrix_bundle(
+            stage["bundle"], f"{field}.bundle"
+        )
+        bundle = _canonical_bundle_from_members(bundle_root, members)
+        diff_info: dict[str, Any] | None
+        if index == 0:
+            if stage["diff"] is not None:
+                raise ValueError(f"{field}.diff must be null for the first stage")
+            diff_info = None
+        else:
+            prev = stage_entries[index - 1]
+            diff_info = _normalize_verified_evolution_stage_diff(
+                stage["diff"],
+                prev["members"],
+                members,
+                f"{field}.diff",
+            )
+        stage_entries.append(
+            {
+                "at": at,
+                "previous": previous,
+                "digest": digest,
+                "bundle_root": bundle_root,
+                "members": members,
+                "bundle": bundle,
+                "diff_info": diff_info,
+                "diff_canonical": None,
+            }
+        )
+        previous_at = at
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _MATRIX_EVOLUTION_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys root, stages"
+        )
+    expected_root = _check_hex64(expected["root"], "expected.root")
+    raw_expected_stages = expected["stages"]
+    if not isinstance(raw_expected_stages, list) or not raw_expected_stages:
+        raise ValueError("expected.stages must be a non-empty list")
+    expected_stages: list[tuple[str, str]] = []
+    expected_previous_at: str | None = None
+    for index, stage in enumerate(raw_expected_stages):
+        field = f"expected.stages[{index}]"
+        if not isinstance(stage, dict) or set(stage) != (
+            _MATRIX_EVOLUTION_EXPECTED_STAGE_KEYS
+        ):
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys at, root"
+            )
+        at = _check_time(stage["at"], f"{field}.at")
+        if expected_previous_at is not None and at <= expected_previous_at:
+            raise ValueError(
+                f"{field}.at must be strictly greater than the previous stage at"
+            )
+        stage_root = _check_hex64(stage["root"], f"{field}.root")
+        expected_stages.append((at, stage_root))
+        expected_previous_at = at
+
+    # Both inputs have now passed every key-set, type, digest-format,
+    # timestamp, ordering, bundle, and adjacent-diff semantic check. Only
+    # now recompute and compare; any mismatch yields False rather than raise.
+    for index, entry in enumerate(stage_entries):
+        if not _matrix_bundle_is_truthful(entry["bundle_root"], entry["members"]):
+            return False
+        diff_info = entry["diff_info"]
+        if diff_info is None:
+            entry["diff_canonical"] = None
+            continue
+        if not _matrix_bundle_is_truthful(
+            diff_info["declared_before_root"], diff_info["before_members"]
+        ):
+            return False
+        if not _matrix_bundle_is_truthful(
+            diff_info["declared_after_root"], diff_info["after_members"]
+        ):
+            return False
+        # The claimed diff roots must be the adjacent stage bundles' roots.
+        if (
+            diff_info["declared_before_root"]
+            != stage_entries[index - 1]["bundle_root"]
+            or diff_info["declared_after_root"] != entry["bundle_root"]
+        ):
+            return False
+        for change in diff_info["changes"]:
+            for truth in (change["before_truth"], change["after_truth"]):
+                if truth is None:
+                    continue
+                declared_digest, recomputed, chain_ok, chain_root = truth
+                if not chain_ok or declared_digest != recomputed:
+                    return False
+        declared_changes = [
+            {
+                "id": change["id"],
+                "kind": change["kind"],
+                "before": change["before"],
+                "after": change["after"],
+            }
+            for change in diff_info["changes"]
+        ]
+        before_root = stage_entries[index - 1]["bundle_root"]
+        after_root = entry["bundle_root"]
+        content = {
+            "before_root": before_root,
+            "after_root": after_root,
+            "before": _canonical_bundle_from_members(
+                before_root, diff_info["before_members"]
+            ),
+            "after": _canonical_bundle_from_members(
+                after_root, diff_info["after_members"]
+            ),
+            "changes": declared_changes,
+        }
+        canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+        recomputed_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        if diff_info["digest"] != recomputed_digest:
+            return False
+        diff_canonical = copy.deepcopy(content)
+        diff_canonical["digest"] = recomputed_digest
+        entry["diff_canonical"] = diff_canonical
+
+    previous = _MATRIX_EVOLUTION_GENESIS
+    for entry in stage_entries:
+        if entry["previous"] != previous:
+            return False
+        recomputed = _evolution_stage_digest(
+            previous,
+            entry["at"],
+            entry["bundle"],
+            entry["diff_canonical"],
+        )
+        if entry["digest"] != recomputed:
+            return False
+        previous = recomputed
+    if report_root != previous:
+        return False
+    if report_root != expected_root:
+        return False
+    if len(stage_entries) != len(expected_stages):
+        return False
+    for entry, (expected_at, expected_bundle_root) in zip(
+        stage_entries, expected_stages
+    ):
+        if entry["at"] != expected_at:
+            return False
+        if entry["bundle_root"] != expected_bundle_root:
+            return False
     return True
