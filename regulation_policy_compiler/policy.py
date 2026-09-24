@@ -2402,6 +2402,61 @@ def _rebuild_matrix_from_schedule(
     return {"start": start, "end": end, "points": points}
 
 
+def _validate_and_rebuild_matrix_attestation(report: Any) -> dict[str, Any]:
+    """Fully validate one matrix attestation structurally and semantically.
+
+    Runs every key-set, type, value-domain, and time check of
+    :func:`verify_decision_matrix_attestation`, then rebuilds the matrix from
+    the attested schedule snapshots and requires it to match the declared
+    matrix. Returns a fresh normalized mapping with keys ``start``, ``end``,
+    ``digest``, ``cases``, ``matrix``, ``policy`` where ``matrix`` is the
+    rebuilt matrix and ``policy`` the normalized schedule report. The declared
+    digest and schedule hash chain are checked separately by the callers.
+    Any structural or semantic violation raises ``ValueError``; the input is
+    never mutated.
+    """
+    if not isinstance(report, dict) or set(report) != _MATRIX_ATTEST_REPORT_KEYS:
+        raise ValueError(
+            "report must be a dict with exactly the keys "
+            "start, end, cases, matrix, policy, digest"
+        )
+    start = _check_time(report["start"], "report.start")
+    end = _check_time(report["end"], "report.end")
+    if start > end:
+        raise ValueError("report.start must not be after report.end")
+    digest = _check_hex64(report["digest"], "report.digest")
+    cases = _normalize_verified_matrix_cases(report["cases"], "report.cases")
+    policy = _normalize_verified_schedule_report(report["policy"], "report.policy")
+    if policy["start"] != start or policy["end"] != end:
+        raise ValueError("report.policy.start/end must equal report.start/end")
+    matrix_points = _normalize_verified_matrix(
+        report["matrix"], start, end, cases, "report.matrix"
+    )
+    rebuilt_matrix = _rebuild_matrix_from_schedule(start, end, cases, policy)
+    declared_matrix = {"start": start, "end": end, "points": matrix_points}
+    if declared_matrix != rebuilt_matrix:
+        raise ValueError(
+            "report.matrix does not match the matrix rebuilt from "
+            "report.cases and report.policy under the decision_matrix "
+            "contract"
+        )
+    return {
+        "start": start,
+        "end": end,
+        "digest": digest,
+        "cases": cases,
+        "matrix": rebuilt_matrix,
+        "policy": policy,
+    }
+
+
+def _recompute_matrix_attestation_digest(validated: dict[str, Any]) -> str:
+    """Recompute the single matrix attestation digest from normalized data."""
+    content = {key: validated[key] for key in _MATRIX_ATTEST_CONTENT_KEYS}
+    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def verify_decision_matrix_attestation(report: Any, expected: Any) -> bool:
     """Verify a :func:`decision_matrix_attestation` report by recomputation.
 
@@ -2443,24 +2498,7 @@ def verify_decision_matrix_attestation(report: Any, expected: Any) -> bool:
     the window, an ``expected`` value, a chain link, or the root does not
     match; otherwise ``True``.
     """
-    if not isinstance(report, dict) or set(report) != _MATRIX_ATTEST_REPORT_KEYS:
-        raise ValueError(
-            "report must be a dict with exactly the keys "
-            "start, end, cases, matrix, policy, digest"
-        )
-    start = _check_time(report["start"], "report.start")
-    end = _check_time(report["end"], "report.end")
-    if start > end:
-        raise ValueError("report.start must not be after report.end")
-    digest = _check_hex64(report["digest"], "report.digest")
-    cases = _normalize_verified_matrix_cases(report["cases"], "report.cases")
-    policy = _normalize_verified_schedule_report(report["policy"], "report.policy")
-    if policy["start"] != start or policy["end"] != end:
-        raise ValueError("report.policy.start/end must equal report.start/end")
-    matrix_points = _normalize_verified_matrix(
-        report["matrix"], start, end, cases, "report.matrix"
-    )
-
+    validated = _validate_and_rebuild_matrix_attestation(report)
     if not isinstance(expected, dict) or set(expected) != (
         _MATRIX_ATTEST_EXPECTED_KEYS
     ):
@@ -2473,27 +2511,268 @@ def verify_decision_matrix_attestation(report: Any, expected: Any) -> bool:
         raise ValueError("expected.start must not be after expected.end")
     expected_digest = _check_hex64(expected["digest"], "expected.digest")
 
-    rebuilt_matrix = _rebuild_matrix_from_schedule(start, end, cases, policy)
-    declared_matrix = {"start": start, "end": end, "points": matrix_points}
-    if declared_matrix != rebuilt_matrix:
-        raise ValueError(
-            "report.matrix does not match the matrix rebuilt from "
-            "report.cases and report.policy under the decision_matrix "
-            "contract"
-        )
-
+    start = validated["start"]
+    end = validated["end"]
+    digest = validated["digest"]
     if start != expected_start or end != expected_end or digest != expected_digest:
         return False
+    policy = validated["policy"]
     chain_ok, chain_root = _recompute_schedule_root(policy["points"])
     if not chain_ok or policy["root"] != chain_root:
         return False
-    content = {
-        "start": start,
-        "end": end,
-        "cases": cases,
-        "matrix": rebuilt_matrix,
-        "policy": policy,
-    }
-    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
-    recomputed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    recomputed = _recompute_matrix_attestation_digest(validated)
     return digest == recomputed
+
+
+_MATRIX_BUNDLE_ITEM_KEYS = frozenset({"id", "report"})
+_MATRIX_BUNDLE_REPORT_KEYS = ("root", "reports")
+_MATRIX_BUNDLE_EXPECTED_KEYS = ("root", "report_ids")
+_MATRIX_BUNDLE_MEMBER_KEYS = ("id", "report", "previous", "digest")
+_MATRIX_BUNDLE_GENESIS = "0" * 64
+
+
+def _matrix_bundle_member_digest(previous: str, member_id: str, report: Any) -> str:
+    """Compute one bundle member digest.
+
+    The payload contains exactly ``id`` and ``report`` in that key order,
+    encoded as newline-free compact UTF-8 JSON; the digest is the lowercase
+    hexadecimal SHA-256 of ``previous``'s ASCII bytes followed immediately by
+    those payload bytes.
+    """
+    payload = {"id": member_id, "report": report}
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(
+        previous.encode("ascii") + canonical.encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_matrix_bundle_items(items: Any) -> list[dict[str, Any]]:
+    """Validate the ``items`` argument of :func:`decision_matrix_attestation_bundle`.
+
+    ``items`` must be a non-empty list whose members are dicts with exactly
+    the keys ``id`` and ``report``; ids must be non-empty and unique. Each
+    report is checked with the existing single matrix attestation validation
+    semantics. Returns the members sorted by ``id`` in Unicode code point
+    order with each report fully normalized and semantically rebuilt. Any
+    violation raises ``ValueError`` without mutating the input.
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list of item dicts")
+    members: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        field = f"items[{index}]"
+        if not isinstance(item, dict) or set(item) != _MATRIX_BUNDLE_ITEM_KEYS:
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys id, report"
+            )
+        member_id = _check_non_empty_str(item["id"], f"{field}.id")
+        if member_id in seen:
+            raise ValueError(f"duplicate item id: {member_id!r}")
+        seen.add(member_id)
+        # Existing single-matrix validation semantics: structural and
+        # semantic violations, including untrue sub-credential digests, raise.
+        validated_report = _validate_and_rebuild_matrix_attestation(item["report"])
+        members.append({"id": member_id, "report": validated_report})
+    members.sort(key=lambda member: member["id"])
+    return members
+
+
+def _matrix_attestation_is_authentic(validated: dict[str, Any]) -> bool:
+    """Recompute a normalized single matrix attestation's chain and digest.
+
+    Returns whether the embedded schedule hash chain, its ``root``, and the
+    declared single-credential digest all match recomputation. Structural and
+    semantic validation is assumed to have already run.
+    """
+    policy = validated["policy"]
+    chain_ok, chain_root = _recompute_schedule_root(policy["points"])
+    if not chain_ok or policy["root"] != chain_root:
+        return False
+    return validated["digest"] == _recompute_matrix_attestation_digest(validated)
+
+
+_MATRIX_ATTEST_FULL_KEYS = _MATRIX_ATTEST_CONTENT_KEYS + ("digest",)
+
+
+def _full_matrix_report(validated: dict[str, Any]) -> dict[str, Any]:
+    """Return the canonical full single matrix attestation (with digest)."""
+    return {key: validated[key] for key in _MATRIX_ATTEST_FULL_KEYS}
+
+
+def decision_matrix_attestation_bundle(items: Any) -> dict[str, Any]:
+    """Bind multiple decision matrix attestations into one verifiable bundle.
+
+    Pure function: it only inspects its argument, touches neither history nor
+    files, and never mutates an input object at any level.
+
+    ``items`` must be a non-empty list whose members are dicts with exactly
+    the keys ``id`` and ``report``. Each ``id`` must be a non-empty string
+    unique across the list (duplicates or wrong types raise ``ValueError``),
+    and every ``report`` must fully conform to the published single
+    :func:`decision_matrix_attestation` contract. Members are checked with the
+    existing validation semantics before anything is built: any bad
+    structure, bad semantics, or untrue sub-credential digest (including a
+    broken embedded schedule chain) raises ``ValueError``.
+
+    Members are ordered by ``id`` in Unicode code point order, so caller order
+    cannot affect the result. Returns a deep copy with top-level keys
+    ``root``, ``reports`` in that order; each member has keys ``id``,
+    ``report``, ``previous``, ``digest`` in that order, where ``report`` is
+    the complete single matrix attestation keeping its canonical key order.
+    The first member's ``previous`` is 64 ASCII ``0`` characters; every later
+    member's ``previous`` is the preceding member's ``digest``. Each member's
+    digest payload contains exactly ``id``, ``report`` in that key order
+    encoded as newline-free compact UTF-8 JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``); ``digest`` is the lowercase 64-char hex
+    SHA-256 of ``previous``'s ASCII bytes immediately followed by that
+    payload. ``root`` is the last member's digest. Equal-valued inputs yield
+    byte-identical results.
+    """
+    members = _validate_matrix_bundle_items(items)
+    reports: list[dict[str, Any]] = []
+    previous = _MATRIX_BUNDLE_GENESIS
+    for member in members:
+        validated = member["report"]
+        if not _matrix_attestation_is_authentic(validated):
+            raise ValueError(
+                f"items report for id {member['id']!r} has an untrue digest "
+                "or schedule chain"
+            )
+        report = _full_matrix_report(validated)
+        digest = _matrix_bundle_member_digest(previous, member["id"], report)
+        reports.append(
+            {
+                "id": member["id"],
+                "report": report,
+                "previous": previous,
+                "digest": digest,
+            }
+        )
+        previous = digest
+    return {"root": previous, "reports": reports}
+
+
+def _normalize_matrix_bundle_report(value: Any) -> list[dict[str, Any]]:
+    """Structurally and semantically validate a bundle report.
+
+    Returns the normalized members (each a fresh deep copy with keys ``id``,
+    ``report``, ``previous``, ``digest``) in their declared order; ``report``
+    is the fully normalized single matrix attestation including its declared
+    digest. The input must be a dict with exactly the keys ``root``,
+    ``reports``; ``root`` and every member ``previous``/``digest`` must be 64
+    lowercase hexadecimal characters; ``reports`` must be a non-empty list of
+    members with exactly the member keys, ids non-empty, unique, and strictly
+    ascending in Unicode code point order, and each sub-report must fully
+    pass the single matrix attestation structural and semantic checks. Any
+    violation raises ``ValueError``; inputs are never mutated.
+    """
+    if not isinstance(value, dict) or set(value) != set(_MATRIX_BUNDLE_REPORT_KEYS):
+        raise ValueError(
+            "report must be a dict with exactly the keys root, reports"
+        )
+    _check_hex64(value["root"], "report.root")
+    raw_reports = value["reports"]
+    if not isinstance(raw_reports, list) or not raw_reports:
+        raise ValueError("report.reports must be a non-empty list")
+    members: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    previous_id: str | None = None
+    for index, member in enumerate(raw_reports):
+        field = f"report.reports[{index}]"
+        if not isinstance(member, dict) or set(member) != set(
+            _MATRIX_BUNDLE_MEMBER_KEYS
+        ):
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys "
+                "id, report, previous, digest"
+            )
+        member_id = _check_non_empty_str(member["id"], f"{field}.id")
+        if member_id in seen:
+            raise ValueError(f"report.reports contains a duplicate id: {member_id!r}")
+        if previous_id is not None and member_id <= previous_id:
+            raise ValueError(
+                "report.reports must be ordered by id in ascending Unicode "
+                "code point order"
+            )
+        previous = _check_hex64(member["previous"], f"{field}.previous")
+        digest = _check_hex64(member["digest"], f"{field}.digest")
+        validated_report = _validate_and_rebuild_matrix_attestation(member["report"])
+        members.append(
+            {
+                "id": member_id,
+                "report": _full_matrix_report(validated_report),
+                "previous": previous,
+                "digest": digest,
+            }
+        )
+        seen.add(member_id)
+        previous_id = member_id
+    return members
+
+
+def verify_decision_matrix_attestation_bundle(report: Any, expected: Any) -> bool:
+    """Verify a :func:`decision_matrix_attestation_bundle` report by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history nor
+    files, and never mutates an input object at any level.
+
+    ``report`` must be a dict with exactly the keys ``root``, ``reports`` and
+    ``expected`` a dict with exactly the keys ``root``, ``report_ids``.
+    ``root`` must be 64 lowercase hexadecimal characters and ``report_ids`` a
+    non-empty list of unique non-empty strings (caller order is arbitrary;
+    comparison is by code point). ``reports`` must be a non-empty list whose
+    members each have exactly the keys ``id``, ``report``, ``previous``,
+    ``digest``; the ids must be non-empty, unique within the bundle, and
+    strictly ascending in Unicode code point order, each ``previous``/
+    ``digest`` must be 64 lowercase hexadecimal characters, and every
+    sub-report must fully conform to the single
+    :func:`decision_matrix_attestation` contract, structurally and
+    semantically. Both inputs complete every key-set, type, digest-format,
+    member-order, and single-credential semantic check before any comparison;
+    any violation raises ``ValueError``.
+
+    Once the structures are legal, every sub-credential digest and embedded
+    schedule chain, every bundle link, and the bundle root are recomputed
+    rather than trusted. Returns ``False`` when any sub-credential digest or
+    its schedule chain, a bundle ``previous``/``digest`` link, the bundle
+    ``root``, or the declared ``root``/report-id set differs from the
+    recomputed values or from ``expected`` (ids compared by code point);
+    otherwise ``True``.
+    """
+    members = _normalize_matrix_bundle_report(report)
+    if not isinstance(expected, dict) or set(expected) != set(
+        _MATRIX_BUNDLE_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys root, report_ids"
+        )
+    expected_root = _check_hex64(expected["root"], "expected.root")
+    raw_ids = expected["report_ids"]
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise ValueError("expected.report_ids must be a non-empty list")
+    expected_ids: set[str] = set()
+    for index, member_id in enumerate(raw_ids):
+        _check_non_empty_str(member_id, f"expected.report_ids[{index}]")
+        if member_id in expected_ids:
+            raise ValueError("expected.report_ids must not contain duplicates")
+        expected_ids.add(member_id)
+
+    # All structural and single-credential semantic checks have passed; only
+    # now compare sets and recompute the digests and links.
+    if expected_ids != {member["id"] for member in members}:
+        return False
+
+    previous = _MATRIX_BUNDLE_GENESIS
+    for member in members:
+        sub = member["report"]
+        # Recompute the embedded single credential rather than trusting it.
+        if not _matrix_attestation_is_authentic(sub):
+            return False
+        if member["previous"] != previous:
+            return False
+        digest = _matrix_bundle_member_digest(previous, member["id"], sub)
+        if member["digest"] != digest:
+            return False
+        previous = digest
+    return report["root"] == previous and expected_root == previous
