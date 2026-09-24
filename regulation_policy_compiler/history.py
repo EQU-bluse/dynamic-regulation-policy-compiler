@@ -18,6 +18,8 @@ _AUDIT_PAYLOAD_KEYS = ("at", "decision", "trace", "basis")
 _AUDIT_ENTRY_KEYS = ("at", "decision", "trace", "basis", "previous", "digest")
 _AUDIT_REPORT_KEYS = ("id", "start", "end", "root", "entries")
 _AUDIT_EXPECTED_KEYS = ("id", "start", "end", "root")
+_BUNDLE_REPORT_KEYS = ("start", "end", "root", "reports")
+_BUNDLE_EXPECTED_KEYS = ("start", "end", "root", "record_ids")
 _AUDIT_GENESIS = "0" * 64
 _HEX_DIGITS = frozenset("0123456789abcdef")
 
@@ -140,6 +142,73 @@ def _validate_audit_entry(entry: Any, index: int) -> dict[str, Any]:
     }
 
 
+def _validate_audit_report(report: Any, label: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Validate an audit-report-shaped object and return a normalized deep copy.
+
+    The object must have exactly the keys ``id, start, end, root, entries``;
+    ``id`` a non-empty string, entries strictly increasing in ``at`` and lying
+    in the report's own closed window. Returns the normalized report copy and
+    the list of normalized entries.
+    """
+    if not isinstance(report, dict) or set(report) != set(_AUDIT_REPORT_KEYS):
+        raise ValueError(
+            f"{label} must be a dict with exactly the keys "
+            "id, start, end, root, entries"
+        )
+    _check_non_empty_str(report["id"], f"{label}.id")
+    _check_time_window(report["start"], report["end"], label)
+    _check_hex64(report["root"], f"{label}.root")
+    entries = report["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"{label}.entries must be a non-empty list")
+    normalized: list[dict[str, Any]] = []
+    previous_at: str | None = None
+    for index, entry in enumerate(entries):
+        normalized.append(_validate_audit_entry(entry, index))
+        at = entry["at"]
+        if previous_at is not None and at <= previous_at:
+            raise ValueError(f"{label}.entries must be strictly increasing in at")
+        if not report["start"] <= at <= report["end"]:
+            raise ValueError(f"{label}.entries[{index}].at lies outside [start, end]")
+        previous_at = at
+    copied = {
+        "id": report["id"],
+        "start": report["start"],
+        "end": report["end"],
+        "root": report["root"],
+        "entries": normalized,
+    }
+    return copied, normalized
+
+
+def _recompute_audit_chain(
+    report: dict[str, Any], entries: list[dict[str, Any]]
+) -> bool:
+    """Return whether ``entries`` recompute to the report's declared chain."""
+    previous = _AUDIT_GENESIS
+    for entry in entries:
+        if entry["previous"] != previous:
+            return False
+        if entry["digest"] != _audit_digest(previous, entry):
+            return False
+        previous = entry["digest"]
+    return report["root"] == previous
+
+
+def _bundle_root(reports: list[dict[str, Any]]) -> str:
+    root = _AUDIT_GENESIS
+    for report in reports:
+        payload = json.dumps(
+            {"id": report["id"], "root": report["root"]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        root = hashlib.sha256(
+            root.encode("ascii") + payload.encode("utf-8")
+        ).hexdigest()
+    return root
+
+
 def verify_audit(report: Any, expected: Any) -> bool:
     """Verify an audit report against an expected summary by recomputation.
 
@@ -165,26 +234,7 @@ def verify_audit(report: Any, expected: Any) -> bool:
     The function touches neither history nor files and does not mutate its
     inputs.
     """
-    if not isinstance(report, dict) or set(report) != set(_AUDIT_REPORT_KEYS):
-        raise ValueError(
-            "report must be a dict with exactly the keys id, start, end, root, entries"
-        )
-    _check_non_empty_str(report["id"], "report.id")
-    _check_time_window(report["start"], report["end"], "report")
-    _check_hex64(report["root"], "report.root")
-    entries = report["entries"]
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("report.entries must be a non-empty list")
-    normalized: list[dict[str, Any]] = []
-    previous_at: str | None = None
-    for index, entry in enumerate(entries):
-        normalized.append(_validate_audit_entry(entry, index))
-        at = entry["at"]
-        if previous_at is not None and at <= previous_at:
-            raise ValueError("report.entries must be strictly increasing in at")
-        if not report["start"] <= at <= report["end"]:
-            raise ValueError(f"entries[{index}].at lies outside [start, end]")
-        previous_at = at
+    normalized_report, normalized_entries = _validate_audit_report(report, "report")
     if not isinstance(expected, dict) or set(expected) != set(_AUDIT_EXPECTED_KEYS):
         raise ValueError(
             "expected must be a dict with exactly the keys id, start, end, root"
@@ -193,16 +243,97 @@ def verify_audit(report: Any, expected: Any) -> bool:
     _check_time_window(expected["start"], expected["end"], "expected")
     _check_hex64(expected["root"], "expected.root")
     for key in _AUDIT_EXPECTED_KEYS:
-        if report[key] != expected[key]:
+        if normalized_report[key] != expected[key]:
             return False
-    previous = _AUDIT_GENESIS
-    for entry in normalized:
-        if entry["previous"] != previous:
+    return _recompute_audit_chain(normalized_report, normalized_entries)
+
+
+def verify_audit_bundle(report: Any, expected: Any) -> bool:
+    """Verify a bundle audit report against an expected summary.
+
+    Pure function: it reads neither history nor files and never mutates its
+    inputs.
+
+    ``report`` must be a dict with exactly the keys
+    ``start, end, root, reports``; ``start``/``end`` valid UTC seconds with
+    ``start <= end``, ``root`` a 64-character lowercase hexadecimal string,
+    and ``reports`` a non-empty list. Each sub-report must have exactly the
+    keys ``id, start, end, root, entries`` and satisfy the single-audit
+    contract: ``id`` a non-empty string unique within the bundle, entries
+    strictly increasing inside the sub-report's own closed window, and all
+    hash fields 64 lowercase hexadecimal characters. Every sub-report's
+    ``start``/``end`` must equal the bundle window, and sub-reports must be
+    sorted by ``id`` in ascending Unicode code point order; duplicate ids or
+    out-of-order reports are invalid.
+
+    ``expected`` must be a dict with exactly the keys
+    ``start, end, root, record_ids``. The time window and ``root`` are
+    validated as above; ``record_ids`` must be a non-empty list of unique
+    non-empty strings (caller order is irrelevant — comparison is by code
+    point order). Any structural violation at any level raises
+    ``ValueError``.
+
+    After structural validation each sub-chain is recomputed using the same
+    semantics as :func:`verify_audit`; any ``previous``, ``digest``, or
+    sub-report ``root`` mismatch returns ``False``. The bundle ``root`` is
+    then recomputed from the canonically ordered sub-reports per the
+    ``audit_bundle`` chain algorithm. ``False`` is also returned when the
+    time window, root, or record id set differs from ``expected``.
+    """
+    if not isinstance(report, dict) or set(report) != set(_BUNDLE_REPORT_KEYS):
+        raise ValueError(
+            "report must be a dict with exactly the keys start, end, root, reports"
+        )
+    _check_time_window(report["start"], report["end"], "report")
+    _check_hex64(report["root"], "report.root")
+    sub_reports_raw = report["reports"]
+    if not isinstance(sub_reports_raw, list) or not sub_reports_raw:
+        raise ValueError("report.reports must be a non-empty list")
+    sub_reports: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    previous_id: str | None = None
+    for index, sub_report in enumerate(sub_reports_raw):
+        label = f"report.reports[{index}]"
+        normalized, entries = _validate_audit_report(sub_report, label)
+        record_id = normalized["id"]
+        if record_id in seen_ids:
+            raise ValueError(f"report.reports contains a duplicate id: {record_id!r}")
+        if previous_id is not None and record_id <= previous_id:
+            raise ValueError("report.reports must be sorted by id in code point order")
+        seen_ids.add(record_id)
+        previous_id = record_id
+        if (
+            normalized["start"] != report["start"]
+            or normalized["end"] != report["end"]
+        ):
+            raise ValueError(f"{label} time window must equal the bundle window")
+        sub_reports.append((normalized, entries))
+    if not isinstance(expected, dict) or set(expected) != set(_BUNDLE_EXPECTED_KEYS):
+        raise ValueError(
+            "expected must be a dict with exactly the keys "
+            "start, end, root, record_ids"
+        )
+    _check_time_window(expected["start"], expected["end"], "expected")
+    _check_hex64(expected["root"], "expected.root")
+    record_ids = expected["record_ids"]
+    if not isinstance(record_ids, list) or not record_ids:
+        raise ValueError("expected.record_ids must be a non-empty list of strings")
+    expected_ids: set[str] = set()
+    for index, record_id in enumerate(record_ids):
+        _check_non_empty_str(record_id, f"expected.record_ids[{index}]")
+        if record_id in expected_ids:
+            raise ValueError("expected.record_ids must not contain duplicates")
+        expected_ids.add(record_id)
+    if report["start"] != expected["start"] or report["end"] != expected["end"]:
+        return False
+    if seen_ids != expected_ids:
+        return False
+    for normalized, entries in sub_reports:
+        if not _recompute_audit_chain(normalized, entries):
             return False
-        if entry["digest"] != _audit_digest(previous, entry):
-            return False
-        previous = entry["digest"]
-    return report["root"] == previous
+    if _bundle_root([normalized for normalized, _ in sub_reports]) != report["root"]:
+        return False
+    return report["root"] == expected["root"]
 
 
 class DecisionHistory:

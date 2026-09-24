@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from .history import DecisionHistory, verify_audit
+from .history import DecisionHistory, verify_audit, verify_audit_bundle
 from .policy import (
     _check_fact_map,
     _check_non_empty_str,
@@ -349,3 +349,18 @@ async def audit_bundle_endpoint(request: Request) -> Response:
     except OSError:
         return _history_unavailable()
     return _record_response(bundle)
+
+
+@app.post("/audits/bundle/verify")
+async def verify_audit_bundle_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_audit_bundle(body["report"], body["expected"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
