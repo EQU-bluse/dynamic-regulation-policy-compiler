@@ -26,6 +26,7 @@ from .policy import (
     decision_timeline_attestation,
     evolution_checkpoint,
     evolution_checkpoint_bundle,
+    evolution_checkpoint_bundle_diff,
     explain,
     matrix_bundle_diff,
     matrix_bundle_evolution,
@@ -39,6 +40,7 @@ from .policy import (
     verify_decision_timeline_attestation,
     verify_evolution_checkpoint,
     verify_evolution_checkpoint_bundle,
+    verify_evolution_checkpoint_bundle_diff,
     verify_matrix_bundle_diff,
     verify_matrix_bundle_evolution,
 )
@@ -64,6 +66,7 @@ _EVOLUTION_CHECKPOINT_KEYS = {"report", "start", "end"}
 _VERIFY_KEYS = {"report", "expected"}
 _EVOLUTION_CHECKPOINT_VERIFY_KEYS = {"proof", "expected"}
 _CHECKPOINT_BUNDLE_ITEMS_KEYS = {"items"}
+_CHECKPOINT_BUNDLE_DIFF_KEYS = {"before", "after"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
 
 
@@ -508,6 +511,40 @@ async def verify_evolution_checkpoint_bundle_endpoint(
         return _invalid_request()
     try:
         valid = verify_evolution_checkpoint_bundle(
+            body["report"], body["expected"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff")
+async def evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_DIFF_KEYS:
+        return _invalid_request()
+    try:
+        report = evolution_checkpoint_bundle_diff(body["before"], body["after"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/verify")
+async def verify_evolution_checkpoint_bundle_diff_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_evolution_checkpoint_bundle_diff(
             body["report"], body["expected"]
         )
     except ValueError:

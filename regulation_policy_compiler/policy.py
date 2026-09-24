@@ -4284,3 +4284,545 @@ def verify_evolution_checkpoint_bundle(report: Any, expected: Any) -> bool:
     if {member["id"] for member in members} != set(expected_ids):
         return False
     return True
+
+
+_CHECKPOINT_BUNDLE_DIFF_REPORT_KEYS = (
+    "before_root",
+    "after_root",
+    "before",
+    "after",
+    "changes",
+    "digest",
+)
+_CHECKPOINT_BUNDLE_DIFF_CHANGE_KEYS = frozenset({"id", "kind", "before", "after"})
+_CHECKPOINT_BUNDLE_DIFF_EXPECTED_KEYS = (
+    "before_root",
+    "after_root",
+    "before_ids",
+    "after_ids",
+    "digest",
+)
+_CHECKPOINT_BUNDLE_DIFF_KINDS = frozenset({"added", "removed", "changed"})
+
+
+def _checkpoint_bundle_is_truthful(
+    bundle_root: str, members: list[dict[str, Any]]
+) -> bool:
+    """Recompute a structurally normalized checkpoint bundle's hash chain.
+
+    Every member proof must recompute as true against its own declarations,
+    each ``previous``/``digest`` link must chain from the 64-zero genesis,
+    and the declared bundle ``root`` must equal the final member digest.
+    """
+    previous = _CHECKPOINT_BUNDLE_GENESIS
+    for member in members:
+        if not _checkpoint_is_truthful(member["proof"]):
+            return False
+        if member["previous"] != previous:
+            return False
+        recomputed = _checkpoint_bundle_member_digest(
+            previous, member["id"], member["proof"]
+        )
+        if member["digest"] != recomputed:
+            return False
+        previous = recomputed
+    return bundle_root == previous
+
+
+def _canonical_checkpoint_bundle_from_members(
+    bundle_root: str, members: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Rebuild a fresh ``root, proofs`` bundle from normalized members."""
+    return {
+        "root": bundle_root,
+        "proofs": [
+            {
+                "id": member["id"],
+                "proof": copy.deepcopy(member["proof"]),
+                "previous": member["previous"],
+                "digest": member["digest"],
+            }
+            for member in members
+        ],
+    }
+
+
+def _checkpoint_diff_semantics(diff: dict[str, Any] | None) -> Any:
+    """Summary-free semantic projection of a normalized stage diff.
+
+    The diff's own digest, both bundle roots, and every bundle or credential
+    digest inside it are summaries, not semantics: two diffs with the same
+    bundles and the same change classification but different hash fields
+    describe the same transition. Projection keeps the summary-free member
+    semantics of both bundles and of every non-null change side.
+    """
+    if diff is None:
+        return None
+
+    def credential_semantics(credential: dict[str, Any] | None) -> Any:
+        if credential is None:
+            return None
+        content = {key: credential[key] for key in _MATRIX_ATTEST_CONTENT_KEYS}
+        return _matrix_credential_semantics(content)
+
+    return {
+        "before": _bundle_member_semantics(diff["before"]),
+        "after": _bundle_member_semantics(diff["after"]),
+        "changes": [
+            {
+                "id": change["id"],
+                "kind": change["kind"],
+                "before": credential_semantics(change["before"]),
+                "after": credential_semantics(change["after"]),
+            }
+            for change in diff["changes"]
+        ],
+    }
+
+
+def _checkpoint_proof_semantics(proof: dict[str, Any]) -> dict[str, Any]:
+    """Summary-free semantic projection of a canonical checkpoint proof.
+
+    The proof's ``anchor``/``commitment``, every stage ``previous``/
+    ``digest``, and every embedded bundle or diff summary are derived
+    summaries, not semantics: two proofs over the same window, bundles, and
+    transitions but different hash fields describe the same member. Change
+    sides are compared with bundle members on this projection, so a false
+    summary yields ``False`` at recomputation rather than a structural
+    mismatch, while genuinely different content still raises ``ValueError``.
+    """
+    return {
+        "start": proof["start"],
+        "end": proof["end"],
+        "stages": [
+            {
+                "at": stage["at"],
+                "bundle": _bundle_member_semantics(stage["bundle"]),
+                "diff": _checkpoint_diff_semantics(stage["diff"]),
+            }
+            for stage in proof["stages"]
+        ],
+    }
+
+
+def evolution_checkpoint_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
+    """Attest the difference between two evolution checkpoint bundles.
+
+    Pure function: it only processes its arguments, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    Both ``before`` and ``after`` must be complete
+    :func:`evolution_checkpoint_bundle` reports. Before anything is
+    produced, both sides pass the full
+    :func:`verify_evolution_checkpoint_bundle` structural and semantic
+    checks: key sets, digest formats, unique strictly ascending member ids,
+    and every embedded checkpoint proof; the second side is still fully
+    checked when the first side merely carries a false digest. Any
+    structural or semantic violation, and any false proof, member chain
+    link, or bundle root on either side, raises ``ValueError``.
+
+    Returns a deep copy with keys ``before_root``, ``after_root``,
+    ``before``, ``after``, ``changes``, ``digest`` in that order;
+    ``before_root``/``after_root`` are the two bundles' roots and
+    ``before``/``after`` are independent deep copies of the normalized
+    bundles. Members are matched by ``id``; ``changes`` keeps only the
+    ``added`` (only in ``after``), ``removed`` (only in ``before``), and
+    ``changed`` (present in both but with a different complete proof)
+    members, ordered by ``id`` in ascending Unicode code point order. Each
+    change has keys ``id``, ``kind``, ``before``, ``after``; the two sides
+    are deep copies of the checkpoint proof or ``null``. Identical bundles
+    yield an empty ``changes`` list.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) with no newline over a payload containing
+    exactly the first five keys in order. ``digest`` is the lowercase
+    64-char hex SHA-256 of ``C``. Equal-valued inputs yield byte-identical
+    results regardless of input dict key order, and no two levels share a
+    mutable container.
+    """
+    before_root, before_members = _normalize_verified_checkpoint_bundle(
+        before, "before"
+    )
+    after_root, after_members = _normalize_verified_checkpoint_bundle(
+        after, "after"
+    )
+    if not _checkpoint_bundle_is_truthful(before_root, before_members):
+        raise ValueError("before bundle root or hash chain does not verify")
+    if not _checkpoint_bundle_is_truthful(after_root, after_members):
+        raise ValueError("after bundle root or hash chain does not verify")
+
+    before_bundle = _canonical_checkpoint_bundle_from_members(
+        before_root, before_members
+    )
+    after_bundle = _canonical_checkpoint_bundle_from_members(
+        after_root, after_members
+    )
+    before_by_id = {member["id"]: member for member in before_members}
+    after_by_id = {member["id"]: member for member in after_members}
+
+    changes: list[dict[str, Any]] = []
+    for member_id in sorted(set(before_by_id) | set(after_by_id)):
+        before_member = before_by_id.get(member_id)
+        after_member = after_by_id.get(member_id)
+        if (
+            before_member is not None
+            and after_member is not None
+            and before_member["proof"] == after_member["proof"]
+        ):
+            continue
+        if before_member is None:
+            kind = "added"
+        elif after_member is None:
+            kind = "removed"
+        else:
+            kind = "changed"
+        changes.append(
+            {
+                "id": member_id,
+                "kind": kind,
+                "before": (
+                    copy.deepcopy(before_member["proof"])
+                    if before_member is not None
+                    else None
+                ),
+                "after": (
+                    copy.deepcopy(after_member["proof"])
+                    if after_member is not None
+                    else None
+                ),
+            }
+        )
+
+    payload = {
+        "before_root": before_root,
+        "after_root": after_root,
+        "before": before_bundle,
+        "after": after_bundle,
+        "changes": changes,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    result = copy.deepcopy(payload)
+    result["digest"] = digest
+    return result
+
+
+def _normalize_diff_change_proof(value: Any, field: str) -> dict[str, Any] | None:
+    """Validate one non-null change-side checkpoint proof.
+
+    Returns a fresh canonical deep copy of the proof, or ``None`` for an
+    explicit null. Structural and semantic violations raise ``ValueError``;
+    a false declared summary is carried back inside the canonical proof so
+    it yields ``False`` only after every input validates.
+    """
+    if value is None:
+        return None
+    return _canonical_checkpoint_from_normalized(
+        _normalize_verified_evolution_checkpoint(value, field)
+    )
+
+
+def _normalize_verified_checkpoint_diff_changes(
+    value: Any,
+    before_members: list[dict[str, Any]],
+    after_members: list[dict[str, Any]],
+    field: str,
+) -> list[dict[str, Any]]:
+    """Structurally validate a checkpoint diff ``changes`` list.
+
+    Each change must have exactly the keys ``id``, ``kind``, ``before``,
+    ``after``; ids non-empty, bundle-wide unique, and strictly ascending in
+    Unicode code point order; ``kind`` one of ``added``, ``removed``,
+    ``changed``; each non-null side a fully valid checkpoint proof. Every
+    change must agree with the two bundles — right kind for its id's
+    presence, correct null sides, and proof semantics equal to the
+    corresponding bundle member's proof — and the list must be complete:
+    every added or removed member and every present-in-both member whose
+    proof semantics differ must appear, unchanged members must not. Returns
+    fresh normalized entries carrying canonical deep-copy proofs. Any
+    violation raises ``ValueError``.
+    """
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a list of change dicts")
+    before_by_id = {member["id"]: member for member in before_members}
+    after_by_id = {member["id"]: member for member in after_members}
+
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    previous_id: str | None = None
+    for index, change in enumerate(value):
+        item_field = f"{field}[{index}]"
+        if not isinstance(change, dict) or set(change) != (
+            _CHECKPOINT_BUNDLE_DIFF_CHANGE_KEYS
+        ):
+            raise ValueError(
+                f"{item_field} must be a dict with exactly the keys "
+                "id, kind, before, after"
+            )
+        member_id = _check_non_empty_str(change["id"], f"{item_field}.id")
+        if member_id in seen:
+            raise ValueError(f"{field} contains a duplicate change id: {member_id!r}")
+        if previous_id is not None and member_id <= previous_id:
+            raise ValueError(
+                f"{field} must be ordered by id in ascending Unicode code "
+                "point order"
+            )
+        kind = change["kind"]
+        if kind not in _CHECKPOINT_BUNDLE_DIFF_KINDS:
+            raise ValueError(
+                f"{item_field}.kind must be 'added', 'removed', or 'changed'"
+            )
+        before_proof = _normalize_diff_change_proof(
+            change["before"], f"{item_field}.before"
+        )
+        after_proof = _normalize_diff_change_proof(
+            change["after"], f"{item_field}.after"
+        )
+        before_member = before_by_id.get(member_id)
+        after_member = after_by_id.get(member_id)
+        if kind == "added":
+            if before_proof is not None or after_proof is None:
+                raise ValueError(
+                    f"{item_field} is 'added' but before/after do not match "
+                    "the contract"
+                )
+            if before_member is not None or after_member is None:
+                raise ValueError(
+                    f"{item_field} id {member_id!r} is not added between the "
+                    "two bundles"
+                )
+            if _checkpoint_proof_semantics(after_proof) != (
+                _checkpoint_proof_semantics(after_member["proof"])
+            ):
+                raise ValueError(
+                    f"{item_field}.after does not equal the after bundle's "
+                    f"proof for id {member_id!r}"
+                )
+        elif kind == "removed":
+            if before_proof is None or after_proof is not None:
+                raise ValueError(
+                    f"{item_field} is 'removed' but before/after do not "
+                    "match the contract"
+                )
+            if before_member is None or after_member is not None:
+                raise ValueError(
+                    f"{item_field} id {member_id!r} is not removed between "
+                    "the two bundles"
+                )
+            if _checkpoint_proof_semantics(before_proof) != (
+                _checkpoint_proof_semantics(before_member["proof"])
+            ):
+                raise ValueError(
+                    f"{item_field}.before does not equal the before bundle's "
+                    f"proof for id {member_id!r}"
+                )
+        else:
+            if before_proof is None or after_proof is None:
+                raise ValueError(
+                    f"{item_field} is 'changed' but before/after do not "
+                    "match the contract"
+                )
+            if before_member is None or after_member is None:
+                raise ValueError(
+                    f"{item_field} id {member_id!r} must exist in both "
+                    "bundles to be 'changed'"
+                )
+            if _checkpoint_proof_semantics(before_proof) != (
+                _checkpoint_proof_semantics(before_member["proof"])
+            ):
+                raise ValueError(
+                    f"{item_field}.before does not equal the before bundle's "
+                    f"proof for id {member_id!r}"
+                )
+            if _checkpoint_proof_semantics(after_proof) != (
+                _checkpoint_proof_semantics(after_member["proof"])
+            ):
+                raise ValueError(
+                    f"{item_field}.after does not equal the after bundle's "
+                    f"proof for id {member_id!r}"
+                )
+        entries.append(
+            {
+                "id": member_id,
+                "kind": kind,
+                "before": before_proof,
+                "after": after_proof,
+            }
+        )
+        seen.add(member_id)
+        previous_id = member_id
+
+    expected_ids: set[str] = set(before_by_id) ^ set(after_by_id)
+    for member_id in sorted(set(before_by_id) & set(after_by_id)):
+        # Membership in the diff is a semantic question; false summaries are
+        # recomputed afterwards and must not fabricate "changed" members.
+        if _checkpoint_proof_semantics(before_by_id[member_id]["proof"]) != (
+            _checkpoint_proof_semantics(after_by_id[member_id]["proof"])
+        ):
+            expected_ids.add(member_id)
+    if seen != expected_ids:
+        raise ValueError(
+            "changes must list exactly the added, removed, and changed "
+            "members, with unchanged members omitted"
+        )
+    return entries
+
+
+def _normalize_verified_checkpoint_diff_report(
+    value: Any, field: str
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Run every structural and semantic check on a checkpoint diff report.
+
+    Validates an :func:`evolution_checkpoint_bundle_diff`-shaped report
+    exactly as :func:`verify_evolution_checkpoint_bundle_diff` does: the six
+    exact keys, hex64 summaries, root fields matching their embedded
+    bundles, both bundles' full structural and embedded-proof checks, and
+    the complete change-list consistency rules. Returns ``(content,
+    before_members, after_members, change_entries)`` where ``content`` is a
+    fresh canonical-order dict with the six diff keys (its ``before``/
+    ``after`` bundles and change proofs are independent deep copies).
+    False summaries are not detected here — callers recompute them
+    afterwards, yielding ``False`` rather than ``ValueError``.
+    """
+    if not isinstance(value, dict) or set(value) != set(
+        _CHECKPOINT_BUNDLE_DIFF_REPORT_KEYS
+    ):
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys "
+            "before_root, after_root, before, after, changes, digest"
+        )
+    before_root = _check_hex64(value["before_root"], f"{field}.before_root")
+    after_root = _check_hex64(value["after_root"], f"{field}.after_root")
+    digest = _check_hex64(value["digest"], f"{field}.digest")
+    before_bundle_root, before_members = _normalize_verified_checkpoint_bundle(
+        value["before"], f"{field}.before"
+    )
+    after_bundle_root, after_members = _normalize_verified_checkpoint_bundle(
+        value["after"], f"{field}.after"
+    )
+    if before_bundle_root != before_root:
+        raise ValueError(f"{field}.before_root must equal {field}.before.root")
+    if after_bundle_root != after_root:
+        raise ValueError(f"{field}.after_root must equal {field}.after.root")
+    change_entries = _normalize_verified_checkpoint_diff_changes(
+        value["changes"], before_members, after_members, f"{field}.changes"
+    )
+    content = {
+        "before_root": before_root,
+        "after_root": after_root,
+        "before": _canonical_checkpoint_bundle_from_members(
+            before_root, before_members
+        ),
+        "after": _canonical_checkpoint_bundle_from_members(
+            after_root, after_members
+        ),
+        "changes": [
+            {
+                "id": change["id"],
+                "kind": change["kind"],
+                "before": change["before"],
+                "after": change["after"],
+            }
+            for change in change_entries
+        ],
+        "digest": digest,
+    }
+    return content, before_members, after_members, change_entries
+
+
+def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
+    """Verify an :func:`evolution_checkpoint_bundle_diff` report by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level.
+
+    ``report`` must be a dict with exactly the keys ``before_root``,
+    ``after_root``, ``before``, ``after``, ``changes``, ``digest`` and
+    conform level by level to the :func:`evolution_checkpoint_bundle_diff`
+    contract. The two roots and ``digest`` must be 64 lowercase hexadecimal
+    characters, and each root must equal the root declared by its embedded
+    bundle. ``before``/``after`` must be complete checkpoint bundles that
+    pass every structural, member-order, digest-format, and embedded-proof
+    semantic check. ``changes`` items must have exactly the keys ``id``,
+    ``kind``, ``before``, ``after`` with non-empty unique strictly ascending
+    ids, legal kinds, null sides matching each kind, and non-null sides that
+    are valid checkpoint proofs exactly reproducing the corresponding bundle
+    members; the list must be complete and omit unchanged members.
+    ``expected`` must have exactly the keys ``before_root``, ``after_root``,
+    ``before_ids``, ``after_ids``, ``digest``; both id arrays must be
+    non-empty lists of unique non-empty strings (caller order is arbitrary;
+    comparison is by code point). Any structural, value-domain, uniqueness,
+    ordering, or change-consistency violation raises ``ValueError``, and
+    both inputs finish structural validation before any comparison.
+
+    Only afterwards are values recomputed rather than trusted: every
+    embedded checkpoint proof (window boundaries, anchor, bundles, adjacent
+    diffs, and stage chain through its commitment), both bundle member
+    chains and roots, and the diff digest over the five declared prefix
+    items in their canonical compact-JSON form. Returns ``False`` when a
+    proof, chain link, bundle root, the diff digest, or an ``expected``
+    value (the two roots, the digest, or either id set after code point
+    sorting) does not match; otherwise ``True``.
+    """
+    content, before_members, after_members, changes = (
+        _normalize_verified_checkpoint_diff_report(report, "report")
+    )
+    before_root = content["before_root"]
+    after_root = content["after_root"]
+    digest = content["digest"]
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _CHECKPOINT_BUNDLE_DIFF_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys "
+            "before_root, after_root, before_ids, after_ids, digest"
+        )
+    expected_before_root = _check_hex64(
+        expected["before_root"], "expected.before_root"
+    )
+    expected_after_root = _check_hex64(
+        expected["after_root"], "expected.after_root"
+    )
+    expected_digest = _check_hex64(expected["digest"], "expected.digest")
+    expected_before_ids = _validate_matrix_bundle_report_ids(
+        expected["before_ids"], "expected.before_ids"
+    )
+    expected_after_ids = _validate_matrix_bundle_report_ids(
+        expected["after_ids"], "expected.after_ids"
+    )
+
+    # Both inputs have now passed every key-set, type, digest-format,
+    # ordering, and embedded-proof semantic check. Only now recompute and
+    # compare; any mismatch yields False rather than raising.
+    if not _checkpoint_bundle_is_truthful(before_root, before_members):
+        return False
+    if not _checkpoint_bundle_is_truthful(after_root, after_members):
+        return False
+    for change in changes:
+        for proof in (change["before"], change["after"]):
+            if proof is None:
+                continue
+            # The non-null change side is a standalone proof: its window,
+            # anchor, embedded bundles and diffs, and stage chain through
+            # its commitment must all recompute as true.
+            if not _checkpoint_is_truthful(proof):
+                return False
+    payload = {
+        key: content[key] for key in _CHECKPOINT_BUNDLE_DIFF_REPORT_KEYS[:5]
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    recomputed_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if digest != recomputed_digest:
+        return False
+    if (
+        before_root != expected_before_root
+        or after_root != expected_after_root
+        or digest != expected_digest
+    ):
+        return False
+    if {member["id"] for member in before_members} != set(expected_before_ids):
+        return False
+    if {member["id"] for member in after_members} != set(expected_after_ids):
+        return False
+    return True
