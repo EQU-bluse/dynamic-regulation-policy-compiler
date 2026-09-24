@@ -919,6 +919,51 @@ def explain(
     }
 
 
+def _sorted_fact_map(facts: dict[str, bool]) -> dict[str, bool]:
+    """Return a deep-copied fact map with keys in Unicode code point order."""
+    return {key: facts[key] for key in sorted(facts)}
+
+
+def decision_attestation(
+    at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Attest a single-point decision with the facts, explanation, and policy.
+
+    ``at``, ``facts``, and ``rules`` are validated exactly as in
+    :func:`explain`; any invalid time, fact type, rule structure, interval,
+    or duplicate rule version raises ``ValueError`` without mutating the
+    inputs. Only the passed values are used; no history or file is accessed.
+
+    Returns a deep copy with top-level keys ``at``, ``facts``,
+    ``explanation``, ``policy``, ``digest``. ``facts`` is a deep copy of the
+    input facts with keys sorted in Unicode code point order (an empty dict
+    is valid); ``explanation`` is the full deep-copied :func:`explain`
+    result at ``at`` keeping its canonical key order at every level;
+    ``policy`` is the full deep-copied :func:`compile_rules` result at
+    ``at``, conflicts included.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) over a payload containing exactly ``at``,
+    ``facts``, ``explanation``, ``policy`` in that key order. ``digest`` is
+    the lowercase 64-char hex SHA-256 of ``C``. Equal-valued inputs yield
+    byte-identical attestations regardless of input dict key order; empty
+    facts, empty rules, and no-match decisions all attest normally.
+    """
+    explanation = explain(at, facts, rules)
+    policy = compile_rules(at, rules)
+    payload = {
+        "at": at,
+        "facts": _sorted_fact_map(facts),
+        "explanation": explanation,
+        "policy": policy,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    attestation = copy.deepcopy(payload)
+    attestation["digest"] = digest
+    return attestation
+
+
 _COMPARE_FIELDS = ("decision", "trace", "basis", "conflicts")
 
 
