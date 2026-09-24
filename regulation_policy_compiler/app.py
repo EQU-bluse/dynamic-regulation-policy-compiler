@@ -16,6 +16,7 @@ from .policy import (
     _check_time,
     _validate_rules,
     checkpoint_chain,
+    checkpoint_chain_checkpoint,
     compare_decisions,
     compile_rules,
     decision_attestation,
@@ -35,6 +36,7 @@ from .policy import (
     policy_schedule,
     policy_schedule_attestation,
     verify_checkpoint_chain,
+    verify_checkpoint_chain_checkpoint,
     verify_decision_attestation,
     verify_decision_impact_attestation,
     verify_decision_matrix_attestation,
@@ -70,6 +72,8 @@ _EVOLUTION_CHECKPOINT_VERIFY_KEYS = {"proof", "expected"}
 _CHECKPOINT_BUNDLE_ITEMS_KEYS = {"items"}
 _CHECKPOINT_BUNDLE_DIFF_KEYS = {"before", "after"}
 _CHECKPOINT_CHAIN_KEYS = {"stages"}
+_CHECKPOINT_CHAIN_CHECKPOINT_KEYS = {"report", "start", "end"}
+_CHECKPOINT_CHAIN_CHECKPOINT_VERIFY_KEYS = {"proof", "expected"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
 
 
@@ -582,6 +586,50 @@ async def verify_checkpoint_chain_endpoint(request: Request) -> Response:
         return _invalid_request()
     try:
         valid = verify_checkpoint_chain(body["report"], body["expected"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain"
+    "/checkpoint"
+)
+async def checkpoint_chain_checkpoint_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _CHECKPOINT_CHAIN_CHECKPOINT_KEYS:
+        return _invalid_request()
+    try:
+        proof = checkpoint_chain_checkpoint(
+            body["report"], body["start"], body["end"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(proof)
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain"
+    "/checkpoint/verify"
+)
+async def verify_checkpoint_chain_checkpoint_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != (
+        _CHECKPOINT_CHAIN_CHECKPOINT_VERIFY_KEYS
+    ):
+        return _invalid_request()
+    try:
+        valid = verify_checkpoint_chain_checkpoint(
+            body["proof"], body["expected"]
+        )
     except ValueError:
         return _invalid_request()
     return _record_response({"valid": valid})
