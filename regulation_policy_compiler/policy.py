@@ -3662,3 +3662,346 @@ def verify_matrix_bundle_evolution(report: Any, expected: Any) -> bool:
     if report_root != previous or report_root != expected_root:
         return False
     return True
+
+
+_EVOLUTION_CHECKPOINT_REPORT_KEYS = (
+    "start",
+    "end",
+    "anchor",
+    "stages",
+    "commitment",
+)
+_EVOLUTION_CHECKPOINT_EXPECTED_KEYS = frozenset(
+    {"start", "end", "anchor", "commitment"}
+)
+
+
+def evolution_checkpoint(report: Any, start: str, end: str) -> dict[str, Any]:
+    """Cut a stage-window proof out of a full bundle evolution report.
+
+    Pure function: it only processes its arguments, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    ``start`` and ``end`` must be valid UTC seconds with ``start <= end`` and
+    both must be the ``at`` of stages that actually exist in ``report`` (an
+    illegal time, a missing boundary, or a reversed window raises
+    ``ValueError``). ``report`` must be a complete, fully verifiable
+    :func:`matrix_bundle_evolution` report: any structural, time, ordering,
+    bundle, adjacent-diff, chain-link, stage-digest, or root forgery raises
+    ``ValueError`` before anything is produced.
+
+    The proof covers the continuous run of stages from ``start`` through
+    ``end`` inclusive, with no stage skipped, reordered, or rewritten.
+    Returns a deep copy containing exactly the keys ``start``, ``end``,
+    ``anchor``, ``stages``, ``commitment`` in that order. When the window
+    begins at the report's first stage, ``anchor`` is 64 ASCII ``0``
+    characters; otherwise it is the immediately preceding stage's ``digest``.
+    ``stages`` are independent deep copies of the full window stages, each
+    still following the published bundle, diff, and stage-chain contracts;
+    the first stage of a non-head window keeps its original ``diff`` and the
+    bundle on its front side, so even a single-stage window can be
+    recomputed without the report outside the window. ``commitment`` is the
+    last window stage's ``digest`` and also equals the original report
+    ``root`` when the window reaches the report's end. Equal-valued inputs
+    yield byte-identical results.
+    """
+    start = _check_time(start, "start")
+    end = _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    report_root, stages = _normalize_verified_matrix_bundle_evolution(
+        report, "report"
+    )
+    self_expected = {
+        "root": report_root,
+        "stages": [
+            {"at": stage["at"], "root": stage["bundle_root"]} for stage in stages
+        ],
+    }
+    if not verify_matrix_bundle_evolution(report, self_expected):
+        raise ValueError(
+            "report must be a fully verifiable matrix bundle evolution report"
+        )
+    ats = [stage["at"] for stage in stages]
+    if start not in ats:
+        raise ValueError("start must be the at of a stage that exists in report")
+    if end not in ats:
+        raise ValueError("end must be the at of a stage that exists in report")
+    first_index = ats.index(start)
+    last_index = ats.index(end)
+    anchor = (
+        _MATRIX_BUNDLE_EVOLUTION_GENESIS
+        if first_index == 0
+        else stages[first_index - 1]["digest"]
+    )
+    window = stages[first_index : last_index + 1]
+    proof_stages = [
+        {
+            "at": stage["at"],
+            "bundle": copy.deepcopy(stage["bundle"]),
+            "diff": copy.deepcopy(stage["diff"]),
+            "previous": stage["previous"],
+            "digest": stage["digest"],
+        }
+        for stage in window
+    ]
+    return {
+        "start": start,
+        "end": end,
+        "anchor": anchor,
+        "stages": proof_stages,
+        "commitment": window[-1]["digest"],
+    }
+
+
+def _normalize_verified_evolution_checkpoint(
+    proof: Any, field: str = "proof"
+) -> dict[str, Any]:
+    """Run every structural and semantic check on a checkpoint proof.
+
+    Enforces the :func:`evolution_checkpoint` proof contract: exact key sets,
+    valid ``start``/``end`` timestamps with ``start <= end``, hex64
+    ``anchor``/``commitment``, a non-empty strictly increasing stage chain,
+    fully valid per-stage bundles, and adjacent diff credentials that
+    reproduce their neighboring bundles. The first stage follows the genesis
+    rule (``previous`` of 64 zeroes and ``null`` diff) or carries the full
+    front-side diff whose ``after`` bundle reproduces the first stage.
+    Window disorder or an adjacent diff that does not correspond raises
+    ``ValueError``. False declared summaries are carried back as data
+    (``bundle_truthful`` and the validated carried-diff members) so they
+    yield ``False`` only after every input validates. Boundary agreement of
+    ``start``/``end`` with the first/last stage ``at`` is reported via
+    ``boundaries_ok`` rather than raised. The input is never mutated.
+    """
+    if not isinstance(proof, dict) or set(proof) != set(
+        _EVOLUTION_CHECKPOINT_REPORT_KEYS
+    ):
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys "
+            "start, end, anchor, stages, commitment"
+        )
+    start = _check_time(proof["start"], f"{field}.start")
+    end = _check_time(proof["end"], f"{field}.end")
+    if start > end:
+        raise ValueError(f"{field}.start must not be after {field}.end")
+    anchor = _check_hex64(proof["anchor"], f"{field}.anchor")
+    commitment = _check_hex64(proof["commitment"], f"{field}.commitment")
+    raw_stages = proof["stages"]
+    if not isinstance(raw_stages, list) or not raw_stages:
+        raise ValueError(f"{field}.stages must be a non-empty list")
+
+    normalized_stages: list[dict[str, Any]] = []
+    previous_at: str | None = None
+    for index, stage in enumerate(raw_stages):
+        stage_field = f"{field}.stages[{index}]"
+        if not isinstance(stage, dict) or set(stage) != set(
+            _MATRIX_BUNDLE_EVOLUTION_STAGE_KEYS
+        ):
+            raise ValueError(
+                f"{stage_field} must be a dict with exactly the keys "
+                "at, bundle, diff, previous, digest"
+            )
+        at = _check_time(stage["at"], f"{stage_field}.at")
+        if previous_at is not None and at <= previous_at:
+            raise ValueError(
+                f"{stage_field}.at must be strictly greater than the "
+                "preceding stage at"
+            )
+        previous_digest = _check_hex64(
+            stage["previous"], f"{stage_field}.previous"
+        )
+        digest = _check_hex64(stage["digest"], f"{stage_field}.digest")
+        bundle_root, bundle_members = _normalize_verified_matrix_bundle(
+            stage["bundle"], f"{stage_field}.bundle"
+        )
+        bundle = _canonical_bundle_from_members(bundle_root, bundle_members)
+        bundle_truthful = _matrix_bundle_is_truthful(bundle_root, bundle_members)
+
+        carried_diff: tuple[dict[str, Any], list[Any], list[Any]] | None = None
+        if index == 0 and previous_digest == _MATRIX_BUNDLE_EVOLUTION_GENESIS:
+            if stage["diff"] is not None:
+                raise ValueError(
+                    f"{stage_field}.diff must be null at the genesis stage"
+                )
+            diff: dict[str, Any] | None = None
+        elif index == 0:
+            diff_content, before_members, after_members, _changes = (
+                _normalize_verified_matrix_diff_report(
+                    stage["diff"], f"{stage_field}.diff"
+                )
+            )
+            if diff_content["after_root"] != bundle_root:
+                raise ValueError(
+                    f"{stage_field}.diff.after_root must equal this stage "
+                    "bundle root"
+                )
+            if _bundle_member_semantics(
+                diff_content["after"]
+            ) != _bundle_member_semantics(bundle):
+                raise ValueError(
+                    f"{stage_field}.diff.after must reproduce this stage bundle"
+                )
+            diff = diff_content
+            carried_diff = (diff_content, before_members, after_members)
+        else:
+            preceding = normalized_stages[-1]
+            diff_content, _before_members, _after_members, _changes = (
+                _normalize_verified_matrix_diff_report(
+                    stage["diff"], f"{stage_field}.diff"
+                )
+            )
+            if diff_content["before_root"] != preceding["bundle_root"]:
+                raise ValueError(
+                    f"{stage_field}.diff.before_root must equal the preceding "
+                    "stage bundle root"
+                )
+            if diff_content["after_root"] != bundle_root:
+                raise ValueError(
+                    f"{stage_field}.diff.after_root must equal this stage "
+                    "bundle root"
+                )
+            if _bundle_member_semantics(
+                diff_content["before"]
+            ) != _bundle_member_semantics(preceding["bundle"]):
+                raise ValueError(
+                    f"{stage_field}.diff.before must reproduce the preceding "
+                    "stage bundle"
+                )
+            if _bundle_member_semantics(
+                diff_content["after"]
+            ) != _bundle_member_semantics(bundle):
+                raise ValueError(
+                    f"{stage_field}.diff.after must reproduce this stage bundle"
+                )
+            diff = diff_content
+
+        normalized_stages.append(
+            {
+                "at": at,
+                "bundle": bundle,
+                "bundle_root": bundle_root,
+                "bundle_truthful": bundle_truthful,
+                "diff": diff,
+                "carried_diff": carried_diff,
+                "previous": previous_digest,
+                "digest": digest,
+            }
+        )
+        previous_at = at
+
+    boundaries_ok = (
+        start == normalized_stages[0]["at"]
+        and end == normalized_stages[-1]["at"]
+    )
+    return {
+        "start": start,
+        "end": end,
+        "anchor": anchor,
+        "commitment": commitment,
+        "stages": normalized_stages,
+        "boundaries_ok": boundaries_ok,
+    }
+
+
+def verify_evolution_checkpoint(proof: Any, expected: Any) -> bool:
+    """Verify a :func:`evolution_checkpoint` proof without the outside report.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level.
+
+    ``proof`` must be a dict with exactly the keys ``start``, ``end``,
+    ``anchor``, ``stages``, ``commitment``; ``start``/``end`` must be valid
+    UTC seconds with ``start <= end`` and ``anchor``/``commitment`` 64
+    lowercase hexadecimal characters. ``stages`` must be a non-empty list of
+    full evolution stages whose ``at`` values are strictly increasing, whose
+    bundles pass every bundle structural and embedded-credential semantic
+    check, and whose diffs correspond to their neighbors: the genesis stage
+    carries 64 zeroes as ``previous`` and a ``null`` diff; any other first
+    stage keeps its front-side diff whose ``after`` bundle reproduces that
+    stage, and every later diff must reproduce the preceding and current
+    bundles. ``expected`` must have exactly the keys ``start``, ``end``,
+    ``anchor``, ``commitment`` and is validated the same way. Exact key
+    sets, times, digest formats, stage order, and every embedded credential
+    semantic are checked on both inputs first; window disorder or an
+    adjacent diff that does not correspond raises ``ValueError``.
+
+    Only afterwards are values recomputed rather than trusted: every bundle
+    chain (including the front-side bundle carried by a non-head first-stage
+    diff), the first stage digest seeded from ``anchor`` (the carried diff
+    recomputed from its before/after bundles), each later adjacent
+    :func:`matrix_bundle_diff` credential, every ``previous``/``digest``
+    stage link, and the terminal ``commitment``. Returns ``False`` for a
+    broken link, a wrong anchor, a boundary mismatch, or any ``expected``
+    disagreement after the structures are legal; otherwise ``True``.
+    """
+    normalized = _normalize_verified_evolution_checkpoint(proof, "proof")
+    if not isinstance(expected, dict) or set(expected) != (
+        _EVOLUTION_CHECKPOINT_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys "
+            "start, end, anchor, commitment"
+        )
+    expected_start = _check_time(expected["start"], "expected.start")
+    expected_end = _check_time(expected["end"], "expected.end")
+    if expected_start > expected_end:
+        raise ValueError("expected.start must not be after expected.end")
+    expected_anchor = _check_hex64(expected["anchor"], "expected.anchor")
+    expected_commitment = _check_hex64(
+        expected["commitment"], "expected.commitment"
+    )
+
+    stages = normalized["stages"]
+    # Both inputs have now passed every structural and embedded-credential
+    # semantic check. Only now recompute and compare; any mismatch yields
+    # False rather than raising.
+    for stage in stages:
+        if not stage["bundle_truthful"]:
+            return False
+        if stage["carried_diff"] is not None:
+            diff_content, before_members, after_members = stage["carried_diff"]
+            if not _matrix_bundle_is_truthful(
+                diff_content["before_root"], before_members
+            ):
+                return False
+            if not _matrix_bundle_is_truthful(
+                diff_content["after_root"], after_members
+            ):
+                return False
+
+    running = normalized["anchor"]
+    for index, stage in enumerate(stages):
+        if stage["previous"] != running:
+            return False
+        if index == 0:
+            if stage["diff"] is not None:
+                recomputed_diff = matrix_bundle_diff(
+                    stage["diff"]["before"], stage["diff"]["after"]
+                )
+                if stage["diff"] != recomputed_diff:
+                    return False
+        else:
+            recomputed_diff = matrix_bundle_diff(
+                stages[index - 1]["bundle"], stage["bundle"]
+            )
+            if stage["diff"] != recomputed_diff:
+                return False
+        recomputed_digest = _matrix_bundle_evolution_stage_digest(
+            running, stage["at"], stage["bundle"], stage["diff"]
+        )
+        if stage["digest"] != recomputed_digest:
+            return False
+        running = recomputed_digest
+
+    if normalized["commitment"] != running:
+        return False
+    if not normalized["boundaries_ok"]:
+        return False
+    if (
+        normalized["start"] != expected_start
+        or normalized["end"] != expected_end
+        or normalized["anchor"] != expected_anchor
+        or normalized["commitment"] != expected_commitment
+    ):
+        return False
+    return True

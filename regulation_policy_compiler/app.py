@@ -24,6 +24,7 @@ from .policy import (
     decision_matrix_attestation_bundle,
     decision_timeline,
     decision_timeline_attestation,
+    evolution_checkpoint,
     explain,
     matrix_bundle_diff,
     matrix_bundle_evolution,
@@ -35,6 +36,7 @@ from .policy import (
     verify_decision_matrix_attestation,
     verify_decision_matrix_attestation_bundle,
     verify_decision_timeline_attestation,
+    verify_evolution_checkpoint,
     verify_matrix_bundle_diff,
     verify_matrix_bundle_evolution,
 )
@@ -56,7 +58,9 @@ _MATRIX_KEYS = {"start", "end", "cases", "rules"}
 _MATRIX_BUNDLE_ITEMS_KEYS = {"items"}
 _MATRIX_BUNDLE_DIFF_KEYS = {"before", "after"}
 _MATRIX_BUNDLE_EVOLUTION_KEYS = {"stages"}
+_EVOLUTION_CHECKPOINT_KEYS = {"report", "start", "end"}
 _VERIFY_KEYS = {"report", "expected"}
+_EVOLUTION_CHECKPOINT_VERIFY_KEYS = {"proof", "expected"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
 
 
@@ -437,6 +441,38 @@ async def verify_matrix_bundle_evolution_endpoint(request: Request) -> Response:
         return _invalid_request()
     try:
         valid = verify_matrix_bundle_evolution(body["report"], body["expected"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post("/decision-matrix/attest/bundle/evolution/checkpoint")
+async def evolution_checkpoint_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _EVOLUTION_CHECKPOINT_KEYS:
+        return _invalid_request()
+    try:
+        proof = evolution_checkpoint(body["report"], body["start"], body["end"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(proof)
+
+
+@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/verify")
+async def verify_evolution_checkpoint_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != (
+        _EVOLUTION_CHECKPOINT_VERIFY_KEYS
+    ):
+        return _invalid_request()
+    try:
+        valid = verify_evolution_checkpoint(body["proof"], body["expected"])
     except ValueError:
         return _invalid_request()
     return _record_response({"valid": valid})
