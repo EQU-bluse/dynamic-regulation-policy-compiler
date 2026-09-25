@@ -7183,3 +7183,271 @@ def verify_bundle_evolution_checkpoint(proof: Any, expected: Any) -> bool:
     ):
         return False
     return True
+
+
+
+_BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_ITEM_KEYS = _CHECKPOINT_BUNDLE_ITEM_KEYS
+_BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_REPORT_KEYS = _CHECKPOINT_BUNDLE_REPORT_KEYS
+_BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_MEMBER_KEYS = _CHECKPOINT_BUNDLE_MEMBER_KEYS
+_BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EXPECTED_KEYS = _CHECKPOINT_BUNDLE_EXPECTED_KEYS
+_BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_GENESIS = _CHECKPOINT_BUNDLE_GENESIS
+
+
+def _canonical_bundle_evolution_checkpoint_from_normalized(
+    normalized: dict[str, Any],
+) -> dict[str, Any]:
+    """Rebuild a fresh ``start, end, anchor, stages, commitment`` proof.
+
+    Every level is an independent deep copy of the normalized data produced
+    by :func:`_normalize_verified_bundle_evolution_checkpoint`, so the
+    result follows the published bundle evolution window proof key order
+    and shares no container with the caller's input.
+    """
+    return {
+        "start": normalized["start"],
+        "end": normalized["end"],
+        "anchor": normalized["anchor"],
+        "stages": [
+            {
+                "at": stage["at"],
+                "bundle": copy.deepcopy(stage["bundle"]),
+                "diff": copy.deepcopy(stage["diff"]),
+                "previous": stage["previous"],
+                "digest": stage["digest"],
+            }
+            for stage in normalized["stages"]
+        ],
+        "commitment": normalized["commitment"],
+    }
+
+
+def _bundle_evolution_checkpoint_is_truthful(proof: dict[str, Any]) -> bool:
+    """Recompute a canonical bundle evolution window proof from itself.
+
+    The expected values are taken from the proof itself, so the result
+    reflects only the proof's internal integrity: window boundaries, the
+    anchor, every embedded chain window proof bundle and adjacent diff, and
+    the full stage chain through the terminal commitment.
+    """
+    return verify_bundle_evolution_checkpoint(
+        proof,
+        {
+            "start": proof["start"],
+            "end": proof["end"],
+            "anchor": proof["anchor"],
+            "commitment": proof["commitment"],
+        },
+    )
+
+
+def bundle_evolution_checkpoint_bundle(items: Any) -> dict[str, Any]:
+    """Bind multiple bundle evolution window proofs into one verifiable bundle.
+
+    Pure function: it only processes its argument, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    ``items`` must be a non-empty list whose members are dicts with exactly
+    the keys ``id`` and ``proof``; ``id`` must be a non-empty string unique
+    across the list (wrong types, wrong key sets, or duplicates raise
+    ``ValueError``), and every ``proof`` must fully conform to the published
+    :func:`bundle_evolution_checkpoint` window contract. Each proof is
+    checked with the existing verification semantics before anything is
+    produced: any structural or semantic violation — window boundaries, the
+    anchor, stage order, embedded bundles, adjacent diffs, member links, or
+    the terminal commitment — and any proof that does not recompute as true
+    raises ``ValueError``.
+
+    Members are ordered by ``id`` in ascending Unicode code point order, so
+    the caller's order never affects the result. Returns a deep copy with
+    keys ``root``, ``proofs`` in that order; each member has keys ``id``,
+    ``proof``, ``previous``, ``digest`` and every ``proof`` is a normalized
+    deep copy. The first member's ``previous`` is 64 ASCII ``0`` characters;
+    every later member's ``previous`` is the preceding member's ``digest``.
+    The per-member digest payload contains exactly ``id``, ``proof`` in that
+    key order, encoded as compact UTF-8 JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) with no newline, and ``digest`` is the
+    lowercase hexadecimal SHA-256 of ``previous``'s ASCII bytes immediately
+    followed by that payload. ``root`` is the last member's ``digest``.
+    Equal-valued inputs yield byte-identical results.
+    """
+    if not isinstance(items, list) or not items:
+        raise ValueError("items must be a non-empty list of {id, proof} dicts")
+    normalized: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        field = f"items[{index}]"
+        if not isinstance(item, dict) or set(item) != set(
+            _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_ITEM_KEYS
+        ):
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys id, proof"
+            )
+        item_id = _check_non_empty_str(item["id"], f"{field}.id")
+        if item_id in seen:
+            raise ValueError(f"items contains a duplicate id: {item_id!r}")
+        seen.add(item_id)
+        # Every proof must fully verify (structure, window boundaries,
+        # anchor, stage order, embedded chain window proof bundles, adjacent
+        # diffs, member links, and the terminal commitment) before anything
+        # is produced.
+        proof = _canonical_bundle_evolution_checkpoint_from_normalized(
+            _normalize_verified_bundle_evolution_checkpoint(
+                item["proof"], f"{field}.proof"
+            )
+        )
+        if not _bundle_evolution_checkpoint_is_truthful(proof):
+            raise ValueError(f"{field}.proof does not recompute as true")
+        normalized.append((item_id, proof))
+    normalized.sort(key=lambda member: member[0])
+    proofs: list[dict[str, Any]] = []
+    previous = _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_GENESIS
+    digest = previous
+    for item_id, proof in normalized:
+        digest = _checkpoint_bundle_member_digest(previous, item_id, proof)
+        proofs.append(
+            {
+                "id": item_id,
+                "proof": copy.deepcopy(proof),
+                "previous": previous,
+                "digest": digest,
+            }
+        )
+        previous = digest
+    return {"root": digest, "proofs": proofs}
+
+
+def _normalize_verified_bundle_evolution_checkpoint_bundle(
+    report: Any, field: str = "report"
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run every structural and per-proof check on a window proof bundle.
+
+    Enforces the full :func:`bundle_evolution_checkpoint_bundle` report
+    contract: exact top-level and per-member key sets, hex64
+    ``root``/``previous``/``digest`` fields, unique strictly ascending member
+    ids, and every member proof's full bundle-evolution-window structural
+    and embedded-credential semantic checks. A proof that merely recomputes
+    as false is structural data, so it is carried back inside the returned
+    canonical member entries and yields ``False`` only after every input
+    validates. Returns ``(root, members)`` where each member carries a fresh
+    normalized deep copy of its proof. Any structural or semantic violation
+    raises ``ValueError`` and the input is never mutated.
+    """
+    if not isinstance(report, dict) or set(report) != set(
+        _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_REPORT_KEYS
+    ):
+        raise ValueError(f"{field} must be a dict with exactly the keys root, proofs")
+    bundle_root = _check_hex64(report["root"], f"{field}.root")
+    raw_proofs = report["proofs"]
+    if not isinstance(raw_proofs, list) or not raw_proofs:
+        raise ValueError(f"{field}.proofs must be a non-empty list")
+    members: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    previous_id: str | None = None
+    for index, member in enumerate(raw_proofs):
+        member_field = f"{field}.proofs[{index}]"
+        if not isinstance(member, dict) or set(member) != set(
+            _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_MEMBER_KEYS
+        ):
+            raise ValueError(
+                f"{member_field} must be a dict with exactly the keys "
+                "id, proof, previous, digest"
+            )
+        item_id = _check_non_empty_str(member["id"], f"{member_field}.id")
+        if item_id in seen_ids:
+            raise ValueError(
+                f"{field}.proofs contains a duplicate id: {item_id!r}"
+            )
+        if previous_id is not None and item_id <= previous_id:
+            raise ValueError(
+                f"{field}.proofs must be ordered by id in ascending "
+                "Unicode code point order"
+            )
+        proof = _canonical_bundle_evolution_checkpoint_from_normalized(
+            _normalize_verified_bundle_evolution_checkpoint(
+                member["proof"], f"{member_field}.proof"
+            )
+        )
+        previous = _check_hex64(member["previous"], f"{member_field}.previous")
+        digest = _check_hex64(member["digest"], f"{member_field}.digest")
+        members.append(
+            {
+                "id": item_id,
+                "proof": proof,
+                "previous": previous,
+                "digest": digest,
+            }
+        )
+        seen_ids.add(item_id)
+        previous_id = item_id
+    return bundle_root, members
+
+
+def verify_bundle_evolution_checkpoint_bundle(report: Any, expected: Any) -> bool:
+    """Verify a :func:`bundle_evolution_checkpoint_bundle` by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level. It works
+    without the report outside the window: every embedded window proof is
+    self-verifying.
+
+    ``report`` must be a dict with exactly the keys ``root``, ``proofs`` and
+    ``expected`` a dict with exactly the keys ``root``, ``proof_ids``.
+    ``root`` must be 64 lowercase hexadecimal characters and ``proof_ids``
+    a non-empty list of unique non-empty strings (caller order is arbitrary;
+    comparison is by code point). ``proofs`` must be a non-empty list whose
+    members are dicts with exactly the keys ``id``, ``proof``, ``previous``,
+    ``digest``, ordered by ``id`` in ascending Unicode code point order with
+    bundle-wide unique non-empty ids; each ``previous`` and ``digest`` must
+    be 64 lowercase hexadecimal characters, and every ``proof`` must fully
+    pass the existing :func:`verify_bundle_evolution_checkpoint` structural
+    and semantic checks. Both inputs complete every key-set, type,
+    digest-format, member-order, and per-proof structural/semantic check
+    before any comparison; any violation raises ``ValueError``.
+
+    Once the structures are legal, nothing declared is trusted: every proof
+    is recomputed from its own window — boundaries, anchor, embedded
+    bundles, adjacent diffs, and the stage chain through its commitment —
+    and the member chain is recomputed from the 64-zero genesis (each member
+    digest over the ``previous`` bytes plus the compact JSON of ``id``,
+    ``proof``). Returns ``False`` when any proof does not recompute as true,
+    a ``previous``/``digest`` link does not chain, the final ``root`` does
+    not equal the last member digest, or the ``root`` or ``proof_ids`` set
+    differ from ``expected``; otherwise ``True``.
+    """
+    bundle_root, members = (
+        _normalize_verified_bundle_evolution_checkpoint_bundle(report, "report")
+    )
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys root, proof_ids"
+        )
+    expected_root = _check_hex64(expected["root"], "expected.root")
+    expected_ids = _validate_matrix_bundle_report_ids(
+        expected["proof_ids"], "expected.proof_ids"
+    )
+
+    # Both inputs have now passed every key-set, type, digest-format,
+    # member-order, and per-proof structural/semantic check. Only now
+    # recompute and compare; any mismatch yields False rather than raising.
+    previous = _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_GENESIS
+    for member in members:
+        if not _bundle_evolution_checkpoint_is_truthful(member["proof"]):
+            return False
+        if member["previous"] != previous:
+            return False
+        recomputed = _checkpoint_bundle_member_digest(
+            previous, member["id"], member["proof"]
+        )
+        if member["digest"] != recomputed:
+            return False
+        previous = recomputed
+    if bundle_root != previous:
+        return False
+    if bundle_root != expected_root:
+        return False
+    if {member["id"] for member in members} != set(expected_ids):
+        return False
+    return True
