@@ -16,6 +16,7 @@ from .policy import (
     _check_time,
     _validate_rules,
     bundle_evolution_checkpoint,
+    bundle_evolution_checkpoint_bundle,
     checkpoint_chain,
     checkpoint_chain_checkpoint,
     checkpoint_chain_checkpoint_bundle,
@@ -40,6 +41,7 @@ from .policy import (
     policy_schedule,
     policy_schedule_attestation,
     verify_bundle_evolution_checkpoint,
+    verify_bundle_evolution_checkpoint_bundle,
     verify_checkpoint_chain,
     verify_checkpoint_chain_checkpoint,
     verify_checkpoint_chain_checkpoint_bundle,
@@ -812,6 +814,48 @@ async def verify_bundle_evolution_checkpoint_endpoint(
     try:
         valid = verify_bundle_evolution_checkpoint(
             body["proof"], body["expected"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
+    "chain/checkpoint/bundle/evolution/checkpoint/bundle"
+)
+async def bundle_evolution_checkpoint_bundle_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_ITEMS_KEYS:
+        return _invalid_request()
+    try:
+        bundle = bundle_evolution_checkpoint_bundle(body["items"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(bundle)
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
+    "chain/checkpoint/bundle/evolution/checkpoint/bundle/verify"
+)
+async def verify_bundle_evolution_checkpoint_bundle_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
+        return _invalid_request()
+    try:
+        valid = verify_bundle_evolution_checkpoint_bundle(
+            body["report"], body["expected"]
         )
     except ValueError:
         return _invalid_request()
