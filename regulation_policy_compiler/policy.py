@@ -7612,75 +7612,21 @@ def bundle_evolution_checkpoint_bundle_diff(
     results regardless of input dict or member order, and no two levels
     share a mutable container.
     """
-    before_root, before_members = (
-        _normalize_verified_bundle_evolution_checkpoint_bundle(before, "before")
-    )
-    after_root, after_members = (
-        _normalize_verified_bundle_evolution_checkpoint_bundle(after, "after")
-    )
-    if not _bundle_evolution_checkpoint_bundle_is_truthful(
-        before_root, before_members
-    ):
+    engine = _VEngine()
+    # Both sides complete every structural and embedded-proof check first;
+    # a false digest is carried as data, so parsing the second side still
+    # runs in full when the first side merely carries a false summary.
+    before_node = engine.top_bundle(before, "before")
+    after_node = engine.top_bundle(after, "after")
+    if not before_node.truth:
         raise ValueError("before bundle root or hash chain does not verify")
-    if not _bundle_evolution_checkpoint_bundle_is_truthful(
-        after_root, after_members
-    ):
+    if not after_node.truth:
         raise ValueError("after bundle root or hash chain does not verify")
-
-    before_bundle = _canonical_checkpoint_bundle_from_members(
-        before_root, before_members
-    )
-    after_bundle = _canonical_checkpoint_bundle_from_members(
-        after_root, after_members
-    )
-    before_by_id = {member["id"]: member for member in before_members}
-    after_by_id = {member["id"]: member for member in after_members}
-
-    changes: list[dict[str, Any]] = []
-    for member_id in sorted(set(before_by_id) | set(after_by_id)):
-        before_member = before_by_id.get(member_id)
-        after_member = after_by_id.get(member_id)
-        if (
-            before_member is not None
-            and after_member is not None
-            and before_member["proof"] == after_member["proof"]
-        ):
-            continue
-        if before_member is None:
-            kind = "added"
-        elif after_member is None:
-            kind = "removed"
-        else:
-            kind = "changed"
-        changes.append(
-            {
-                "id": member_id,
-                "kind": kind,
-                "before": (
-                    copy.deepcopy(before_member["proof"])
-                    if before_member is not None
-                    else None
-                ),
-                "after": (
-                    copy.deepcopy(after_member["proof"])
-                    if after_member is not None
-                    else None
-                ),
-            }
-        )
-
-    payload = {
-        "before_root": before_root,
-        "after_root": after_root,
-        "before": before_bundle,
-        "after": after_bundle,
-        "changes": changes,
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
-    result["digest"] = digest
-    return result
+    diff_node = engine.top_generate(before_node, after_node)
+    # Rebuild the result from the cached canonical compact bytes: one parse
+    # yields a fully independent tree (the two bundles and every change side
+    # are distinct containers, no level shared) without re-walking objects.
+    return json.loads(diff_node.json)
 
 
 def _normalize_bundle_evolution_diff_change_proof(
@@ -7977,14 +7923,12 @@ def verify_bundle_evolution_checkpoint_bundle_diff(
     ``expected`` value (the two roots, the digest, or either id set after
     code point sorting) does not match; otherwise ``True``.
     """
-    content, before_members, after_members, changes, changes_complete = (
-        _normalize_verified_bundle_evolution_checkpoint_bundle_diff_report(
-            report, "report", {}
-        )
-    )
-    before_root = content["before_root"]
-    after_root = content["after_root"]
-    digest = content["digest"]
+    engine = _VEngine()
+    # Structural and semantic validation of the whole report first; any
+    # structural, ordering, change-classification, or embedded-proof semantic
+    # violation raises ValueError, and a false declared summary is carried as
+    # data so it yields False only below.
+    content = engine.top_parse_diff(report, "report")
 
     if not isinstance(expected, dict) or set(expected) != set(
         _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_DIFF_EXPECTED_KEYS
@@ -8009,67 +7953,742 @@ def verify_bundle_evolution_checkpoint_bundle_diff(
     # ordering, and embedded-proof semantic check. Only now recompute and
     # compare; any mismatch yields False rather than raising.
     #
-    # Each deep window proof is fully recomputed once: the bundle checks
-    # resolve every bundle member proof, and every non-null change-side
-    # proof is the same canonical object (normalized from an equal declared
-    # value) as the corresponding bundle member proof, so its truth result
-    # is resolved on first encounter and reused from the cache afterwards.
-    truthful: dict[int, bool] = {}
-
-    def proof_is_truthful(proof: dict[str, Any]) -> bool:
-        key = id(proof)
-        if key not in truthful:
-            truthful[key] = _bundle_evolution_checkpoint_is_truthful(proof)
-        return truthful[key]
-
-    def bundle_is_truthful(
-        bundle_root_value: str, members: list[dict[str, Any]]
-    ) -> bool:
-        previous = _CHECKPOINT_BUNDLE_GENESIS
-        for member in members:
-            if not proof_is_truthful(member["proof"]):
-                return False
-            if member["previous"] != previous:
-                return False
-            recomputed = _checkpoint_bundle_member_digest(
-                previous, member["id"], member["proof"]
-            )
-            if member["digest"] != recomputed:
-                return False
-            previous = recomputed
-        return bundle_root_value == previous
-
-    if not bundle_is_truthful(before_root, before_members):
+    # Each deep window proof is fully recomputed once: the bundle members and
+    # every non-null change side resolve equal values to the same engine node
+    # (value key), so truth is computed on the first encounter and reused.
+    if not content.truth:
         return False
-    if not bundle_is_truthful(after_root, after_members):
+    if not content.complete:
         return False
-    if not changes_complete:
-        return False
-    for change in changes:
-        for proof in (change["before"], change["after"]):
-            if proof is None:
-                continue
-            # The non-null change side is a standalone window proof: its
-            # boundaries, anchor, embedded bundles and diffs, and stage
-            # chain through its commitment must all recompute as true.
-            if not proof_is_truthful(proof):
-                return False
-    payload = {
-        key: content[key]
-        for key in _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_DIFF_REPORT_KEYS[:5]
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    recomputed_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    if digest != recomputed_digest:
-        return False
+    before_node = content.before_node
+    after_node = content.after_node
     if (
-        before_root != expected_before_root
-        or after_root != expected_after_root
-        or digest != expected_digest
+        content.root != expected_before_root
+        or content.root_after != expected_after_root
+        or content.digest != expected_digest
     ):
         return False
-    if {member["id"] for member in before_members} != set(expected_before_ids):
+    if {member[0] for member in before_node.members} != set(expected_before_ids):
         return False
-    if {member["id"] for member in after_members} != set(expected_after_ids):
+    if {member[0] for member in after_node.members} != set(expected_after_ids):
         return False
     return True
+
+
+"""Value-identity proof engine (appended into policy.py).
+
+Within one top-level bundle-evolution bundle diff call the same deep
+credentials, bundles, proofs, and diffs physically occur thousands of times
+but only a handful of distinct values exist.  The engine canonicalizes and
+recomputes each *distinct* value once.
+
+Identity is a hash-consed *value* key:
+
+* leaf credentials are keyed by their order-insensitive compact JSON (they
+  are the bounded base case and those bytes are their digest payload anyway)
+  -- a whole multi-megabyte deep proof is never serialized for keying;
+* composite keys are tuples of scalar fields plus their children's value
+  keys, so building a key costs only the (small) member list, never the
+  subtree, and equality is exact Python tuple equality (never object identity
+  and never a content hash that could merge distinct values);
+* canonical compact JSON is composed bottom-up from cached child bytes, so
+  member, stage, and diff digests reuse those intermediate values;
+* expensive semantic leaf work, truth recomputation, and canonical assembly
+  happen only on a genuine key miss; a repeat occurrence only repeats the
+  cheap structural walk before its key resolves to the cached node;
+* canonical containers are shared read-only inside the engine and deep
+  copied per emitted output slot, keeping inputs, the two bundles, and the
+  change sides isolated.
+"""
+
+
+def _vjs(value: Any) -> str:
+    # JSON encoding for scalars (ids, kinds, hex64 strings, timestamps).
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _v_member_payload(singular: str, item_id: str, child_json: str) -> str:
+    return '{"id":' + _vjs(item_id) + ',"' + singular + '":' + child_json + "}"
+
+
+class _VNode:
+    __slots__ = (
+        "key", "canonical", "json", "sem", "semkey", "dsem", "dsemkey",
+        "truth", "complete",
+        "root", "root_after", "members", "before_node", "after_node",
+        "digest",
+    )
+
+    def __init__(self) -> None:
+        self.key: Any = None
+        self.canonical: Any = None
+        self.json: str = ""
+        self.sem: Any = None
+        self.semkey: Any = None
+        self.dsem: Any = None
+        self.dsemkey: Any = None
+        self.truth: bool = False
+        self.complete: bool = True
+        self.root: str = ""
+        self.root_after: str = ""
+        self.members: list[Any] = []
+        self.before_node: Any = None
+        self.after_node: Any = None
+        self.digest: str = ""
+
+
+class _VEngine:
+    def __init__(self) -> None:
+        self.cred: dict[str, _VNode] = {}
+        self.mbundle: dict[Any, _VNode] = {}
+        self.mdiff: dict[Any, _VNode] = {}
+        self.p0: dict[Any, _VNode] = {}
+        self.b0: dict[Any, _VNode] = {}
+        self.d0: dict[Any, _VNode] = {}
+        self.p1: dict[Any, _VNode] = {}
+        self.b1: dict[Any, _VNode] = {}
+        self.d1: dict[Any, _VNode] = {}
+        self.p2: dict[Any, _VNode] = {}
+        self.b2: dict[Any, _VNode] = {}
+        self.d2: dict[Any, _VNode] = {}
+
+    # ------------------------------------------------------------ leaf cred
+    def credential(self, value: Any, field: str) -> _VNode:
+        if not isinstance(value, dict):
+            raise ValueError(f"{field} must be a credential dict")
+        # The raw key is order-insensitive compact JSON. A non-JSON-native
+        # leaf simply cannot key yet: fall through to full validation, which
+        # reports the structural/type violation as ValueError (never a
+        # TypeError), so such a value is never cached.
+        try:
+            key = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+        except (TypeError, ValueError):
+            key = None
+        if key is not None:
+            node = self.cred.get(key)
+            if node is not None:
+                return node
+        content, declared, recomputed, chain_ok, chain_root = (
+            _check_verified_matrix_attestation(value, field)
+        )
+        canonical = copy.deepcopy(content)
+        canonical["digest"] = declared
+        cjson = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+        if key is None:
+            key = cjson
+        node = self.cred.get(key)
+        if node is not None:
+            return node
+        node = _VNode()
+        node.key = key
+        node.canonical = canonical
+        node.json = cjson
+        node.sem = _matrix_credential_semantics(content)
+        node.semkey = (
+            "cred",
+            json.dumps(node.sem, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")),
+        )
+        node.truth = bool(
+            chain_ok
+            and content["policy"]["root"] == chain_root
+            and declared == recomputed
+        )
+        self.cred[key] = node
+        return node
+
+    # ------------------------------------------------------- shared members
+    def _bundle_members(self, value, field, plural, singular, parse_child):
+        if not isinstance(value, dict) or set(value) != {"root", plural}:
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys root, {plural}"
+            )
+        root = _check_hex64(value["root"], f"{field}.root")
+        raw = value[plural]
+        if not isinstance(raw, list) or not raw:
+            raise ValueError(f"{field}.{plural} must be a non-empty list")
+        members: list[tuple[str, _VNode, str, str]] = []
+        seen: set[str] = set()
+        previous_id: str | None = None
+        for index, member in enumerate(raw):
+            mf = f"{field}.{plural}[{index}]"
+            if not isinstance(member, dict) or set(member) != {
+                "id", singular, "previous", "digest"
+            }:
+                raise ValueError(
+                    f"{mf} must be a dict with exactly the keys "
+                    f"id, {singular}, previous, digest"
+                )
+            item_id = _check_non_empty_str(member["id"], f"{mf}.id")
+            if item_id in seen:
+                raise ValueError(
+                    f"{field}.{plural} contains a duplicate id: {item_id!r}"
+                )
+            if previous_id is not None and item_id <= previous_id:
+                raise ValueError(
+                    f"{field}.{plural} must be ordered by id in ascending "
+                    "Unicode code point order"
+                )
+            child = parse_child(member[singular], f"{mf}.{singular}")
+            prev = _check_hex64(member["previous"], f"{mf}.previous")
+            dig = _check_hex64(member["digest"], f"{mf}.digest")
+            members.append((item_id, child, prev, dig))
+            seen.add(item_id)
+            previous_id = item_id
+        return root, members
+
+    def _assemble_bundle(self, tag, registry, root, members, plural, genesis):
+        singular = "proof" if plural == "proofs" else "report"
+        truth = True
+        running = genesis
+        parts: list[str] = []
+        for item_id, child, prev, dig in members:
+            payload = _v_member_payload(singular, item_id, child.json)
+            recomputed = hashlib.sha256(
+                running.encode("ascii") + payload.encode("utf-8")
+            ).hexdigest()
+            parts.append(
+                '{"id":' + _vjs(item_id)
+                + ',"' + singular + '":'
+                + child.json
+                + ',"previous":' + _vjs(prev)
+                + ',"digest":' + _vjs(dig) + "}"
+            )
+            if not child.truth or prev != running or dig != recomputed:
+                truth = False
+            running = recomputed
+        if root != running:
+            truth = False
+        node = _VNode()
+        node.key = (
+            tag, root,
+            tuple((i, n.key, p, d) for i, n, p, d in members),
+        )
+        node.root = root
+        node.members = members
+        node.truth = truth
+        node.sem = [(i, n.sem) for i, n, _p, _d in members]
+        node.semkey = (
+            tag,
+            tuple((i, n.semkey) for i, n, _p, _d in members),
+        )
+        node.json = (
+            '{"root":' + _vjs(root) + ',"' + plural + '":['
+            + ",".join(parts) + "]}"
+        )
+        node.canonical = None
+        registry[node.key] = node
+        return node
+
+    # ------------------------------------------------------------ mbundle
+    def matrix_bundle(self, value: Any, field: str) -> _VNode:
+        root, members = self._bundle_members(
+            value, field, "reports", "report",
+            lambda v, f: self.credential(v, f),
+        )
+        key = ("mbundle", root, tuple((i, n.key, p, d) for i, n, p, d in members))
+        node = self.mbundle.get(key)
+        if node is not None:
+            return node
+        return self._assemble_bundle(
+            "mbundle", self.mbundle, root, members, "reports",
+            _MATRIX_BUNDLE_GENESIS,
+        )
+
+    # ------------------------------------------------------------- pbundle
+    def proof_bundle(self, level: int, value: Any, field: str) -> _VNode:
+        tag = {0: "b0", 1: "b1", 2: "b2"}[level]
+        registry = (self.b0, self.b1, self.b2)[level]
+        proof_parse = (
+            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof
+        )[level]
+        root, members = self._bundle_members(
+            value, field, "proofs", "proof", proof_parse
+        )
+        key = (tag, root, tuple((i, n.key, p, d) for i, n, p, d in members))
+        node = registry.get(key)
+        if node is not None:
+            return node
+        return self._assemble_bundle(
+            tag, registry, root, members, "proofs", _CHECKPOINT_BUNDLE_GENESIS
+        )
+
+    # -------------------------------------------------------------- diffs
+    def _diff_changes(self, value, before_members, after_members, field,
+                      side_parse, strict):
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a list of change dicts")
+        before_by_id = {m[0]: m for m in before_members}
+        after_by_id = {m[0]: m for m in after_members}
+        entries: list[tuple[str, str, _VNode | None, _VNode | None]] = []
+        seen: set[str] = set()
+        previous_id: str | None = None
+        for index, change in enumerate(value):
+            cf = f"{field}[{index}]"
+            if not isinstance(change, dict) or set(change) != (
+                _CHECKPOINT_BUNDLE_DIFF_CHANGE_KEYS
+            ):
+                raise ValueError(
+                    f"{cf} must be a dict with exactly the keys id, kind, before, after"
+                )
+            member_id = _check_non_empty_str(change["id"], f"{cf}.id")
+            if member_id in seen:
+                raise ValueError(f"{field} contains a duplicate change id: {member_id!r}")
+            if previous_id is not None and member_id <= previous_id:
+                raise ValueError(
+                    f"{field} must be ordered by id in ascending Unicode code "
+                    "point order"
+                )
+            kind = change["kind"]
+            if kind not in _CHECKPOINT_BUNDLE_DIFF_KINDS:
+                raise ValueError(
+                    f"{cf}.kind must be 'added', 'removed', or 'changed'"
+                )
+            bn = (
+                None if change["before"] is None
+                else side_parse(change["before"], f"{cf}.before")
+            )
+            an = (
+                None if change["after"] is None
+                else side_parse(change["after"], f"{cf}.after")
+            )
+            bm = before_by_id.get(member_id)
+            am = after_by_id.get(member_id)
+            if kind == "added":
+                if bn is not None or an is None:
+                    raise ValueError(
+                        f"{cf} is 'added' but before/after do not match the contract"
+                    )
+                if bm is not None or am is None:
+                    raise ValueError(
+                        f"{cf} id {member_id!r} is not added between the two bundles"
+                    )
+                if an.semkey != am[1].semkey:
+                    raise ValueError(
+                        f"{cf}.after does not equal the after bundle member "
+                        f"for id {member_id!r}"
+                    )
+            elif kind == "removed":
+                if bn is None or an is not None:
+                    raise ValueError(
+                        f"{cf} is 'removed' but before/after do not match the contract"
+                    )
+                if bm is None or am is not None:
+                    raise ValueError(
+                        f"{cf} id {member_id!r} is not removed between the two bundles"
+                    )
+                if bn.semkey != bm[1].semkey:
+                    raise ValueError(
+                        f"{cf}.before does not equal the before bundle member "
+                        f"for id {member_id!r}"
+                    )
+            else:
+                if bn is None or an is None:
+                    raise ValueError(
+                        f"{cf} is 'changed' but before/after do not match the contract"
+                    )
+                if bm is None or am is None:
+                    raise ValueError(
+                        f"{cf} id {member_id!r} must exist in both bundles to be 'changed'"
+                    )
+                if bn.semkey != bm[1].semkey:
+                    raise ValueError(
+                        f"{cf}.before does not equal the before bundle member "
+                        f"for id {member_id!r}"
+                    )
+                if an.semkey != am[1].semkey:
+                    raise ValueError(
+                        f"{cf}.after does not equal the after bundle member "
+                        f"for id {member_id!r}"
+                    )
+            entries.append((member_id, kind, bn, an))
+            seen.add(member_id)
+            previous_id = member_id
+
+        expected = set(before_by_id) ^ set(after_by_id)
+        for member_id in sorted(set(before_by_id) & set(after_by_id)):
+            if before_by_id[member_id][1].semkey != after_by_id[member_id][1].semkey:
+                expected.add(member_id)
+        if strict and seen != expected:
+            raise ValueError(
+                "changes must list exactly the added, removed, and changed "
+                "members, with unchanged members omitted"
+            )
+        return entries, seen == expected
+
+    def _assemble_diff(self, tag, registry, before_root, after_root, digest,
+                       before, after, entries):
+        change_parts: list[str] = []
+        for _id, kind, bn, an in entries:
+            change_parts.append(
+                '{"id":' + _vjs(_id)
+                + ',"kind":' + _vjs(kind)
+                + ',"before":' + ("null" if bn is None else bn.json)
+                + ',"after":' + ("null" if an is None else an.json)
+                + "}"
+            )
+        five = (
+            '{"before_root":' + _vjs(before_root)
+            + ',"after_root":' + _vjs(after_root)
+            + ',"before":' + before.json
+            + ',"after":' + after.json
+            + ',"changes":[' + ",".join(change_parts) + "]}"
+        )
+        node = _VNode()
+        node.key = (
+            tag,
+            before_root, after_root, digest,
+            before.key, after.key,
+            tuple(
+                (i, k, None if bn is None else bn.key,
+                 None if an is None else an.key)
+                for i, k, bn, an in entries
+            ),
+        )
+        node.root = before_root
+        node.root_after = after_root
+        node.digest = digest
+        node.before_node = before
+        node.after_node = after
+        node.members = entries
+        node.json = five[:-1] + ',"digest":' + _vjs(digest) + "}"
+        node.dsem = {
+            "before": before.sem,
+            "after": after.sem,
+            "changes": [
+                {
+                    "id": _id,
+                    "kind": kind,
+                    "before": None if bn is None else bn.sem,
+                    "after": None if an is None else an.sem,
+                }
+                for _id, kind, bn, an in entries
+            ],
+        }
+        node.dsemkey = (
+            tag,
+            before.semkey,
+            after.semkey,
+            tuple(
+                (
+                    _id,
+                    kind,
+                    None if bn is None else bn.semkey,
+                    None if an is None else an.semkey,
+                )
+                for _id, kind, bn, an in entries
+            ),
+        )
+        node.canonical = None
+        registry[node.key] = node
+        return node, five
+
+    def _parse_diff(self, tag, registry, value, field, bundle_parse,
+                    side_parse, strict):
+        if not isinstance(value, dict) or set(value) != set(
+            _CHECKPOINT_BUNDLE_DIFF_REPORT_KEYS
+        ):
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys "
+                "before_root, after_root, before, after, changes, digest"
+            )
+        before_root = _check_hex64(value["before_root"], f"{field}.before_root")
+        after_root = _check_hex64(value["after_root"], f"{field}.after_root")
+        digest = _check_hex64(value["digest"], f"{field}.digest")
+        before = bundle_parse(value["before"], f"{field}.before")
+        after = bundle_parse(value["after"], f"{field}.after")
+        if before.root != before_root:
+            raise ValueError(f"{field}.before_root must equal {field}.before.root")
+        if after.root != after_root:
+            raise ValueError(f"{field}.after_root must equal {field}.after.root")
+        entries, complete = self._diff_changes(
+            value["changes"], before.members, after.members,
+            f"{field}.changes", side_parse, strict,
+        )
+        key = (
+            tag, before_root, after_root, digest, before.key, after.key,
+            tuple(
+                (i, k, None if bn is None else bn.key,
+                 None if an is None else an.key)
+                for i, k, bn, an in entries
+            ),
+        )
+        node = registry.get(key)
+        if node is not None:
+            return node
+        node, five = self._assemble_diff(
+            tag, registry, before_root, after_root, digest, before, after, entries
+        )
+        recomputed = hashlib.sha256(five.encode("utf-8")).hexdigest()
+        sides_ok = all(
+            (bn is None or bn.truth) and (an is None or an.truth)
+            for _i, _k, bn, an in entries
+        )
+        node.truth = bool(
+            before.truth and after.truth and sides_ok and digest == recomputed
+        )
+        node.complete = complete
+        return node
+
+    def matrix_diff(self, value: Any, field: str) -> _VNode:
+        return self._parse_diff(
+            "mdiff", self.mdiff, value, field,
+            lambda v, f: self.matrix_bundle(v, f),
+            lambda v, f: self.credential(v, f),
+            strict=True,
+        )
+
+    def proof_diff(self, level: int, value: Any, field: str) -> _VNode:
+        tag = {0: "d0", 1: "d1", 2: "d2"}[level]
+        registry = (self.d0, self.d1, self.d2)[level]
+        bundle_parse = (
+            (lambda v, f: self.proof_bundle(0, v, f)),
+            (lambda v, f: self.proof_bundle(1, v, f)),
+            (lambda v, f: self.proof_bundle(2, v, f)),
+        )[level]
+        side_parse = (
+            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof
+        )[level]
+        return self._parse_diff(
+            tag, registry, value, field, bundle_parse, side_parse, strict=False
+        )
+
+    def generate_diff(self, level, before: _VNode, after: _VNode) -> _VNode:
+        """Canonical diff a generator produces from two canonical bundles."""
+        if level == -1:
+            tag, registry = "mdiff", self.mdiff
+        else:
+            tag = {0: "d0", 1: "d1", 2: "d2"}[level]
+            registry = (self.d0, self.d1, self.d2)[level]
+        before_by_id = {m[0]: m for m in before.members}
+        after_by_id = {m[0]: m for m in after.members}
+        entries: list[tuple[str, str, _VNode | None, _VNode | None]] = []
+        for member_id in sorted(set(before_by_id) | set(after_by_id)):
+            bm = before_by_id.get(member_id)
+            am = after_by_id.get(member_id)
+            if bm is not None and am is not None and bm[1].json == am[1].json:
+                continue
+            kind = "added" if bm is None else "removed" if am is None else "changed"
+            entries.append(
+                (member_id, kind, None if bm is None else bm[1],
+                 None if am is None else am[1])
+            )
+        change_keys = tuple(
+            (i, k, None if bn is None else bn.key, None if an is None else an.key)
+            for i, k, bn, an in entries
+        )
+        change_parts = [
+            '{"id":' + _vjs(_id)
+            + ',"kind":' + _vjs(kind)
+            + ',"before":' + ("null" if bn is None else bn.json)
+            + ',"after":' + ("null" if an is None else an.json)
+            + "}"
+            for _id, kind, bn, an in entries
+        ]
+        five = (
+            '{"before_root":' + _vjs(before.root)
+            + ',"after_root":' + _vjs(after.root)
+            + ',"before":' + before.json
+            + ',"after":' + after.json
+            + ',"changes":[' + ",".join(change_parts) + "]}"
+        )
+        digest = hashlib.sha256(five.encode("utf-8")).hexdigest()
+        full_key = (tag, before.root, after.root, digest, before.key, after.key,
+                    change_keys)
+        existing = registry.get(full_key)
+        if existing is not None:
+            return existing
+        node, _five = self._assemble_diff(
+            tag, registry, before.root, after.root, digest, before, after, entries
+        )
+        node.truth = True
+        node.complete = True
+        return node
+
+    # -------------------------------------------------------------- proofs
+    def _proof(self, tag, registry, value, field, genesis, bundle_parse,
+               diff_level, diff_parse):
+        if not isinstance(value, dict) or set(value) != {
+            "start", "end", "anchor", "stages", "commitment"
+        }:
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys "
+                "start, end, anchor, stages, commitment"
+            )
+        start = _check_time(value["start"], f"{field}.start")
+        end = _check_time(value["end"], f"{field}.end")
+        if start > end:
+            raise ValueError(f"{field}.start must not be after {field}.end")
+        anchor = _check_hex64(value["anchor"], f"{field}.anchor")
+        commitment = _check_hex64(value["commitment"], f"{field}.commitment")
+        raw_stages = value["stages"]
+        if not isinstance(raw_stages, list) or not raw_stages:
+            raise ValueError(f"{field}.stages must be a non-empty list")
+
+        rows: list[tuple[str, _VNode, _VNode | None, str, str]] = []
+        previous_at: str | None = None
+        for index, stage in enumerate(raw_stages):
+            sf = f"{field}.stages[{index}]"
+            if not isinstance(stage, dict) or set(stage) != {
+                "at", "bundle", "diff", "previous", "digest"
+            }:
+                raise ValueError(
+                    f"{sf} must be a dict with exactly the keys "
+                    "at, bundle, diff, previous, digest"
+                )
+            at = _check_time(stage["at"], f"{sf}.at")
+            if previous_at is not None and at <= previous_at:
+                raise ValueError(
+                    f"{sf}.at must be strictly greater than the preceding stage at"
+                )
+            prev = _check_hex64(stage["previous"], f"{sf}.previous")
+            dig = _check_hex64(stage["digest"], f"{sf}.digest")
+            bundle = bundle_parse(stage["bundle"], f"{sf}.bundle")
+            diff: _VNode | None
+            if index == 0 and prev == genesis:
+                if stage["diff"] is not None:
+                    raise ValueError(f"{sf}.diff must be null at the genesis stage")
+                diff = None
+            else:
+                diff = diff_parse(stage["diff"], f"{sf}.diff")
+                if diff.root_after != bundle.root:
+                    raise ValueError(
+                        f"{sf}.diff.after_root must equal this stage bundle root"
+                    )
+                if diff.after_node.semkey != bundle.semkey:
+                    raise ValueError(
+                        f"{sf}.diff.after must reproduce this stage bundle"
+                    )
+                if index > 0:
+                    preceding_bundle = rows[-1][1]
+                    if diff.root != preceding_bundle.root:
+                        raise ValueError(
+                            f"{sf}.diff.before_root must equal the preceding "
+                            "stage bundle root"
+                        )
+                    if diff.before_node.semkey != preceding_bundle.semkey:
+                        raise ValueError(
+                            f"{sf}.diff.before must reproduce the preceding "
+                            "stage bundle"
+                        )
+            rows.append((at, bundle, diff, prev, dig))
+            previous_at = at
+
+        key = (
+            tag, start, end, anchor, commitment,
+            tuple(
+                (at, b.key, None if d is None else d.key, p, h)
+                for at, b, d, p, h in rows
+            ),
+        )
+        node = registry.get(key)
+        if node is not None:
+            return node
+
+        truth = True
+        running = anchor
+        stage_parts: list[str] = []
+        sem_stages: list[dict[str, Any]] = []
+        semkey_stages: list[tuple[str, Any, Any]] = []
+        for index, (at, bundle, diff, prev, dig) in enumerate(rows):
+            if not bundle.truth:
+                truth = False
+            if diff is not None:
+                if not diff.truth:
+                    truth = False
+                if index == 0:
+                    generated = self.generate_diff(
+                        diff_level, diff.before_node, diff.after_node
+                    )
+                else:
+                    generated = self.generate_diff(
+                        diff_level, rows[index - 1][1], bundle
+                    )
+                if diff.json != generated.json:
+                    truth = False
+            stage_payload = (
+                '{"at":' + _vjs(at)
+                + ',"bundle":' + bundle.json
+                + ',"diff":' + ("null" if diff is None else diff.json)
+                + "}"
+            )
+            recomputed = hashlib.sha256(
+                running.encode("ascii") + stage_payload.encode("utf-8")
+            ).hexdigest()
+            if prev != running or dig != recomputed:
+                truth = False
+            running = recomputed
+            stage_parts.append(
+                '{"at":' + _vjs(at)
+                + ',"bundle":' + bundle.json
+                + ',"diff":' + ("null" if diff is None else diff.json)
+                + ',"previous":' + _vjs(prev)
+                + ',"digest":' + _vjs(dig) + "}"
+            )
+            sem_stages.append(
+                {
+                    "at": at,
+                    "bundle": bundle.sem,
+                    "diff": None if diff is None else diff.dsem,
+                }
+            )
+            semkey_stages.append(
+                (
+                    at,
+                    bundle.semkey,
+                    None if diff is None else diff.dsemkey,
+                )
+            )
+        if commitment != running:
+            truth = False
+        if not (start == rows[0][0] and end == rows[-1][0]):
+            truth = False
+
+        node = _VNode()
+        node.key = key
+        node.truth = truth
+        node.json = (
+            '{"start":' + _vjs(start)
+            + ',"end":' + _vjs(end)
+            + ',"anchor":' + _vjs(anchor)
+            + ',"stages":[' + ",".join(stage_parts)
+            + '],"commitment":' + _vjs(commitment) + "}"
+        )
+        node.sem = {"start": start, "end": end, "stages": sem_stages}
+        node.semkey = (tag, start, end, tuple(semkey_stages))
+        node.canonical = None
+        registry[key] = node
+        return node
+
+    def evolution_proof(self, value, field):
+        return self._proof(
+            "p0", self.p0, value, field, _MATRIX_BUNDLE_EVOLUTION_GENESIS,
+            lambda v, f: self.matrix_bundle(v, f),
+            -1, lambda v, f: self.matrix_diff(v, f),
+        )
+
+    def chain_proof(self, value, field):
+        return self._proof(
+            "p1", self.p1, value, field, _CHECKPOINT_CHAIN_GENESIS,
+            lambda v, f: self.proof_bundle(0, v, f),
+            0, lambda v, f: self.proof_diff(0, v, f),
+        )
+
+    def bundle_evolution_proof(self, value, field):
+        return self._proof(
+            "p2", self.p2, value, field, _CHECKPOINT_CHAIN_BUNDLE_EVOLUTION_GENESIS,
+            lambda v, f: self.proof_bundle(1, v, f),
+            1, lambda v, f: self.proof_diff(1, v, f),
+        )
+
+    # ----------------------------------------------------- top-level diffs
+    def top_bundle(self, value: Any, field: str) -> _VNode:
+        return self.proof_bundle(2, value, field)
+
+    def top_generate(self, before: _VNode, after: _VNode) -> _VNode:
+        return self.generate_diff(2, before, after)
+
+    def top_parse_diff(self, value: Any, field: str) -> _VNode:
+        return self.proof_diff(2, value, field)
