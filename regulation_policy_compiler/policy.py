@@ -11,6 +11,7 @@ from functools import cmp_to_key
 from typing import Any
 
 _TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
 _RULE_KEYS = frozenset({"id", "ver", "source", "priority", "from", "to", "when", "result"})
 _SOURCES = ("law", "org")
 
@@ -1001,11 +1002,7 @@ _DECISION_ATTEST_CONTENT_KEYS = ("at", "facts", "explanation", "policy")
 
 
 def _check_hex64(value: Any, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(char not in _SCHEDULE_HEX_DIGITS for char in value)
-    ):
+    if not isinstance(value, str) or _HEX64_RE.fullmatch(value) is None:
         raise ValueError(f"{field} must be 64 lowercase hexadecimal characters")
     return value
 
@@ -2964,67 +2961,20 @@ def matrix_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
     results regardless of input dict key order, and no two levels share a
     mutable container.
     """
-    before_root, before_members = _normalize_verified_matrix_bundle(
-        before, "before"
-    )
-    after_root, after_members = _normalize_verified_matrix_bundle(
-        after, "after"
-    )
-    if not _matrix_bundle_is_truthful(before_root, before_members):
+    engine = _VEngine()
+    # Both sides complete every structural and embedded-credential check
+    # first; a false digest is carried as data, so parsing the second side
+    # still runs in full when the first side merely carries a false summary.
+    before_node = engine.matrix_bundle(before, "before")
+    after_node = engine.matrix_bundle(after, "after")
+    if not before_node.truth:
         raise ValueError("before bundle root or hash chain does not verify")
-    if not _matrix_bundle_is_truthful(after_root, after_members):
+    if not after_node.truth:
         raise ValueError("after bundle root or hash chain does not verify")
-
-    before_bundle = _canonical_bundle_from_members(before_root, before_members)
-    after_bundle = _canonical_bundle_from_members(after_root, after_members)
-    before_by_id = {member["id"]: member for member in before_members}
-    after_by_id = {member["id"]: member for member in after_members}
-
-    changes: list[dict[str, Any]] = []
-    for member_id in sorted(set(before_by_id) | set(after_by_id)):
-        before_member = before_by_id.get(member_id)
-        after_member = after_by_id.get(member_id)
-        if (
-            before_member is not None
-            and after_member is not None
-            and before_member["report"] == after_member["report"]
-        ):
-            continue
-        if before_member is None:
-            kind = "added"
-        elif after_member is None:
-            kind = "removed"
-        else:
-            kind = "changed"
-        changes.append(
-            {
-                "id": member_id,
-                "kind": kind,
-                "before": (
-                    copy.deepcopy(before_member["report"])
-                    if before_member is not None
-                    else None
-                ),
-                "after": (
-                    copy.deepcopy(after_member["report"])
-                    if after_member is not None
-                    else None
-                ),
-            }
-        )
-
-    payload = {
-        "before_root": before_root,
-        "after_root": after_root,
-        "before": before_bundle,
-        "after": after_bundle,
-        "changes": changes,
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
-    result["digest"] = digest
-    return result
+    diff_node = engine.generate_diff(-1, before_node, after_node)
+    # Rebuild the result from the cached canonical compact bytes: one parse
+    # yields a fully independent tree without re-walking objects.
+    return _emit(diff_node.json)
 
 
 def _normalize_diff_change_credential(
@@ -3415,58 +3365,11 @@ def matrix_bundle_evolution(stages: Any) -> dict[str, Any]:
     ``root`` is the last stage's ``digest``. Equal-valued inputs yield
     byte-identical results and no level shares an input object.
     """
-    if not isinstance(stages, list) or not stages:
-        raise ValueError("stages must be a non-empty list of {at, bundle} dicts")
-    normalized: list[tuple[str, dict[str, Any]]] = []
-    previous_at: str | None = None
-    for index, stage in enumerate(stages):
-        field = f"stages[{index}]"
-        if not isinstance(stage, dict) or set(stage) != (
-            _MATRIX_BUNDLE_EVOLUTION_STAGE_ITEM_KEYS
-        ):
-            raise ValueError(
-                f"{field} must be a dict with exactly the keys at, bundle"
-            )
-        at = _check_time(stage["at"], f"{field}.at")
-        if previous_at is not None and at <= previous_at:
-            raise ValueError(
-                f"{field}.at must be strictly greater than the preceding at"
-            )
-        # Every bundle must fully verify (structure, semantics, sub-reports,
-        # member chain, and root) before anything is produced.
-        bundle_root, bundle_members = _normalize_verified_matrix_bundle(
-            stage["bundle"], f"{field}.bundle"
-        )
-        if not _matrix_bundle_is_truthful(bundle_root, bundle_members):
-            raise ValueError(f"{field}.bundle root or hash chain does not verify")
-        normalized.append(
-            (at, _canonical_bundle_from_members(bundle_root, bundle_members))
-        )
-        previous_at = at
-
-    result_stages: list[dict[str, Any]] = []
-    previous = _MATRIX_BUNDLE_EVOLUTION_GENESIS
-    digest = previous
-    prior_bundle: dict[str, Any] | None = None
-    for at, bundle in normalized:
-        diff = (
-            None
-            if prior_bundle is None
-            else matrix_bundle_diff(prior_bundle, bundle)
-        )
-        digest = _matrix_bundle_evolution_stage_digest(previous, at, bundle, diff)
-        result_stages.append(
-            {
-                "at": at,
-                "bundle": copy.deepcopy(bundle),
-                "diff": None if diff is None else copy.deepcopy(diff),
-                "previous": previous,
-                "digest": digest,
-            }
-        )
-        prior_bundle = bundle
-        previous = digest
-    return {"root": digest, "stages": result_stages}
+    # The value engine normalizes and recomputes each distinct embedded
+    # credential, bundle, and diff once; the emitted report is assembled
+    # from the cached canonical bytes and parsed back into fresh
+    # containers, so no level shares an input object.
+    return _emit(_VEngine().build_chain(-1, stages))
 
 
 def _normalize_verified_matrix_bundle_evolution(
@@ -3709,49 +3612,9 @@ def evolution_checkpoint(report: Any, start: str, end: str) -> dict[str, Any]:
     end = _check_time(end, "end")
     if start > end:
         raise ValueError(f"start must not be after end: {start!r} > {end!r}")
-    report_root, stages = _normalize_verified_matrix_bundle_evolution(
-        report, "report"
-    )
-    self_expected = {
-        "root": report_root,
-        "stages": [
-            {"at": stage["at"], "root": stage["bundle_root"]} for stage in stages
-        ],
-    }
-    if not verify_matrix_bundle_evolution(report, self_expected):
-        raise ValueError(
-            "report must be a fully verifiable matrix bundle evolution report"
-        )
-    ats = [stage["at"] for stage in stages]
-    if start not in ats:
-        raise ValueError("start must be the at of a stage that exists in report")
-    if end not in ats:
-        raise ValueError("end must be the at of a stage that exists in report")
-    first_index = ats.index(start)
-    last_index = ats.index(end)
-    anchor = (
-        _MATRIX_BUNDLE_EVOLUTION_GENESIS
-        if first_index == 0
-        else stages[first_index - 1]["digest"]
-    )
-    window = stages[first_index : last_index + 1]
-    proof_stages = [
-        {
-            "at": stage["at"],
-            "bundle": copy.deepcopy(stage["bundle"]),
-            "diff": copy.deepcopy(stage["diff"]),
-            "previous": stage["previous"],
-            "digest": stage["digest"],
-        }
-        for stage in window
-    ]
-    return {
-        "start": start,
-        "end": end,
-        "anchor": anchor,
-        "stages": proof_stages,
-        "commitment": window[-1]["digest"],
-    }
+    # The value engine validates and recomputes the whole report once;
+    # the window is assembled from the cached canonical stage bytes.
+    return _emit(_VEngine().cut_window(-1, report, start, end))
 
 
 def _normalize_verified_evolution_checkpoint(
@@ -4106,47 +3969,10 @@ def evolution_checkpoint_bundle(items: Any) -> dict[str, Any]:
     followed by that payload. ``root`` is the last member's ``digest``.
     Equal-valued inputs yield byte-identical results.
     """
-    if not isinstance(items, list) or not items:
-        raise ValueError("items must be a non-empty list of {id, proof} dicts")
-    normalized: list[tuple[str, dict[str, Any]]] = []
-    seen: set[str] = set()
-    for index, item in enumerate(items):
-        field = f"items[{index}]"
-        if not isinstance(item, dict) or set(item) != _CHECKPOINT_BUNDLE_ITEM_KEYS:
-            raise ValueError(
-                f"{field} must be a dict with exactly the keys id, proof"
-            )
-        item_id = _check_non_empty_str(item["id"], f"{field}.id")
-        if item_id in seen:
-            raise ValueError(f"items contains a duplicate id: {item_id!r}")
-        seen.add(item_id)
-        # Every proof must fully verify (structure, semantics, window
-        # boundaries, anchor, bundles, diffs, and stage chain) before
-        # anything is produced.
-        proof = _canonical_checkpoint_from_normalized(
-            _normalize_verified_evolution_checkpoint(
-                item["proof"], f"{field}.proof"
-            )
-        )
-        if not _checkpoint_is_truthful(proof):
-            raise ValueError(f"{field}.proof does not recompute as true")
-        normalized.append((item_id, proof))
-    normalized.sort(key=lambda member: member[0])
-    proofs: list[dict[str, Any]] = []
-    previous = _CHECKPOINT_BUNDLE_GENESIS
-    digest = previous
-    for item_id, proof in normalized:
-        digest = _checkpoint_bundle_member_digest(previous, item_id, proof)
-        proofs.append(
-            {
-                "id": item_id,
-                "proof": copy.deepcopy(proof),
-                "previous": previous,
-                "digest": digest,
-            }
-        )
-        previous = digest
-    return {"root": digest, "proofs": proofs}
+    # The value engine normalizes and recomputes each distinct proof once,
+    # however often it occurs; the bundle is assembled from the cached
+    # canonical bytes and parsed back into fresh containers.
+    return _emit(_VEngine().build_bundle(0, items))
 
 
 def _normalize_verified_checkpoint_bundle(
@@ -4440,71 +4266,20 @@ def evolution_checkpoint_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
     results regardless of input dict key order, and no two levels share a
     mutable container.
     """
-    before_root, before_members = _normalize_verified_checkpoint_bundle(
-        before, "before"
-    )
-    after_root, after_members = _normalize_verified_checkpoint_bundle(
-        after, "after"
-    )
-    if not _checkpoint_bundle_is_truthful(before_root, before_members):
+    engine = _VEngine()
+    # Both sides complete every structural and embedded-proof check first;
+    # a false digest is carried as data, so parsing the second side still
+    # runs in full when the first side merely carries a false summary.
+    before_node = engine.proof_bundle(0, before, "before")
+    after_node = engine.proof_bundle(0, after, "after")
+    if not before_node.truth:
         raise ValueError("before bundle root or hash chain does not verify")
-    if not _checkpoint_bundle_is_truthful(after_root, after_members):
+    if not after_node.truth:
         raise ValueError("after bundle root or hash chain does not verify")
-
-    before_bundle = _canonical_checkpoint_bundle_from_members(
-        before_root, before_members
-    )
-    after_bundle = _canonical_checkpoint_bundle_from_members(
-        after_root, after_members
-    )
-    before_by_id = {member["id"]: member for member in before_members}
-    after_by_id = {member["id"]: member for member in after_members}
-
-    changes: list[dict[str, Any]] = []
-    for member_id in sorted(set(before_by_id) | set(after_by_id)):
-        before_member = before_by_id.get(member_id)
-        after_member = after_by_id.get(member_id)
-        if (
-            before_member is not None
-            and after_member is not None
-            and before_member["proof"] == after_member["proof"]
-        ):
-            continue
-        if before_member is None:
-            kind = "added"
-        elif after_member is None:
-            kind = "removed"
-        else:
-            kind = "changed"
-        changes.append(
-            {
-                "id": member_id,
-                "kind": kind,
-                "before": (
-                    copy.deepcopy(before_member["proof"])
-                    if before_member is not None
-                    else None
-                ),
-                "after": (
-                    copy.deepcopy(after_member["proof"])
-                    if after_member is not None
-                    else None
-                ),
-            }
-        )
-
-    payload = {
-        "before_root": before_root,
-        "after_root": after_root,
-        "before": before_bundle,
-        "after": after_bundle,
-        "changes": changes,
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
-    result["digest"] = digest
-    return result
+    diff_node = engine.generate_diff(0, before_node, after_node)
+    # Rebuild the result from the cached canonical compact bytes: one parse
+    # yields a fully independent tree without re-walking objects.
+    return _emit(diff_node.json)
 
 
 def _normalize_diff_change_proof(value: Any, field: str) -> dict[str, Any] | None:
@@ -4912,63 +4687,10 @@ def checkpoint_chain(stages: Any) -> dict[str, Any]:
     Equal-valued inputs yield byte-identical results and no level shares an
     input object.
     """
-    if not isinstance(stages, list) or not stages:
-        raise ValueError("stages must be a non-empty list of {at, bundle} dicts")
-    normalized: list[tuple[str, dict[str, Any]]] = []
-    previous_at: str | None = None
-    for index, stage in enumerate(stages):
-        field = f"stages[{index}]"
-        if not isinstance(stage, dict) or set(stage) != (
-            _CHECKPOINT_CHAIN_STAGE_ITEM_KEYS
-        ):
-            raise ValueError(
-                f"{field} must be a dict with exactly the keys at, bundle"
-            )
-        at = _check_time(stage["at"], f"{field}.at")
-        if previous_at is not None and at <= previous_at:
-            raise ValueError(
-                f"{field}.at must be strictly greater than the preceding at"
-            )
-        # Every bundle must fully verify (structure, embedded proofs, member
-        # chain, and root) before anything is produced.
-        bundle_root, bundle_members = _normalize_verified_checkpoint_bundle(
-            stage["bundle"], f"{field}.bundle"
-        )
-        if not _checkpoint_bundle_is_truthful(bundle_root, bundle_members):
-            raise ValueError(f"{field}.bundle root or hash chain does not verify")
-        normalized.append(
-            (
-                at,
-                _canonical_checkpoint_bundle_from_members(
-                    bundle_root, bundle_members
-                ),
-            )
-        )
-        previous_at = at
-
-    result_stages: list[dict[str, Any]] = []
-    previous = _CHECKPOINT_CHAIN_GENESIS
-    digest = previous
-    prior_bundle: dict[str, Any] | None = None
-    for at, bundle in normalized:
-        diff = (
-            None
-            if prior_bundle is None
-            else evolution_checkpoint_bundle_diff(prior_bundle, bundle)
-        )
-        digest = _checkpoint_chain_stage_digest(previous, at, bundle, diff)
-        result_stages.append(
-            {
-                "at": at,
-                "bundle": copy.deepcopy(bundle),
-                "diff": None if diff is None else copy.deepcopy(diff),
-                "previous": previous,
-                "digest": digest,
-            }
-        )
-        prior_bundle = bundle
-        previous = digest
-    return {"root": digest, "stages": result_stages}
+    # The value engine normalizes and recomputes each distinct embedded
+    # proof, bundle, and adjacent diff once; the emitted chain is built
+    # from the cached canonical bytes and parsed back into fresh containers.
+    return _emit(_VEngine().build_chain(0, stages))
 
 
 def _normalize_verified_checkpoint_chain(
@@ -5240,54 +4962,9 @@ def checkpoint_chain_checkpoint(
     end = _check_time(end, "end")
     if start > end:
         raise ValueError(f"start must not be after end: {start!r} > {end!r}")
-    report_root, stages = _normalize_verified_checkpoint_chain(report, "report")
-    self_expected = {
-        "root": report_root,
-        "stages": [
-            {
-                "at": stage["at"],
-                "bundle_root": stage["bundle_root"],
-                "diff_digest": (
-                    None if stage["diff"] is None else stage["diff"]["digest"]
-                ),
-            }
-            for stage in stages
-        ],
-    }
-    if not verify_checkpoint_chain(report, self_expected):
-        raise ValueError(
-            "report must be a fully verifiable checkpoint chain report"
-        )
-    ats = [stage["at"] for stage in stages]
-    if start not in ats:
-        raise ValueError("start must be the at of a stage that exists in report")
-    if end not in ats:
-        raise ValueError("end must be the at of a stage that exists in report")
-    first_index = ats.index(start)
-    last_index = ats.index(end)
-    anchor = (
-        _CHECKPOINT_CHAIN_GENESIS
-        if first_index == 0
-        else stages[first_index - 1]["digest"]
-    )
-    window = stages[first_index : last_index + 1]
-    proof_stages = [
-        {
-            "at": stage["at"],
-            "bundle": copy.deepcopy(stage["bundle"]),
-            "diff": copy.deepcopy(stage["diff"]),
-            "previous": stage["previous"],
-            "digest": stage["digest"],
-        }
-        for stage in window
-    ]
-    return {
-        "start": start,
-        "end": end,
-        "anchor": anchor,
-        "stages": proof_stages,
-        "commitment": window[-1]["digest"],
-    }
+    # The value engine validates and recomputes the whole report once;
+    # the window is assembled from the cached canonical stage bytes.
+    return _emit(_VEngine().cut_window(0, report, start, end))
 
 
 def _normalize_verified_checkpoint_chain_checkpoint(
@@ -5675,47 +5352,10 @@ def checkpoint_chain_checkpoint_bundle(items: Any) -> dict[str, Any]:
     followed by that payload. ``root`` is the last member's ``digest``.
     Equal-valued inputs yield byte-identical results.
     """
-    if not isinstance(items, list) or not items:
-        raise ValueError("items must be a non-empty list of {id, proof} dicts")
-    normalized: list[tuple[str, dict[str, Any]]] = []
-    seen: set[str] = set()
-    for index, item in enumerate(items):
-        field = f"items[{index}]"
-        if not isinstance(item, dict) or set(item) != _CHECKPOINT_BUNDLE_ITEM_KEYS:
-            raise ValueError(
-                f"{field} must be a dict with exactly the keys id, proof"
-            )
-        item_id = _check_non_empty_str(item["id"], f"{field}.id")
-        if item_id in seen:
-            raise ValueError(f"items contains a duplicate id: {item_id!r}")
-        seen.add(item_id)
-        # Every proof must fully verify (structure, window boundaries,
-        # anchor, stage order, embedded bundles, adjacent diffs, member
-        # links, and the terminal commitment) before anything is produced.
-        proof = _canonical_checkpoint_chain_checkpoint_from_normalized(
-            _normalize_verified_checkpoint_chain_checkpoint(
-                item["proof"], f"{field}.proof"
-            )
-        )
-        if not _checkpoint_chain_checkpoint_is_truthful(proof):
-            raise ValueError(f"{field}.proof does not recompute as true")
-        normalized.append((item_id, proof))
-    normalized.sort(key=lambda member: member[0])
-    proofs: list[dict[str, Any]] = []
-    previous = _CHECKPOINT_BUNDLE_GENESIS
-    digest = previous
-    for item_id, proof in normalized:
-        digest = _checkpoint_bundle_member_digest(previous, item_id, proof)
-        proofs.append(
-            {
-                "id": item_id,
-                "proof": copy.deepcopy(proof),
-                "previous": previous,
-                "digest": digest,
-            }
-        )
-        previous = digest
-    return {"root": digest, "proofs": proofs}
+    # The value engine normalizes and recomputes each distinct proof once,
+    # however often it occurs; the bundle is assembled from the cached
+    # canonical bytes and parsed back into fresh containers.
+    return _emit(_VEngine().build_bundle(1, items))
 
 
 def _normalize_verified_checkpoint_chain_checkpoint_bundle(
@@ -5983,73 +5623,20 @@ def checkpoint_chain_checkpoint_bundle_diff(
     results regardless of input dict key order, and no two levels share a
     mutable container.
     """
-    before_root, before_members = (
-        _normalize_verified_checkpoint_chain_checkpoint_bundle(
-            before, "before"
-        )
-    )
-    after_root, after_members = (
-        _normalize_verified_checkpoint_chain_checkpoint_bundle(after, "after")
-    )
-    if not _chain_checkpoint_bundle_is_truthful(before_root, before_members):
+    engine = _VEngine()
+    # Both sides complete every structural and embedded-proof check first;
+    # a false digest is carried as data, so parsing the second side still
+    # runs in full when the first side merely carries a false summary.
+    before_node = engine.proof_bundle(1, before, "before")
+    after_node = engine.proof_bundle(1, after, "after")
+    if not before_node.truth:
         raise ValueError("before bundle root or hash chain does not verify")
-    if not _chain_checkpoint_bundle_is_truthful(after_root, after_members):
+    if not after_node.truth:
         raise ValueError("after bundle root or hash chain does not verify")
-
-    before_bundle = _canonical_checkpoint_bundle_from_members(
-        before_root, before_members
-    )
-    after_bundle = _canonical_checkpoint_bundle_from_members(
-        after_root, after_members
-    )
-    before_by_id = {member["id"]: member for member in before_members}
-    after_by_id = {member["id"]: member for member in after_members}
-
-    changes: list[dict[str, Any]] = []
-    for member_id in sorted(set(before_by_id) | set(after_by_id)):
-        before_member = before_by_id.get(member_id)
-        after_member = after_by_id.get(member_id)
-        if (
-            before_member is not None
-            and after_member is not None
-            and before_member["proof"] == after_member["proof"]
-        ):
-            continue
-        if before_member is None:
-            kind = "added"
-        elif after_member is None:
-            kind = "removed"
-        else:
-            kind = "changed"
-        changes.append(
-            {
-                "id": member_id,
-                "kind": kind,
-                "before": (
-                    copy.deepcopy(before_member["proof"])
-                    if before_member is not None
-                    else None
-                ),
-                "after": (
-                    copy.deepcopy(after_member["proof"])
-                    if after_member is not None
-                    else None
-                ),
-            }
-        )
-
-    payload = {
-        "before_root": before_root,
-        "after_root": after_root,
-        "before": before_bundle,
-        "after": after_bundle,
-        "changes": changes,
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
-    result["digest"] = digest
-    return result
+    diff_node = engine.generate_diff(1, before_node, after_node)
+    # Rebuild the result from the cached canonical compact bytes: one parse
+    # yields a fully independent tree without re-walking objects.
+    return _emit(diff_node.json)
 
 
 def _normalize_chain_checkpoint_diff_change_proof(
@@ -6480,65 +6067,10 @@ def checkpoint_chain_checkpoint_bundle_evolution(stages: Any) -> dict[str, Any]:
     ``root`` is the last stage's ``digest``. Equal-valued inputs yield
     byte-identical results and no level shares an input object.
     """
-    if not isinstance(stages, list) or not stages:
-        raise ValueError("stages must be a non-empty list of {at, bundle} dicts")
-    normalized: list[tuple[str, dict[str, Any]]] = []
-    previous_at: str | None = None
-    for index, stage in enumerate(stages):
-        field = f"stages[{index}]"
-        if not isinstance(stage, dict) or set(stage) != (
-            _CHECKPOINT_CHAIN_BUNDLE_EVOLUTION_STAGE_ITEM_KEYS
-        ):
-            raise ValueError(
-                f"{field} must be a dict with exactly the keys at, bundle"
-            )
-        at = _check_time(stage["at"], f"{field}.at")
-        if previous_at is not None and at <= previous_at:
-            raise ValueError(
-                f"{field}.at must be strictly greater than the preceding at"
-            )
-        # Every bundle must fully verify (its window proofs, member chain,
-        # and root) before anything is produced.
-        bundle_root, bundle_members = (
-            _normalize_verified_checkpoint_chain_checkpoint_bundle(
-                stage["bundle"], f"{field}.bundle"
-            )
-        )
-        if not _chain_checkpoint_bundle_is_truthful(bundle_root, bundle_members):
-            raise ValueError(f"{field}.bundle root or hash chain does not verify")
-        normalized.append(
-            (
-                at,
-                _canonical_checkpoint_bundle_from_members(bundle_root, bundle_members),
-            )
-        )
-        previous_at = at
-
-    result_stages: list[dict[str, Any]] = []
-    previous = _CHECKPOINT_CHAIN_BUNDLE_EVOLUTION_GENESIS
-    digest = previous
-    prior_bundle: dict[str, Any] | None = None
-    for at, bundle in normalized:
-        diff = (
-            None
-            if prior_bundle is None
-            else checkpoint_chain_checkpoint_bundle_diff(prior_bundle, bundle)
-        )
-        digest = _chain_checkpoint_bundle_evolution_stage_digest(
-            previous, at, bundle, diff
-        )
-        result_stages.append(
-            {
-                "at": at,
-                "bundle": copy.deepcopy(bundle),
-                "diff": None if diff is None else copy.deepcopy(diff),
-                "previous": previous,
-                "digest": digest,
-            }
-        )
-        prior_bundle = bundle
-        previous = digest
-    return {"root": digest, "stages": result_stages}
+    # The value engine normalizes and recomputes each distinct embedded
+    # proof, bundle, and adjacent diff once; the emitted chain is built
+    # from the cached canonical bytes and parsed back into fresh containers.
+    return _emit(_VEngine().build_chain(1, stages))
 
 
 def _normalize_verified_checkpoint_chain_checkpoint_bundle_evolution(
@@ -6817,60 +6349,9 @@ def bundle_evolution_checkpoint(
     end = _check_time(end, "end")
     if start > end:
         raise ValueError(f"start must not be after end: {start!r} > {end!r}")
-    report_root, stages = (
-        _normalize_verified_checkpoint_chain_checkpoint_bundle_evolution(
-            report, "report"
-        )
-    )
-    self_expected = {
-        "root": report_root,
-        "stages": [
-            {
-                "at": stage["at"],
-                "bundle_root": stage["bundle_root"],
-                "diff_digest": (
-                    None if stage["diff"] is None else stage["diff"]["digest"]
-                ),
-            }
-            for stage in stages
-        ],
-    }
-    if not verify_checkpoint_chain_checkpoint_bundle_evolution(
-        report, self_expected
-    ):
-        raise ValueError(
-            "report must be a fully verifiable bundle evolution report"
-        )
-    ats = [stage["at"] for stage in stages]
-    if start not in ats:
-        raise ValueError("start must be the at of a stage that exists in report")
-    if end not in ats:
-        raise ValueError("end must be the at of a stage that exists in report")
-    first_index = ats.index(start)
-    last_index = ats.index(end)
-    anchor = (
-        _CHECKPOINT_CHAIN_BUNDLE_EVOLUTION_GENESIS
-        if first_index == 0
-        else stages[first_index - 1]["digest"]
-    )
-    window = stages[first_index : last_index + 1]
-    proof_stages = [
-        {
-            "at": stage["at"],
-            "bundle": copy.deepcopy(stage["bundle"]),
-            "diff": copy.deepcopy(stage["diff"]),
-            "previous": stage["previous"],
-            "digest": stage["digest"],
-        }
-        for stage in window
-    ]
-    return {
-        "start": start,
-        "end": end,
-        "anchor": anchor,
-        "stages": proof_stages,
-        "commitment": window[-1]["digest"],
-    }
+    # The value engine validates and recomputes the whole report once;
+    # the window is assembled from the cached canonical stage bytes.
+    return _emit(_VEngine().cut_window(1, report, start, end))
 
 
 def _normalize_verified_bundle_evolution_checkpoint(
@@ -7294,47 +6775,10 @@ def bundle_evolution_checkpoint_bundle(items: Any) -> dict[str, Any]:
     followed by that payload. ``root`` is the last member's ``digest``.
     Equal-valued inputs yield byte-identical results.
     """
-    if not isinstance(items, list) or not items:
-        raise ValueError("items must be a non-empty list of {id, proof} dicts")
-    normalized: list[tuple[str, dict[str, Any]]] = []
-    seen: set[str] = set()
-    for index, item in enumerate(items):
-        field = f"items[{index}]"
-        if not isinstance(item, dict) or set(item) != _CHECKPOINT_BUNDLE_ITEM_KEYS:
-            raise ValueError(
-                f"{field} must be a dict with exactly the keys id, proof"
-            )
-        item_id = _check_non_empty_str(item["id"], f"{field}.id")
-        if item_id in seen:
-            raise ValueError(f"items contains a duplicate id: {item_id!r}")
-        seen.add(item_id)
-        # Every proof must fully verify (structure, window boundaries,
-        # anchor, stage order, embedded bundles, adjacent diffs, member
-        # links, and the terminal commitment) before anything is produced.
-        proof = _canonical_bundle_evolution_checkpoint_from_normalized(
-            _normalize_verified_bundle_evolution_checkpoint(
-                item["proof"], f"{field}.proof"
-            )
-        )
-        if not _bundle_evolution_checkpoint_is_truthful(proof):
-            raise ValueError(f"{field}.proof does not recompute as true")
-        normalized.append((item_id, proof))
-    normalized.sort(key=lambda member: member[0])
-    proofs: list[dict[str, Any]] = []
-    previous = _CHECKPOINT_BUNDLE_GENESIS
-    digest = previous
-    for item_id, proof in normalized:
-        digest = _checkpoint_bundle_member_digest(previous, item_id, proof)
-        proofs.append(
-            {
-                "id": item_id,
-                "proof": copy.deepcopy(proof),
-                "previous": previous,
-                "digest": digest,
-            }
-        )
-        previous = digest
-    return {"root": digest, "proofs": proofs}
+    # The value engine normalizes and recomputes each distinct proof once,
+    # however often it occurs; the bundle is assembled from the cached
+    # canonical bytes and parsed back into fresh containers.
+    return _emit(_VEngine().build_bundle(2, items))
 
 
 def _normalize_verified_bundle_evolution_checkpoint_bundle(
@@ -7626,7 +7070,7 @@ def bundle_evolution_checkpoint_bundle_diff(
     # Rebuild the result from the cached canonical compact bytes: one parse
     # yields a fully independent tree (the two bundles and every change side
     # are distinct containers, no level shared) without re-walking objects.
-    return json.loads(diff_node.json)
+    return _emit(diff_node.json)
 
 
 def _normalize_bundle_evolution_diff_change_proof(
@@ -8007,8 +7451,59 @@ def _vjs(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+class _CanonicalDict(dict):
+    """A plain dict carrying the root of a canonical generator result.
+
+    It behaves exactly like a plain ``dict`` in every respect — it *is* one:
+    equality, ordering, iteration, JSON encoding, and ``isinstance`` checks
+    are unchanged.  The only addition is a ``__deepcopy__`` that rebuilds
+    the independent copy through the canonical compact JSON form, which is
+    far cheaper than the generic recursive copier for the very large
+    credential trees these functions return.  The copy is made of plain
+    dicts and lists, so nothing beyond copying speed is observable, and the
+    copy remains fully independent of the original at every level.
+    """
+
+    def __deepcopy__(self, memo: dict) -> Any:
+        clone = json.loads(
+            json.dumps(self, ensure_ascii=False, separators=(",", ":"))
+        )
+        memo[id(self)] = clone
+        return clone
+
+
+def _emit(canonical_json: str) -> dict[str, Any]:
+    """Materialize a canonical JSON document as an independent result tree."""
+    return _CanonicalDict(json.loads(canonical_json))
+
+
 def _v_member_payload(singular: str, item_id: str, child_json: str) -> str:
     return '{"id":' + _vjs(item_id) + ',"' + singular + '":' + child_json + "}"
+
+
+class _VKey:
+    """A hash-consed composite value key.
+
+    Composite nodes (bundles, diffs, proofs) key their registries by tuples
+    of scalar fields plus their children's keys.  Plain tuples re-hash the
+    whole nested structure on every lookup; wrapping the tuple caches the
+    hash once, so a repeat occurrence resolves in O(1).  Equality still
+    compares the full underlying tuple, so distinct values can never merge.
+    """
+
+    __slots__ = ("parts", "_hash")
+
+    def __init__(self, parts: Any) -> None:
+        self.parts = parts
+        self._hash = hash(parts)
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, _VKey):
+            return NotImplemented
+        return self.parts == other.parts
 
 
 class _VNode:
@@ -8016,7 +7511,7 @@ class _VNode:
         "key", "canonical", "json", "sem", "semkey", "dsem", "dsemkey",
         "truth", "complete",
         "root", "root_after", "members", "before_node", "after_node",
-        "digest",
+        "digest", "stage_parts",
     )
 
     def __init__(self) -> None:
@@ -8035,6 +7530,7 @@ class _VNode:
         self.before_node: Any = None
         self.after_node: Any = None
         self.digest: str = ""
+        self.stage_parts: list[str] = []
 
 
 class _VEngine:
@@ -8139,16 +7635,22 @@ class _VEngine:
             previous_id = item_id
         return root, members
 
-    def _assemble_bundle(self, tag, registry, root, members, plural, genesis):
+    def _assemble_bundle(self, tag, registry, key, root, members, plural, genesis):
         singular = "proof" if plural == "proofs" else "report"
+        label = b',"proof":' if plural == "proofs" else b',"report":'
         truth = True
         running = genesis
         parts: list[str] = []
         for item_id, child, prev, dig in members:
-            payload = _v_member_payload(singular, item_id, child.json)
-            recomputed = hashlib.sha256(
-                running.encode("ascii") + payload.encode("utf-8")
-            ).hexdigest()
+            # Hash the member payload incrementally from the cached child
+            # bytes instead of concatenating a throwaway payload string.
+            hasher = hashlib.sha256(running.encode("ascii"))
+            hasher.update(b'{"id":')
+            hasher.update(_vjs(item_id).encode("utf-8"))
+            hasher.update(label)
+            hasher.update(child.json.encode("utf-8"))
+            hasher.update(b"}")
+            recomputed = hasher.hexdigest()
             parts.append(
                 '{"id":' + _vjs(item_id)
                 + ',"' + singular + '":'
@@ -8162,10 +7664,7 @@ class _VEngine:
         if root != running:
             truth = False
         node = _VNode()
-        node.key = (
-            tag, root,
-            tuple((i, n.key, p, d) for i, n, p, d in members),
-        )
+        node.key = key
         node.root = root
         node.members = members
         node.truth = truth
@@ -8179,7 +7678,7 @@ class _VEngine:
             + ",".join(parts) + "]}"
         )
         node.canonical = None
-        registry[node.key] = node
+        registry[key] = node
         return node
 
     # ------------------------------------------------------------ mbundle
@@ -8188,12 +7687,14 @@ class _VEngine:
             value, field, "reports", "report",
             lambda v, f: self.credential(v, f),
         )
-        key = ("mbundle", root, tuple((i, n.key, p, d) for i, n, p, d in members))
+        key = _VKey(
+            ("mbundle", root, tuple((i, n.key, p, d) for i, n, p, d in members))
+        )
         node = self.mbundle.get(key)
         if node is not None:
             return node
         return self._assemble_bundle(
-            "mbundle", self.mbundle, root, members, "reports",
+            "mbundle", self.mbundle, key, root, members, "reports",
             _MATRIX_BUNDLE_GENESIS,
         )
 
@@ -8207,12 +7708,15 @@ class _VEngine:
         root, members = self._bundle_members(
             value, field, "proofs", "proof", proof_parse
         )
-        key = (tag, root, tuple((i, n.key, p, d) for i, n, p, d in members))
+        key = _VKey(
+            (tag, root, tuple((i, n.key, p, d) for i, n, p, d in members))
+        )
         node = registry.get(key)
         if node is not None:
             return node
         return self._assemble_bundle(
-            tag, registry, root, members, "proofs", _CHECKPOINT_BUNDLE_GENESIS
+            tag, registry, key, root, members, "proofs",
+            _CHECKPOINT_BUNDLE_GENESIS
         )
 
     # -------------------------------------------------------------- diffs
@@ -8318,35 +7822,27 @@ class _VEngine:
             )
         return entries, seen == expected
 
-    def _assemble_diff(self, tag, registry, before_root, after_root, digest,
-                       before, after, entries):
-        change_parts: list[str] = []
-        for _id, kind, bn, an in entries:
-            change_parts.append(
-                '{"id":' + _vjs(_id)
-                + ',"kind":' + _vjs(kind)
-                + ',"before":' + ("null" if bn is None else bn.json)
-                + ',"after":' + ("null" if an is None else an.json)
-                + "}"
+    def _assemble_diff(self, tag, registry, key, before_root, after_root,
+                       digest, before, after, entries, five=None):
+        if five is None:
+            change_parts: list[str] = []
+            for _id, kind, bn, an in entries:
+                change_parts.append(
+                    '{"id":' + _vjs(_id)
+                    + ',"kind":' + _vjs(kind)
+                    + ',"before":' + ("null" if bn is None else bn.json)
+                    + ',"after":' + ("null" if an is None else an.json)
+                    + "}"
+                )
+            five = (
+                '{"before_root":' + _vjs(before_root)
+                + ',"after_root":' + _vjs(after_root)
+                + ',"before":' + before.json
+                + ',"after":' + after.json
+                + ',"changes":[' + ",".join(change_parts) + "]}"
             )
-        five = (
-            '{"before_root":' + _vjs(before_root)
-            + ',"after_root":' + _vjs(after_root)
-            + ',"before":' + before.json
-            + ',"after":' + after.json
-            + ',"changes":[' + ",".join(change_parts) + "]}"
-        )
         node = _VNode()
-        node.key = (
-            tag,
-            before_root, after_root, digest,
-            before.key, after.key,
-            tuple(
-                (i, k, None if bn is None else bn.key,
-                 None if an is None else an.key)
-                for i, k, bn, an in entries
-            ),
-        )
+        node.key = key
         node.root = before_root
         node.root_after = after_root
         node.digest = digest
@@ -8382,7 +7878,7 @@ class _VEngine:
             ),
         )
         node.canonical = None
-        registry[node.key] = node
+        registry[key] = node
         return node, five
 
     def _parse_diff(self, tag, registry, value, field, bundle_parse,
@@ -8407,19 +7903,22 @@ class _VEngine:
             value["changes"], before.members, after.members,
             f"{field}.changes", side_parse, strict,
         )
-        key = (
-            tag, before_root, after_root, digest, before.key, after.key,
-            tuple(
-                (i, k, None if bn is None else bn.key,
-                 None if an is None else an.key)
-                for i, k, bn, an in entries
-            ),
+        key = _VKey(
+            (
+                tag, before_root, after_root, digest, before.key, after.key,
+                tuple(
+                    (i, k, None if bn is None else bn.key,
+                     None if an is None else an.key)
+                    for i, k, bn, an in entries
+                ),
+            )
         )
         node = registry.get(key)
         if node is not None:
             return node
         node, five = self._assemble_diff(
-            tag, registry, before_root, after_root, digest, before, after, entries
+            tag, registry, key, before_root, after_root, digest,
+            before, after, entries,
         )
         recomputed = hashlib.sha256(five.encode("utf-8")).hexdigest()
         sides_ok = all(
@@ -8495,13 +7994,16 @@ class _VEngine:
             + ',"changes":[' + ",".join(change_parts) + "]}"
         )
         digest = hashlib.sha256(five.encode("utf-8")).hexdigest()
-        full_key = (tag, before.root, after.root, digest, before.key, after.key,
-                    change_keys)
+        full_key = _VKey(
+            (tag, before.root, after.root, digest, before.key, after.key,
+             change_keys)
+        )
         existing = registry.get(full_key)
         if existing is not None:
             return existing
         node, _five = self._assemble_diff(
-            tag, registry, before.root, after.root, digest, before, after, entries
+            tag, registry, full_key, before.root, after.root, digest,
+            before, after, entries, five=five,
         )
         node.truth = True
         node.complete = True
@@ -8576,12 +8078,14 @@ class _VEngine:
             rows.append((at, bundle, diff, prev, dig))
             previous_at = at
 
-        key = (
-            tag, start, end, anchor, commitment,
-            tuple(
-                (at, b.key, None if d is None else d.key, p, h)
-                for at, b, d, p, h in rows
-            ),
+        key = _VKey(
+            (
+                tag, start, end, anchor, commitment,
+                tuple(
+                    (at, b.key, None if d is None else d.key, p, h)
+                    for at, b, d, p, h in rows
+                ),
+            )
         )
         node = registry.get(key)
         if node is not None:
@@ -8608,15 +8112,19 @@ class _VEngine:
                     )
                 if diff.json != generated.json:
                     truth = False
-            stage_payload = (
-                '{"at":' + _vjs(at)
-                + ',"bundle":' + bundle.json
-                + ',"diff":' + ("null" if diff is None else diff.json)
-                + "}"
+            # Hash the stage payload incrementally from the cached child
+            # bytes instead of concatenating a throwaway payload string.
+            hasher = hashlib.sha256(running.encode("ascii"))
+            hasher.update(b'{"at":')
+            hasher.update(_vjs(at).encode("utf-8"))
+            hasher.update(b',"bundle":')
+            hasher.update(bundle.json.encode("utf-8"))
+            hasher.update(b',"diff":')
+            hasher.update(
+                b"null" if diff is None else diff.json.encode("utf-8")
             )
-            recomputed = hashlib.sha256(
-                running.encode("ascii") + stage_payload.encode("utf-8")
-            ).hexdigest()
+            hasher.update(b"}")
+            recomputed = hasher.hexdigest()
             if prev != running or dig != recomputed:
                 truth = False
             running = recomputed
@@ -8649,6 +8157,8 @@ class _VEngine:
         node = _VNode()
         node.key = key
         node.truth = truth
+        node.members = rows
+        node.stage_parts = stage_parts
         node.json = (
             '{"start":' + _vjs(start)
             + ',"end":' + _vjs(end)
@@ -8692,3 +8202,213 @@ class _VEngine:
 
     def top_parse_diff(self, value: Any, field: str) -> _VNode:
         return self.proof_diff(2, value, field)
+
+    # --------------------------------------------------------- generators
+    def build_chain(self, level: int, stages: Any, field: str = "stages") -> str:
+        """Generate a ``root, stages`` chain report as canonical JSON text.
+
+        Every stage bundle is parsed through the value engine (structural
+        and embedded-proof checks) and must recompute as true; the adjacent
+        diffs reuse the parsed bundle nodes directly, so no proof is
+        normalized or recomputed twice. ``level`` is -1 for matrix bundle
+        evolution, 0 for the checkpoint chain, and 1 for the chain window
+        proof bundle evolution.
+        """
+        genesis, bundle_parse, diff_level = {
+            -1: (
+                _MATRIX_BUNDLE_EVOLUTION_GENESIS,
+                self.matrix_bundle,
+                -1,
+            ),
+            0: (
+                _CHECKPOINT_CHAIN_GENESIS,
+                lambda v, f: self.proof_bundle(0, v, f),
+                0,
+            ),
+            1: (
+                _CHECKPOINT_CHAIN_BUNDLE_EVOLUTION_GENESIS,
+                lambda v, f: self.proof_bundle(1, v, f),
+                1,
+            ),
+        }[level]
+        if not isinstance(stages, list) or not stages:
+            raise ValueError(
+                f"{field} must be a non-empty list of {{at, bundle}} dicts"
+            )
+        rows: list[tuple[str, _VNode]] = []
+        previous_at: str | None = None
+        for index, stage in enumerate(stages):
+            sf = f"{field}[{index}]"
+            if not isinstance(stage, dict) or set(stage) != {"at", "bundle"}:
+                raise ValueError(
+                    f"{sf} must be a dict with exactly the keys at, bundle"
+                )
+            at = _check_time(stage["at"], f"{sf}.at")
+            if previous_at is not None and at <= previous_at:
+                raise ValueError(
+                    f"{sf}.at must be strictly greater than the preceding at"
+                )
+            node = bundle_parse(stage["bundle"], f"{sf}.bundle")
+            if not node.truth:
+                raise ValueError(
+                    f"{sf}.bundle root or hash chain does not verify"
+                )
+            rows.append((at, node))
+            previous_at = at
+
+        previous = genesis
+        prior: _VNode | None = None
+        parts: list[str] = []
+        for at, node in rows:
+            diff_node = (
+                None if prior is None else self.generate_diff(diff_level, prior, node)
+            )
+            payload = (
+                '{"at":' + _vjs(at)
+                + ',"bundle":' + node.json
+                + ',"diff":' + ("null" if diff_node is None else diff_node.json)
+                + "}"
+            )
+            digest = hashlib.sha256(
+                previous.encode("ascii") + payload.encode("utf-8")
+            ).hexdigest()
+            parts.append(
+                payload[:-1]
+                + ',"previous":' + _vjs(previous)
+                + ',"digest":' + _vjs(digest) + "}"
+            )
+            previous = digest
+            prior = node
+        return '{"root":' + _vjs(previous) + ',"stages":[' + ",".join(parts) + "]}"
+
+    def _report_node(
+        self, proof_parse: Any, genesis: str, report: Any, field: str
+    ) -> _VNode:
+        """Parse a ``root, stages`` chain report into a truth-checked node.
+
+        The report is validated by the same proof-row machinery as a window
+        proof covering every stage with the genesis anchor and the declared
+        root as commitment: exact key sets, times, ordering, embedded
+        bundles and adjacent diffs are structural checks (violations raise
+        ``ValueError``), and any false proof, chain link, diff, stage
+        digest, or root also raises ``ValueError`` here because generators
+        never emit partial results.
+        """
+        if not isinstance(report, dict) or set(report) != {"root", "stages"}:
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys root, stages"
+            )
+        root = _check_hex64(report["root"], f"{field}.root")
+        raw_stages = report["stages"]
+        if not isinstance(raw_stages, list) or not raw_stages:
+            raise ValueError(f"{field}.stages must be a non-empty list")
+        first, last = raw_stages[0], raw_stages[-1]
+        synthetic = {
+            "start": first.get("at") if isinstance(first, dict) else None,
+            "end": last.get("at") if isinstance(last, dict) else None,
+            "anchor": genesis,
+            "stages": raw_stages,
+            "commitment": root,
+        }
+        node = proof_parse(synthetic, field)
+        if not node.truth:
+            raise ValueError(
+                f"{field} must be a fully verifiable chain report"
+            )
+        return node
+
+    def cut_window(
+        self,
+        level: int,
+        report: Any,
+        start: str,
+        end: str,
+        field: str = "report",
+    ) -> str:
+        """Cut a stage-window proof out of a fully verified chain report.
+
+        The report is parsed and recomputed once; the returned canonical
+        JSON text reuses the parsed stage bytes, so window stages are not
+        normalized again. ``level`` is -1 for matrix bundle evolution
+        reports, 0 for checkpoint chain reports, and 1 for chain window
+        proof bundle evolution reports.
+        """
+        genesis, proof_parse = {
+            -1: (_MATRIX_BUNDLE_EVOLUTION_GENESIS, self.evolution_proof),
+            0: (_CHECKPOINT_CHAIN_GENESIS, self.chain_proof),
+            1: (
+                _CHECKPOINT_CHAIN_BUNDLE_EVOLUTION_GENESIS,
+                self.bundle_evolution_proof,
+            ),
+        }[level]
+        node = self._report_node(proof_parse, genesis, report, field)
+        rows = node.members
+        ats = [row[0] for row in rows]
+        if start not in ats:
+            raise ValueError(
+                "start must be the at of a stage that exists in report"
+            )
+        if end not in ats:
+            raise ValueError(
+                "end must be the at of a stage that exists in report"
+            )
+        first_index = ats.index(start)
+        last_index = ats.index(end)
+        anchor = genesis if first_index == 0 else rows[first_index - 1][4]
+        return (
+            '{"start":' + _vjs(start)
+            + ',"end":' + _vjs(end)
+            + ',"anchor":' + _vjs(anchor)
+            + ',"stages":['
+            + ",".join(node.stage_parts[first_index:last_index + 1])
+            + '],"commitment":' + _vjs(rows[last_index][4]) + "}"
+        )
+
+    def build_bundle(self, level: int, items: Any, field: str = "items") -> str:
+        """Generate a ``root, proofs`` bundle as canonical JSON text.
+
+        Every ``{id, proof}`` item's proof is parsed through the value
+        engine and must recompute as true; equal-valued proofs collapse to
+        one node, so a repeated proof is normalized and recomputed only
+        once. ``level`` is 0 for evolution checkpoint proofs, 1 for chain
+        window proofs, and 2 for bundle evolution window proofs.
+        """
+        proof_parse = (
+            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof
+        )[level]
+        if not isinstance(items, list) or not items:
+            raise ValueError(
+                f"{field} must be a non-empty list of {{id, proof}} dicts"
+            )
+        parsed: list[tuple[str, _VNode]] = []
+        seen: set[str] = set()
+        for index, item in enumerate(items):
+            sf = f"{field}[{index}]"
+            if not isinstance(item, dict) or set(item) != {"id", "proof"}:
+                raise ValueError(
+                    f"{sf} must be a dict with exactly the keys id, proof"
+                )
+            item_id = _check_non_empty_str(item["id"], f"{sf}.id")
+            if item_id in seen:
+                raise ValueError(f"{field} contains a duplicate id: {item_id!r}")
+            seen.add(item_id)
+            node = proof_parse(item["proof"], f"{sf}.proof")
+            if not node.truth:
+                raise ValueError(f"{sf}.proof does not recompute as true")
+            parsed.append((item_id, node))
+        parsed.sort(key=lambda member: member[0])
+        previous = _CHECKPOINT_BUNDLE_GENESIS
+        parts: list[str] = []
+        for item_id, node in parsed:
+            payload = _v_member_payload("proof", item_id, node.json)
+            digest = hashlib.sha256(
+                previous.encode("ascii") + payload.encode("utf-8")
+            ).hexdigest()
+            parts.append(
+                '{"id":' + _vjs(item_id)
+                + ',"proof":' + node.json
+                + ',"previous":' + _vjs(previous)
+                + ',"digest":' + _vjs(digest) + "}"
+            )
+            previous = digest
+        return '{"root":' + _vjs(previous) + ',"proofs":[' + ",".join(parts) + "]}"
