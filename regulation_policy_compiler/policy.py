@@ -5983,73 +5983,21 @@ def checkpoint_chain_checkpoint_bundle_diff(
     results regardless of input dict key order, and no two levels share a
     mutable container.
     """
-    before_root, before_members = (
-        _normalize_verified_checkpoint_chain_checkpoint_bundle(
-            before, "before"
-        )
-    )
-    after_root, after_members = (
-        _normalize_verified_checkpoint_chain_checkpoint_bundle(after, "after")
-    )
-    if not _chain_checkpoint_bundle_is_truthful(before_root, before_members):
+    engine = _VEngine()
+    # Both sides complete every structural and embedded-proof check first;
+    # a false digest is carried as data, so parsing the second side still
+    # runs in full when the first side merely carries a false summary.
+    before_node = engine.proof_bundle(1, before, "before")
+    after_node = engine.proof_bundle(1, after, "after")
+    if not before_node.truth:
         raise ValueError("before bundle root or hash chain does not verify")
-    if not _chain_checkpoint_bundle_is_truthful(after_root, after_members):
+    if not after_node.truth:
         raise ValueError("after bundle root or hash chain does not verify")
-
-    before_bundle = _canonical_checkpoint_bundle_from_members(
-        before_root, before_members
-    )
-    after_bundle = _canonical_checkpoint_bundle_from_members(
-        after_root, after_members
-    )
-    before_by_id = {member["id"]: member for member in before_members}
-    after_by_id = {member["id"]: member for member in after_members}
-
-    changes: list[dict[str, Any]] = []
-    for member_id in sorted(set(before_by_id) | set(after_by_id)):
-        before_member = before_by_id.get(member_id)
-        after_member = after_by_id.get(member_id)
-        if (
-            before_member is not None
-            and after_member is not None
-            and before_member["proof"] == after_member["proof"]
-        ):
-            continue
-        if before_member is None:
-            kind = "added"
-        elif after_member is None:
-            kind = "removed"
-        else:
-            kind = "changed"
-        changes.append(
-            {
-                "id": member_id,
-                "kind": kind,
-                "before": (
-                    copy.deepcopy(before_member["proof"])
-                    if before_member is not None
-                    else None
-                ),
-                "after": (
-                    copy.deepcopy(after_member["proof"])
-                    if after_member is not None
-                    else None
-                ),
-            }
-        )
-
-    payload = {
-        "before_root": before_root,
-        "after_root": after_root,
-        "before": before_bundle,
-        "after": after_bundle,
-        "changes": changes,
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
-    result["digest"] = digest
-    return result
+    diff_node = engine.generate_diff(1, before_node, after_node)
+    # Rebuild the result from the cached canonical compact bytes: one parse
+    # yields a fully independent tree (the two bundles and every change side
+    # are distinct containers, no level shared) without re-walking objects.
+    return json.loads(diff_node.json)
 
 
 def _normalize_chain_checkpoint_diff_change_proof(
@@ -6333,12 +6281,12 @@ def verify_checkpoint_chain_checkpoint_bundle_diff(
     the digest, or either id set after code point sorting) does not match;
     otherwise ``True``.
     """
-    content, before_members, after_members, changes, changes_complete = (
-        _normalize_verified_chain_checkpoint_diff_report(report, "report")
-    )
-    before_root = content["before_root"]
-    after_root = content["after_root"]
-    digest = content["digest"]
+    engine = _VEngine()
+    # Structural and semantic validation of the whole report first; any
+    # structural, ordering, change-classification, or embedded-proof semantic
+    # violation raises ValueError, and a false declared summary is carried as
+    # data so it yields False only below.
+    content = engine.proof_diff(1, report, "report")
 
     if not isinstance(expected, dict) or set(expected) != set(
         _CHECKPOINT_CHAIN_BUNDLE_DIFF_EXPECTED_KEYS
@@ -6364,37 +6312,25 @@ def verify_checkpoint_chain_checkpoint_bundle_diff(
     # Both inputs have now passed every key-set, type, digest-format,
     # ordering, and embedded-proof semantic check. Only now recompute and
     # compare; any mismatch yields False rather than raising.
-    if not _chain_checkpoint_bundle_is_truthful(before_root, before_members):
+    #
+    # Each deep window proof is fully recomputed once: the bundle members and
+    # every non-null change side resolve equal values to the same engine node
+    # (value key), so truth is computed on the first encounter and reused.
+    if not content.truth:
         return False
-    if not _chain_checkpoint_bundle_is_truthful(after_root, after_members):
+    if not content.complete:
         return False
-    if not changes_complete:
-        return False
-    for change in changes:
-        for proof in (change["before"], change["after"]):
-            if proof is None:
-                continue
-            # The non-null change side is a standalone window proof: its
-            # boundaries, anchor, embedded bundles and diffs, and stage
-            # chain through its commitment must all recompute as true.
-            if not _checkpoint_chain_checkpoint_is_truthful(proof):
-                return False
-    payload = {
-        key: content[key] for key in _CHECKPOINT_CHAIN_BUNDLE_DIFF_REPORT_KEYS[:5]
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    recomputed_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    if digest != recomputed_digest:
-        return False
+    before_node = content.before_node
+    after_node = content.after_node
     if (
-        before_root != expected_before_root
-        or after_root != expected_after_root
-        or digest != expected_digest
+        content.root != expected_before_root
+        or content.root_after != expected_after_root
+        or content.digest != expected_digest
     ):
         return False
-    if {member["id"] for member in before_members} != set(expected_before_ids):
+    if {member[0] for member in before_node.members} != set(expected_before_ids):
         return False
-    if {member["id"] for member in after_members} != set(expected_after_ids):
+    if {member[0] for member in after_node.members} != set(expected_after_ids):
         return False
     return True
 

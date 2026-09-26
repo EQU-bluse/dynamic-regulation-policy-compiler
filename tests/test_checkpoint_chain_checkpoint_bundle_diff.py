@@ -1,4 +1,5 @@
 import copy
+import functools
 import hashlib
 import json
 
@@ -141,33 +142,60 @@ def _chain():
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _chain_cached():
+    return _chain()
+
+
 def _window_proof(start, end):
-    return checkpoint_chain_checkpoint(_chain(), start, end)
+    return copy.deepcopy(_window_proof_raw(start, end))
+
+
+@functools.lru_cache(maxsize=None)
+def _window_proof_raw(start, end):
+    return checkpoint_chain_checkpoint(_chain_cached(), start, end)
+
+
+@functools.lru_cache(maxsize=1)
+def _bundle_before_raw():
+    return checkpoint_chain_checkpoint_bundle(
+        [
+            {"id": "alpha", "proof": _window_proof_raw(RT1, RT1)},
+            {"id": "beta", "proof": _window_proof_raw(RT2, RT3)},
+        ]
+    )
 
 
 def _bundle_before():
+    return copy.deepcopy(_bundle_before_raw())
+
+
+@functools.lru_cache(maxsize=1)
+def _bundle_after_raw():
+    # alpha unchanged, beta present with a different window proof, and a new
+    # CJK member is added.
     return checkpoint_chain_checkpoint_bundle(
         [
-            {"id": "alpha", "proof": _window_proof(RT1, RT1)},
-            {"id": "beta", "proof": _window_proof(RT2, RT3)},
+            {"id": "alpha", "proof": _window_proof_raw(RT1, RT1)},
+            {"id": "beta", "proof": _window_proof_raw(RT2, RT2)},
+            {"id": "伽马", "proof": _window_proof_raw(RT3, RT3)},
         ]
     )
 
 
 def _bundle_after():
-    # alpha unchanged, beta present with a different window proof, and a new
-    # CJK member is added.
-    return checkpoint_chain_checkpoint_bundle(
-        [
-            {"id": "alpha", "proof": _window_proof(RT1, RT1)},
-            {"id": "beta", "proof": _window_proof(RT2, RT2)},
-            {"id": "伽马", "proof": _window_proof(RT3, RT3)},
-        ]
+    return copy.deepcopy(_bundle_after_raw())
+
+
+@functools.lru_cache(maxsize=1)
+def _diff_raw():
+    return checkpoint_chain_checkpoint_bundle_diff(
+        _bundle_before_raw(), _bundle_after_raw()
     )
 
 
 def _diff():
-    return checkpoint_chain_checkpoint_bundle_diff(_bundle_before(), _bundle_after())
+    return copy.deepcopy(_diff_raw())
 
 
 # ---------------------------------------------------------------- structure
