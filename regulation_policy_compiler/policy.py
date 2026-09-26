@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextvars
 import copy
+import functools
+import gc
 import hashlib
 import json
 import re
@@ -13,6 +16,300 @@ from typing import Any
 _TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _RULE_KEYS = frozenset({"id", "ver", "source", "priority", "from", "to", "when", "result"})
 _SOURCES = ("law", "org")
+
+
+# --------------------------------------------------------------------------
+# Proof memo
+#
+# The window-proof bundle capabilities normalize and recompute the same deep
+# credential many times: a window proof appears as a bundle member, as a
+# non-null change side, and inside adjacent diffs, and every layer
+# re-normalizes everything below it. The memo gives each top-level call one
+# shared cache so every unique equal-valued deep proof is normalized and
+# recomputed at most once per call, and so canonical key order, member
+# digests, stage chains, and diff digests reuse the intermediate values
+# already computed for equal content. A bounded process-level store carries
+# the same content-keyed results across calls, so repeated verification of
+# equal-valued reports does not redo work already proven for that content.
+#
+# Cache identity is the SHA-256 of the canonical compact JSON (sorted keys),
+# never object identity: equal-valued inputs share one identity regardless
+# of dict key order, and different values never merge. An ``id`` shortcut
+# only avoids re-serializing the *same* object within one call, and the
+# strong reference held alongside keeps that id valid while the shortcut
+# lives, so cache identity is established with at most one serialization
+# per distinct object per call. Cached results are treated as immutable
+# everywhere; every public result is still assembled from fresh deep
+# copies, so no two returned levels share a mutable container.
+
+
+def _content_key(value: Any) -> str | None:
+    """Serialize a JSON-like value to its content identity, or ``None``.
+
+    The identity is the lowercase hexadecimal SHA-256 of the canonical
+    compact JSON (``sort_keys=True``, ``ensure_ascii=False``, no spaces, no
+    newline). Anything outside the JSON data model is uncacheable and
+    reported as ``None`` so the caller computes (and raises) normally.
+    """
+    try:
+        canonical = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class _ProofMemo:
+    """Normalization and recomputation cache for one top-level call."""
+
+    __slots__ = ("object_keys", "values")
+
+    def __init__(self) -> None:
+        # id(obj) -> (obj, content key); the strong reference keeps the id
+        # (and therefore the shortcut) valid for the memo's lifetime.
+        self.object_keys: dict[int, tuple[Any, str]] = {}
+        self.values: dict[Any, Any] = {}
+
+    def key(self, value: Any) -> str | None:
+        """Return the content identity of ``value``, or ``None``.
+
+        Scalars are keyed directly; each container is serialized at most
+        once per call no matter how many memoized layers inspect it.
+        """
+        if isinstance(value, (dict, list)):
+            oid = id(value)
+            entry = self.object_keys.get(oid)
+            if entry is not None and entry[0] is value:
+                return entry[1]
+            key = _content_key(value)
+            if key is not None:
+                self.object_keys[oid] = (value, key)
+            return key
+        return _content_key(value)
+
+    def get(self, cache_key: Any) -> Any:
+        """Look up ``cache_key`` in this call's values, then the store.
+
+        A persistent hit held as canonical JSON text is decoded once and
+        kept as this call's object, so each unique value is deserialized at
+        most once per call.
+        """
+        if cache_key in self.values:
+            return self.values[cache_key]
+        stored = _PERSISTENT_VALUES.get(cache_key, _MISSING)
+        if type(stored) is str and stored.startswith(_JSON_PREFIX):
+            result = json.loads(stored[len(_JSON_PREFIX):])
+            self.values[cache_key] = result
+            return result
+        return stored
+
+    def get_fresh_copy(self, cache_key: Any) -> Any:
+        """Look up ``cache_key`` and return an independent copy of the hit.
+
+        Used by public entry points whose callers may mutate the result:
+        the cached object itself never escapes.
+        """
+        if cache_key in self.values:
+            return _json_deepcopy(self.values[cache_key])
+        stored = _PERSISTENT_VALUES.get(cache_key, _MISSING)
+        if stored is _MISSING:
+            return _MISSING
+        if type(stored) is str and stored.startswith(_JSON_PREFIX):
+            return json.loads(stored[len(_JSON_PREFIX):])
+        if not isinstance(stored, (dict, list, tuple)):
+            return stored
+        return _json_deepcopy(stored)
+
+    def store(self, cache_key: Any, result: Any) -> None:
+        """Cache ``result`` for this call and for later calls."""
+        self.values[cache_key] = result
+        if len(_PERSISTENT_VALUES) >= _PERSISTENT_VALUES_LIMIT:
+            _PERSISTENT_VALUES.clear()
+        _PERSISTENT_VALUES[cache_key] = result
+
+    def store_json(self, cache_key: Any, result: Any) -> None:
+        """Cache ``result`` persistently as canonical JSON text.
+
+        The persistent entry is one atomic string, so full garbage
+        collections never re-walk the result's containers, and decoding it
+        on a hit already produces an independent object. The object itself
+        is not kept: the caller's fresh result may be returned directly.
+        """
+        if len(_PERSISTENT_VALUES) >= _PERSISTENT_VALUES_LIMIT:
+            _PERSISTENT_VALUES.clear()
+        _PERSISTENT_VALUES[cache_key] = _JSON_PREFIX + json.dumps(
+            result, ensure_ascii=False, separators=(",", ":")
+        )
+
+
+# Process-level content-keyed store shared across top-level calls. Entries
+# are keyed by content only, so a mutated input simply misses; results are
+# immutable by convention and never escape without a deep copy. The bound
+# keeps memory flat under adversarial churn; eviction only costs a recompute.
+_PERSISTENT_VALUES: dict[Any, Any] = {}
+_PERSISTENT_VALUES_LIMIT = 4096
+_MISSING = object()
+_JSON_PREFIX = "\x00json:"
+
+# The verification workload allocates millions of short-lived acyclic
+# containers (canonical copies and compact-JSON encodings) above a large
+# long-lived persistent cache. Under the default cyclic-GC thresholds every
+# generation collection re-walks that whole cache many times per call, which
+# dominates the runtime of the deep proof capabilities without doing any
+# useful collection: the data involved is acyclic JSON, so reference
+# counting alone reclaims it. Relax the thresholds so full collections stay
+# rare; a host application that already chose its own GC policy (anything
+# but the CPython default) is left untouched.
+if gc.get_threshold() == (700, 10, 10):
+    gc.set_threshold(10000, 100, 100)
+
+
+def _json_deepcopy(value: Any) -> Any:
+    """Independent deep copy of a canonical JSON-only structure.
+
+    Only used for structures this module itself built (canonical reports,
+    bundles, and diff results contain nothing but dicts, lists, strings,
+    numbers, booleans, and ``None``), where a JSON round-trip preserves
+    every value and key order exactly, breaks all internal sharing, and is
+    much faster than :func:`copy.deepcopy` on deep proof trees.
+    """
+    return json.loads(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _call_cache_key(memo: _ProofMemo | None, layer: str, args: tuple) -> Any:
+    """Content identity of one pure public call, or ``None``.
+
+    Equal-valued arguments map to one cached result; the cached object is
+    never handed out directly, so every caller still receives an
+    independent deep copy.
+    """
+    if memo is None:
+        return None
+    parts = []
+    for arg in args:
+        key = memo.key(arg)
+        if key is None:
+            return None
+        parts.append(key)
+    return (layer, *parts)
+
+
+def _cached_public_result(layer: str) -> Any:
+    """Cache a pure public generator's result in the active memo.
+
+    The first call with a given content stores its fresh result and
+    receives an independent copy of it; later equal-valued calls receive a
+    copy of the stored result, so equal inputs still yield equal-valued
+    results and no two results share a mutable container.
+    """
+
+    def decorate(function: Any) -> Any:
+        @functools.wraps(function)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            memo = _ACTIVE_PROOF_MEMO.get()
+            cache_key = (
+                None if kwargs else _call_cache_key(memo, layer, args)
+            )
+            if cache_key is not None:
+                cached = memo.get_fresh_copy(cache_key)
+                if cached is not _MISSING:
+                    return cached
+            result = function(*args, **kwargs)
+            if cache_key is not None:
+                memo.store_json(cache_key, result)
+            return result
+
+        return wrapper
+
+    return decorate
+
+
+_ACTIVE_PROOF_MEMO: contextvars.ContextVar[_ProofMemo | None] = (
+    contextvars.ContextVar("proof_memo", default=None)
+)
+
+
+def _memo_scope(function: Any) -> Any:
+    """Run a public entry point with a proof memo active.
+
+    Nested calls reuse the already-active memo, so one top-level call shares
+    one cache across every layer; otherwise a fresh memo is created for the
+    duration of the call and dropped afterwards.
+    """
+
+    @functools.wraps(function)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _ACTIVE_PROOF_MEMO.get() is not None:
+            return function(*args, **kwargs)
+        token = _ACTIVE_PROOF_MEMO.set(_ProofMemo())
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _ACTIVE_PROOF_MEMO.reset(token)
+
+    return wrapper
+
+
+def _memoized_value(layer: str) -> Any:
+    """Cache a pure function of one inspected value in the active memo.
+
+    The cache key is the first positional argument's content identity;
+    remaining arguments (such as ``field`` labels used only in error
+    messages) do not affect the result. Only successful results are cached,
+    so invalid inputs keep raising from the underlying function.
+    """
+
+    def decorate(function: Any) -> Any:
+        @functools.wraps(function)
+        def wrapper(value: Any, *args: Any, **kwargs: Any) -> Any:
+            memo = _ACTIVE_PROOF_MEMO.get()
+            if memo is None:
+                return function(value, *args, **kwargs)
+            key = memo.key(value)
+            if key is None:
+                return function(value, *args, **kwargs)
+            cache_key = (layer, key)
+            cached = memo.get(cache_key)
+            if cached is not _MISSING:
+                return cached
+            result = function(value, *args, **kwargs)
+            memo.store(cache_key, result)
+            return result
+
+        return wrapper
+
+    return decorate
+
+
+def _memoized_args(layer: str) -> Any:
+    """Cache a pure function of several significant arguments in the memo."""
+
+    def decorate(function: Any) -> Any:
+        @functools.wraps(function)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            memo = _ACTIVE_PROOF_MEMO.get()
+            if memo is None or kwargs:
+                return function(*args, **kwargs)
+            parts = []
+            for arg in args:
+                key = memo.key(arg)
+                if key is None:
+                    return function(*args, **kwargs)
+                parts.append(key)
+            cache_key = (layer, *parts)
+            cached = memo.get(cache_key)
+            if cached is not _MISSING:
+                return cached
+            result = function(*args, **kwargs)
+            memo.store(cache_key, result)
+            return result
+
+        return wrapper
+
+    return decorate
 
 
 def _check_time(value: Any, field: str) -> str:
@@ -2402,6 +2699,7 @@ def _rebuild_matrix_from_schedule(
     return {"start": start, "end": end, "points": points}
 
 
+@_memoized_value("norm:matrix-attestation")
 def _check_verified_matrix_attestation(
     report: Any, field: str = "report"
 ) -> tuple[dict[str, Any], str, str, bool, str]:
@@ -2580,6 +2878,7 @@ def _validate_matrix_bundle_items(items: Any) -> list[tuple[str, Any]]:
     return members
 
 
+@_memoized_args("digest:matrix-bundle-member")
 def _matrix_bundle_member_digest(previous: str, item_id: str, report: Any) -> str:
     """Compute one bundle member digest.
 
@@ -2595,6 +2894,8 @@ def _matrix_bundle_member_digest(previous: str, item_id: str, report: Any) -> st
     ).hexdigest()
 
 
+@_memo_scope
+@_cached_public_result("gen:matrix-attestation-bundle")
 def decision_matrix_attestation_bundle(items: Any) -> dict[str, Any]:
     """Bind multiple decision matrix attestations into one verifiable bundle.
 
@@ -2661,6 +2962,7 @@ def _validate_matrix_bundle_report_ids(value: Any, field: str) -> list[str]:
     return ids
 
 
+@_memoized_value("norm:matrix-bundle")
 def _normalize_verified_matrix_bundle(
     report: Any, field: str = "report"
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -2737,6 +3039,7 @@ def _normalize_verified_matrix_bundle(
     return bundle_root, members
 
 
+@_memo_scope
 def verify_decision_matrix_attestation_bundle(report: Any, expected: Any) -> bool:
     """Verify a :func:`decision_matrix_attestation_bundle` by recomputation.
 
@@ -2829,6 +3132,7 @@ _MATRIX_BUNDLE_DIFF_EXPECTED_KEYS = (
 _MATRIX_BUNDLE_DIFF_KINDS = frozenset({"added", "removed", "changed"})
 
 
+@_memoized_args("truth:matrix-bundle")
 def _matrix_bundle_is_truthful(
     bundle_root: str, members: list[dict[str, Any]]
 ) -> bool:
@@ -2857,6 +3161,7 @@ def _matrix_bundle_is_truthful(
     return bundle_root == previous
 
 
+@_memoized_args("canon:matrix-bundle")
 def _canonical_bundle_from_members(
     bundle_root: str, members: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -2880,6 +3185,7 @@ def _matrix_member_content(member: dict[str, Any]) -> dict[str, Any]:
     return {key: member["report"][key] for key in _MATRIX_ATTEST_CONTENT_KEYS}
 
 
+@_memoized_value("sem:matrix-credential")
 def _matrix_credential_semantics(content: dict[str, Any]) -> dict[str, Any]:
     """Project a normalized matrix credential to its summary-free content.
 
@@ -2909,11 +3215,13 @@ def _matrix_credential_semantics(content: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_memoized_value("sem:matrix-member")
 def _matrix_member_semantics(member: dict[str, Any]) -> dict[str, Any]:
     """Summary-free semantic projection of a normalized bundle member."""
     return _matrix_credential_semantics(_matrix_member_content(member))
 
 
+@_memoized_value("sem:matrix-bundle")
 def _bundle_member_semantics(bundle: dict[str, Any]) -> list[tuple[str, Any]]:
     """Summary-free semantic projection of a canonical bundle.
 
@@ -2929,6 +3237,8 @@ def _bundle_member_semantics(bundle: dict[str, Any]) -> list[tuple[str, Any]]:
     ]
 
 
+@_memo_scope
+@_cached_public_result("diff:matrix-bundle")
 def matrix_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
     """Attest the difference between two decision matrix attestation bundles.
 
@@ -3022,7 +3332,7 @@ def matrix_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
     }
     canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
+    result = _json_deepcopy(payload)
     result["digest"] = digest
     return result
 
@@ -3258,6 +3568,7 @@ def _normalize_verified_matrix_diff_report(
     return content, before_members, after_members, change_entries
 
 
+@_memo_scope
 def verify_matrix_bundle_diff(report: Any, expected: Any) -> bool:
     """Verify a :func:`matrix_bundle_diff` report by recomputation.
 
@@ -3370,6 +3681,7 @@ _MATRIX_BUNDLE_EVOLUTION_EXPECTED_STAGE_KEYS = frozenset({"at", "root"})
 _MATRIX_BUNDLE_EVOLUTION_GENESIS = "0" * 64
 
 
+@_memoized_args("digest:matrix-evolution-stage")
 def _matrix_bundle_evolution_stage_digest(
     previous: str, at: str, bundle: dict[str, Any], diff: dict[str, Any] | None
 ) -> str:
@@ -3387,6 +3699,8 @@ def _matrix_bundle_evolution_stage_digest(
     ).hexdigest()
 
 
+@_memo_scope
+@_cached_public_result("gen:matrix-bundle-evolution")
 def matrix_bundle_evolution(stages: Any) -> dict[str, Any]:
     """Chain decision matrix attestation bundles across release stages.
 
@@ -3469,6 +3783,7 @@ def matrix_bundle_evolution(stages: Any) -> dict[str, Any]:
     return {"root": digest, "stages": result_stages}
 
 
+@_memoized_value("norm:matrix-bundle-evolution")
 def _normalize_verified_matrix_bundle_evolution(
     report: Any, field: str = "report"
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -3573,6 +3888,7 @@ def _normalize_verified_matrix_bundle_evolution(
     return root, normalized_stages
 
 
+@_memo_scope
 def verify_matrix_bundle_evolution(report: Any, expected: Any) -> bool:
     """Verify a :func:`matrix_bundle_evolution` report by recomputation.
 
@@ -3676,6 +3992,8 @@ _EVOLUTION_CHECKPOINT_EXPECTED_KEYS = frozenset(
 )
 
 
+@_memo_scope
+@_cached_public_result("gen:evolution-checkpoint")
 def evolution_checkpoint(report: Any, start: str, end: str) -> dict[str, Any]:
     """Cut a stage-window proof out of a full bundle evolution report.
 
@@ -3754,6 +4072,7 @@ def evolution_checkpoint(report: Any, start: str, end: str) -> dict[str, Any]:
     }
 
 
+@_memoized_value("norm:evolution-checkpoint")
 def _normalize_verified_evolution_checkpoint(
     proof: Any, field: str = "proof"
 ) -> dict[str, Any]:
@@ -3903,6 +4222,7 @@ def _normalize_verified_evolution_checkpoint(
     }
 
 
+@_memo_scope
 def verify_evolution_checkpoint(proof: Any, expected: Any) -> bool:
     """Verify a :func:`evolution_checkpoint` proof without the outside report.
 
@@ -4042,6 +4362,7 @@ def _canonical_checkpoint_from_normalized(
     }
 
 
+@_memoized_args("digest:checkpoint-bundle-member")
 def _checkpoint_bundle_member_digest(
     previous: str, item_id: str, proof: dict[str, Any]
 ) -> str:
@@ -4059,6 +4380,7 @@ def _checkpoint_bundle_member_digest(
     ).hexdigest()
 
 
+@_memoized_args("truth:evolution-checkpoint")
 def _checkpoint_is_truthful(proof: dict[str, Any]) -> bool:
     """Recompute a canonical checkpoint proof against its own declarations.
 
@@ -4078,6 +4400,8 @@ def _checkpoint_is_truthful(proof: dict[str, Any]) -> bool:
     )
 
 
+@_memo_scope
+@_cached_public_result("gen:evolution-checkpoint-bundle")
 def evolution_checkpoint_bundle(items: Any) -> dict[str, Any]:
     """Bind multiple evolution checkpoint proofs into one verifiable bundle.
 
@@ -4149,6 +4473,7 @@ def evolution_checkpoint_bundle(items: Any) -> dict[str, Any]:
     return {"root": digest, "proofs": proofs}
 
 
+@_memoized_value("norm:checkpoint-bundle")
 def _normalize_verified_checkpoint_bundle(
     report: Any, field: str = "report"
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -4217,6 +4542,7 @@ def _normalize_verified_checkpoint_bundle(
     return bundle_root, members
 
 
+@_memo_scope
 def verify_evolution_checkpoint_bundle(report: Any, expected: Any) -> bool:
     """Verify an :func:`evolution_checkpoint_bundle` by recomputation.
 
@@ -4305,6 +4631,7 @@ _CHECKPOINT_BUNDLE_DIFF_EXPECTED_KEYS = (
 _CHECKPOINT_BUNDLE_DIFF_KINDS = frozenset({"added", "removed", "changed"})
 
 
+@_memoized_args("truth:checkpoint-bundle")
 def _checkpoint_bundle_is_truthful(
     bundle_root: str, members: list[dict[str, Any]]
 ) -> bool:
@@ -4329,6 +4656,7 @@ def _checkpoint_bundle_is_truthful(
     return bundle_root == previous
 
 
+@_memoized_args("canon:checkpoint-bundle")
 def _canonical_checkpoint_bundle_from_members(
     bundle_root: str, members: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -4347,6 +4675,7 @@ def _canonical_checkpoint_bundle_from_members(
     }
 
 
+@_memoized_value("sem:checkpoint-diff")
 def _checkpoint_diff_semantics(diff: dict[str, Any] | None) -> Any:
     """Summary-free semantic projection of a normalized stage diff.
 
@@ -4380,6 +4709,7 @@ def _checkpoint_diff_semantics(diff: dict[str, Any] | None) -> Any:
     }
 
 
+@_memoized_value("sem:checkpoint-proof")
 def _checkpoint_proof_semantics(proof: dict[str, Any]) -> dict[str, Any]:
     """Summary-free semantic projection of a canonical checkpoint proof.
 
@@ -4405,6 +4735,8 @@ def _checkpoint_proof_semantics(proof: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_memo_scope
+@_cached_public_result("diff:evolution-checkpoint-bundle")
 def evolution_checkpoint_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
     """Attest the difference between two evolution checkpoint bundles.
 
@@ -4502,7 +4834,7 @@ def evolution_checkpoint_bundle_diff(before: Any, after: Any) -> dict[str, Any]:
     }
     canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
+    result = _json_deepcopy(payload)
     result["digest"] = digest
     return result
 
@@ -4738,6 +5070,7 @@ def _normalize_verified_checkpoint_diff_report(
     return content, before_members, after_members, change_entries, changes_complete
 
 
+@_memo_scope
 def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
     """Verify an :func:`evolution_checkpoint_bundle_diff` report by recomputation.
 
@@ -4850,6 +5183,7 @@ _CHECKPOINT_CHAIN_EXPECTED_STAGE_KEYS = frozenset(
 _CHECKPOINT_CHAIN_GENESIS = "0" * 64
 
 
+@_memoized_args("digest:checkpoint-chain-stage")
 def _checkpoint_chain_stage_digest(
     previous: str, at: str, bundle: dict[str, Any], diff: dict[str, Any] | None
 ) -> str:
@@ -4867,6 +5201,7 @@ def _checkpoint_chain_stage_digest(
     ).hexdigest()
 
 
+@_memoized_value("sem:checkpoint-bundle")
 def _checkpoint_bundle_semantics(bundle: dict[str, Any]) -> list[tuple[str, Any]]:
     """Summary-free semantic projection of a canonical checkpoint bundle.
 
@@ -4882,6 +5217,8 @@ def _checkpoint_bundle_semantics(bundle: dict[str, Any]) -> list[tuple[str, Any]
     ]
 
 
+@_memo_scope
+@_cached_public_result("gen:checkpoint-chain")
 def checkpoint_chain(stages: Any) -> dict[str, Any]:
     """Chain evolution checkpoint bundles across release stages.
 
@@ -4971,6 +5308,7 @@ def checkpoint_chain(stages: Any) -> dict[str, Any]:
     return {"root": digest, "stages": result_stages}
 
 
+@_memoized_value("norm:checkpoint-chain")
 def _normalize_verified_checkpoint_chain(
     report: Any, field: str = "report"
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -5084,6 +5422,7 @@ def _normalize_verified_checkpoint_chain(
     return root, normalized_stages
 
 
+@_memo_scope
 def verify_checkpoint_chain(report: Any, expected: Any) -> bool:
     """Verify a :func:`checkpoint_chain` report by recomputation.
 
@@ -5204,6 +5543,8 @@ _CHECKPOINT_CHAIN_CHECKPOINT_EXPECTED_KEYS = frozenset(
 )
 
 
+@_memo_scope
+@_cached_public_result("gen:checkpoint-chain-checkpoint")
 def checkpoint_chain_checkpoint(
     report: Any, start: str, end: str
 ) -> dict[str, Any]:
@@ -5290,6 +5631,7 @@ def checkpoint_chain_checkpoint(
     }
 
 
+@_memoized_value("norm:chain-checkpoint")
 def _normalize_verified_checkpoint_chain_checkpoint(
     proof: Any, field: str = "proof"
 ) -> dict[str, Any]:
@@ -5460,6 +5802,7 @@ def _normalize_verified_checkpoint_chain_checkpoint(
     }
 
 
+@_memo_scope
 def verify_checkpoint_chain_checkpoint(
     proof: Any, expected: Any
 ) -> bool:
@@ -5626,6 +5969,7 @@ def _canonical_checkpoint_chain_checkpoint_from_normalized(
     }
 
 
+@_memoized_args("truth:chain-checkpoint")
 def _checkpoint_chain_checkpoint_is_truthful(proof: dict[str, Any]) -> bool:
     """Recompute a canonical chain window proof against its own declarations.
 
@@ -5645,6 +5989,8 @@ def _checkpoint_chain_checkpoint_is_truthful(proof: dict[str, Any]) -> bool:
     )
 
 
+@_memo_scope
+@_cached_public_result("gen:checkpoint-chain-checkpoint-bundle")
 def checkpoint_chain_checkpoint_bundle(items: Any) -> dict[str, Any]:
     """Bind multiple checkpoint chain window proofs into one verifiable bundle.
 
@@ -5718,6 +6064,7 @@ def checkpoint_chain_checkpoint_bundle(items: Any) -> dict[str, Any]:
     return {"root": digest, "proofs": proofs}
 
 
+@_memoized_value("norm:chain-checkpoint-bundle")
 def _normalize_verified_checkpoint_chain_checkpoint_bundle(
     report: Any, field: str = "report"
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -5784,6 +6131,7 @@ def _normalize_verified_checkpoint_chain_checkpoint_bundle(
     return bundle_root, members
 
 
+@_memo_scope
 def verify_checkpoint_chain_checkpoint_bundle(report: Any, expected: Any) -> bool:
     """Verify a :func:`checkpoint_chain_checkpoint_bundle` by recomputation.
 
@@ -5861,6 +6209,7 @@ _CHECKPOINT_CHAIN_BUNDLE_DIFF_EXPECTED_KEYS = _CHECKPOINT_BUNDLE_DIFF_EXPECTED_K
 _CHECKPOINT_CHAIN_BUNDLE_DIFF_KINDS = _CHECKPOINT_BUNDLE_DIFF_KINDS
 
 
+@_memoized_value("sem:chain-stage-diff")
 def _chain_stage_diff_semantics(diff: dict[str, Any] | None) -> Any:
     """Summary-free semantic projection of a chain stage's checkpoint diff.
 
@@ -5895,6 +6244,7 @@ def _chain_stage_diff_semantics(diff: dict[str, Any] | None) -> Any:
     }
 
 
+@_memoized_value("sem:chain-checkpoint-proof")
 def _chain_checkpoint_proof_semantics(proof: dict[str, Any]) -> dict[str, Any]:
     """Summary-free semantic projection of a canonical chain window proof.
 
@@ -5921,6 +6271,7 @@ def _chain_checkpoint_proof_semantics(proof: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_memoized_args("truth:chain-checkpoint-bundle")
 def _chain_checkpoint_bundle_is_truthful(
     bundle_root: str, members: list[dict[str, Any]]
 ) -> bool:
@@ -5946,6 +6297,8 @@ def _chain_checkpoint_bundle_is_truthful(
     return bundle_root == previous
 
 
+@_memo_scope
+@_cached_public_result("diff:checkpoint-chain-checkpoint-bundle")
 def checkpoint_chain_checkpoint_bundle_diff(
     before: Any, after: Any
 ) -> dict[str, Any]:
@@ -6047,7 +6400,7 @@ def checkpoint_chain_checkpoint_bundle_diff(
     }
     canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
+    result = _json_deepcopy(payload)
     result["digest"] = digest
     return result
 
@@ -6291,6 +6644,7 @@ def _normalize_verified_chain_checkpoint_diff_report(
     return content, before_members, after_members, change_entries, changes_complete
 
 
+@_memo_scope
 def verify_checkpoint_chain_checkpoint_bundle_diff(
     report: Any, expected: Any
 ) -> bool:
@@ -6415,6 +6769,7 @@ _CHECKPOINT_CHAIN_BUNDLE_EVOLUTION_EXPECTED_STAGE_KEYS = frozenset(
 _CHECKPOINT_CHAIN_BUNDLE_EVOLUTION_GENESIS = "0" * 64
 
 
+@_memoized_args("digest:chain-bundle-evolution-stage")
 def _chain_checkpoint_bundle_evolution_stage_digest(
     previous: str, at: str, bundle: dict[str, Any], diff: dict[str, Any] | None
 ) -> str:
@@ -6432,6 +6787,7 @@ def _chain_checkpoint_bundle_evolution_stage_digest(
     ).hexdigest()
 
 
+@_memoized_value("sem:chain-checkpoint-bundle")
 def _chain_checkpoint_bundle_semantics(bundle: dict[str, Any]) -> list[tuple[str, Any]]:
     """Summary-free semantic projection of a canonical chain window bundle.
 
@@ -6448,6 +6804,8 @@ def _chain_checkpoint_bundle_semantics(bundle: dict[str, Any]) -> list[tuple[str
     ]
 
 
+@_memo_scope
+@_cached_public_result("gen:checkpoint-chain-checkpoint-bundle-evolution")
 def checkpoint_chain_checkpoint_bundle_evolution(stages: Any) -> dict[str, Any]:
     """Chain checkpoint chain window proof bundles across delivery stages.
 
@@ -6541,6 +6899,7 @@ def checkpoint_chain_checkpoint_bundle_evolution(stages: Any) -> dict[str, Any]:
     return {"root": digest, "stages": result_stages}
 
 
+@_memoized_value("norm:chain-bundle-evolution")
 def _normalize_verified_checkpoint_chain_checkpoint_bundle_evolution(
     report: Any, field: str = "report"
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -6653,6 +7012,7 @@ def _normalize_verified_checkpoint_chain_checkpoint_bundle_evolution(
     return root, normalized_stages
 
 
+@_memo_scope
 def verify_checkpoint_chain_checkpoint_bundle_evolution(
     report: Any, expected: Any
 ) -> bool:
@@ -6781,6 +7141,8 @@ _BUNDLE_EVOLUTION_CHECKPOINT_EXPECTED_KEYS = frozenset(
 )
 
 
+@_memo_scope
+@_cached_public_result("gen:bundle-evolution-checkpoint")
 def bundle_evolution_checkpoint(
     report: Any, start: str, end: str
 ) -> dict[str, Any]:
@@ -6873,6 +7235,7 @@ def bundle_evolution_checkpoint(
     }
 
 
+@_memoized_value("norm:bundle-evolution-checkpoint")
 def _normalize_verified_bundle_evolution_checkpoint(
     proof: Any, field: str = "proof"
 ) -> dict[str, Any]:
@@ -7048,6 +7411,7 @@ def _normalize_verified_bundle_evolution_checkpoint(
     }
 
 
+@_memo_scope
 def verify_bundle_evolution_checkpoint(proof: Any, expected: Any) -> bool:
     """Verify a :func:`bundle_evolution_checkpoint` proof without the report.
 
@@ -7213,6 +7577,7 @@ def _canonical_bundle_evolution_checkpoint_from_normalized(
     }
 
 
+@_memoized_args("truth:bundle-evolution-checkpoint")
 def _bundle_evolution_checkpoint_is_truthful(proof: dict[str, Any]) -> bool:
     """Recompute a canonical bundle evolution window proof against itself.
 
@@ -7232,38 +7597,28 @@ def _bundle_evolution_checkpoint_is_truthful(proof: dict[str, Any]) -> bool:
     )
 
 
+@_memoized_value("canon:bundle-evolution-window")
 def _canonical_bundle_evolution_window_proof(
     value: Any,
     field: str,
-    proof_cache: dict[str, dict[str, Any]] | None,
 ) -> dict[str, Any]:
     """Canonicalize one raw bundle evolution window proof.
 
     Runs the full structural and embedded-credential normalization and
-    returns a fresh canonical deep copy. With a shared ``proof_cache``,
-    equal-valued raw proofs resolve to the same canonical object, so one
-    top-level diff verification normalizes each deep window proof at most
-    once (bundle members and the corresponding non-null change sides share
-    one result); a cache miss or an uncacheable value falls back to a
-    standalone normalization.
+    returns a fresh canonical deep copy. The active per-call memo resolves
+    equal-valued raw proofs to the same canonical object, so one top-level
+    diff verification normalizes each deep window proof at most once
+    (bundle members and the corresponding non-null change sides share one
+    result); the shared canonical object is never mutated, and every public
+    result still deep-copies it before assembly.
     """
-    if proof_cache is not None:
-        try:
-            cache_key = json.dumps(
-                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
-        except (TypeError, ValueError):
-            cache_key = None
-        if cache_key is not None and cache_key in proof_cache:
-            return proof_cache[cache_key]
-    proof = _canonical_bundle_evolution_checkpoint_from_normalized(
+    return _canonical_bundle_evolution_checkpoint_from_normalized(
         _normalize_verified_bundle_evolution_checkpoint(value, field)
     )
-    if proof_cache is not None and cache_key is not None:
-        proof_cache[cache_key] = proof
-    return proof
 
 
+@_memo_scope
+@_cached_public_result("gen:bundle-evolution-checkpoint-bundle")
 def bundle_evolution_checkpoint_bundle(items: Any) -> dict[str, Any]:
     """Bind multiple bundle evolution window proofs into one verifiable bundle.
 
@@ -7337,10 +7692,10 @@ def bundle_evolution_checkpoint_bundle(items: Any) -> dict[str, Any]:
     return {"root": digest, "proofs": proofs}
 
 
+@_memoized_value("norm:bundle-evolution-bundle")
 def _normalize_verified_bundle_evolution_checkpoint_bundle(
     report: Any,
     field: str = "report",
-    proof_cache: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Run every structural and per-proof check on a bundle proof bundle.
 
@@ -7355,9 +7710,9 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle(
     normalized deep copy of its proof. Any structural or semantic violation
     raises ``ValueError`` and the input is never mutated.
 
-    When ``proof_cache`` is supplied, equal-valued raw member proofs share
-    one canonical normalized copy, so a single top-level verification
-    normalizes each deep window proof at most once.
+    The active per-call memo lets equal-valued raw member proofs share one
+    canonical normalized copy, so a single top-level verification normalizes
+    each deep window proof at most once.
     """
     if not isinstance(report, dict) or set(report) != set(
         _CHECKPOINT_BUNDLE_REPORT_KEYS
@@ -7390,7 +7745,7 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle(
                 "Unicode code point order"
             )
         proof = _canonical_bundle_evolution_window_proof(
-            member["proof"], f"{member_field}.proof", proof_cache
+            member["proof"], f"{member_field}.proof"
         )
         previous = _check_hex64(member["previous"], f"{member_field}.previous")
         digest = _check_hex64(member["digest"], f"{member_field}.digest")
@@ -7407,6 +7762,7 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle(
     return bundle_root, members
 
 
+@_memo_scope
 def verify_bundle_evolution_checkpoint_bundle(report: Any, expected: Any) -> bool:
     """Verify a :func:`bundle_evolution_checkpoint_bundle` by recomputation.
 
@@ -7490,6 +7846,7 @@ _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_DIFF_EXPECTED_KEYS = (
 _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_DIFF_KINDS = _CHECKPOINT_BUNDLE_DIFF_KINDS
 
 
+@_memoized_args("truth:bundle-evolution-bundle")
 def _bundle_evolution_checkpoint_bundle_is_truthful(
     bundle_root: str, members: list[dict[str, Any]]
 ) -> bool:
@@ -7515,6 +7872,7 @@ def _bundle_evolution_checkpoint_bundle_is_truthful(
     return bundle_root == previous
 
 
+@_memoized_value("sem:bundle-evolution-stage-diff")
 def _bundle_evolution_stage_diff_semantics(diff: dict[str, Any] | None) -> Any:
     """Summary-free semantic projection of a bundle evolution stage diff.
 
@@ -7548,6 +7906,7 @@ def _bundle_evolution_stage_diff_semantics(diff: dict[str, Any] | None) -> Any:
     }
 
 
+@_memoized_value("sem:bundle-evolution-proof")
 def _bundle_evolution_proof_semantics(proof: dict[str, Any]) -> dict[str, Any]:
     """Summary-free semantic projection of a canonical bundle evolution proof.
 
@@ -7574,6 +7933,8 @@ def _bundle_evolution_proof_semantics(proof: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@_memo_scope
+@_cached_public_result("diff:bundle-evolution-checkpoint-bundle")
 def bundle_evolution_checkpoint_bundle_diff(
     before: Any, after: Any
 ) -> dict[str, Any]:
@@ -7678,26 +8039,26 @@ def bundle_evolution_checkpoint_bundle_diff(
     }
     canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    result = copy.deepcopy(payload)
+    result = _json_deepcopy(payload)
     result["digest"] = digest
     return result
 
 
 def _normalize_bundle_evolution_diff_change_proof(
-    value: Any, field: str, proof_cache: dict[str, dict[str, Any]] | None
+    value: Any, field: str
 ) -> dict[str, Any] | None:
     """Validate one non-null change-side bundle evolution window proof.
 
     Returns a fresh canonical deep copy of the proof, or ``None`` for an
     explicit null. Structural and semantic violations raise ``ValueError``;
     a false declared summary is carried back inside the canonical proof so
-    it yields ``False`` only after every input validates. A shared
-    ``proof_cache`` lets a change side reuse the canonical normalization of
+    it yields ``False`` only after every input validates. The active
+    per-call memo lets a change side reuse the canonical normalization of
     the equal-valued corresponding bundle member proof.
     """
     if value is None:
         return None
-    return _canonical_bundle_evolution_window_proof(value, field, proof_cache)
+    return _canonical_bundle_evolution_window_proof(value, field)
 
 
 def _normalize_verified_bundle_evolution_checkpoint_bundle_diff_changes(
@@ -7705,7 +8066,6 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle_diff_changes(
     before_members: list[dict[str, Any]],
     after_members: list[dict[str, Any]],
     field: str,
-    proof_cache: dict[str, dict[str, Any]] | None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Structurally validate a bundle evolution bundle diff ``changes`` list.
 
@@ -7755,10 +8115,10 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle_diff_changes(
                 f"{item_field}.kind must be 'added', 'removed', or 'changed'"
             )
         before_proof = _normalize_bundle_evolution_diff_change_proof(
-            change["before"], f"{item_field}.before", proof_cache
+            change["before"], f"{item_field}.before"
         )
         after_proof = _normalize_bundle_evolution_diff_change_proof(
-            change["after"], f"{item_field}.after", proof_cache
+            change["after"], f"{item_field}.after"
         )
         before_member = before_by_id.get(member_id)
         after_member = after_by_id.get(member_id)
@@ -7847,10 +8207,10 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle_diff_changes(
     return entries, seen == expected_ids
 
 
+@_memoized_value("norm:bundle-evolution-diff")
 def _normalize_verified_bundle_evolution_checkpoint_bundle_diff_report(
     value: Any,
     field: str,
-    proof_cache: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[
     dict[str, Any],
     list[dict[str, Any]],
@@ -7884,16 +8244,14 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle_diff_report(
     before_root = _check_hex64(value["before_root"], f"{field}.before_root")
     after_root = _check_hex64(value["after_root"], f"{field}.after_root")
     digest = _check_hex64(value["digest"], f"{field}.digest")
-    if proof_cache is None:
-        proof_cache = {}
     before_bundle_root, before_members = (
         _normalize_verified_bundle_evolution_checkpoint_bundle(
-            value["before"], f"{field}.before", proof_cache
+            value["before"], f"{field}.before"
         )
     )
     after_bundle_root, after_members = (
         _normalize_verified_bundle_evolution_checkpoint_bundle(
-            value["after"], f"{field}.after", proof_cache
+            value["after"], f"{field}.after"
         )
     )
     if before_bundle_root != before_root:
@@ -7906,7 +8264,6 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle_diff_report(
             before_members,
             after_members,
             f"{field}.changes",
-            proof_cache,
         )
     )
     content = {
@@ -7932,6 +8289,7 @@ def _normalize_verified_bundle_evolution_checkpoint_bundle_diff_report(
     return content, before_members, after_members, change_entries, changes_complete
 
 
+@_memo_scope
 def verify_bundle_evolution_checkpoint_bundle_diff(
     report: Any, expected: Any
 ) -> bool:
@@ -7979,7 +8337,7 @@ def verify_bundle_evolution_checkpoint_bundle_diff(
     """
     content, before_members, after_members, changes, changes_complete = (
         _normalize_verified_bundle_evolution_checkpoint_bundle_diff_report(
-            report, "report", {}
+            report, "report"
         )
     )
     before_root = content["before_root"]
@@ -8012,22 +8370,14 @@ def verify_bundle_evolution_checkpoint_bundle_diff(
     # Each deep window proof is fully recomputed once: the bundle checks
     # resolve every bundle member proof, and every non-null change-side
     # proof is the same canonical object (normalized from an equal declared
-    # value) as the corresponding bundle member proof, so its truth result
-    # is resolved on first encounter and reused from the cache afterwards.
-    truthful: dict[int, bool] = {}
-
-    def proof_is_truthful(proof: dict[str, Any]) -> bool:
-        key = id(proof)
-        if key not in truthful:
-            truthful[key] = _bundle_evolution_checkpoint_is_truthful(proof)
-        return truthful[key]
-
+    # value) as the corresponding bundle member proof, so the per-call memo
+    # resolves its truth result on first encounter and reuses it afterwards.
     def bundle_is_truthful(
         bundle_root_value: str, members: list[dict[str, Any]]
     ) -> bool:
         previous = _CHECKPOINT_BUNDLE_GENESIS
         for member in members:
-            if not proof_is_truthful(member["proof"]):
+            if not _bundle_evolution_checkpoint_is_truthful(member["proof"]):
                 return False
             if member["previous"] != previous:
                 return False
@@ -8052,7 +8402,7 @@ def verify_bundle_evolution_checkpoint_bundle_diff(
             # The non-null change side is a standalone window proof: its
             # boundaries, anchor, embedded bundles and diffs, and stage
             # chain through its commitment must all recompute as true.
-            if not proof_is_truthful(proof):
+            if not _bundle_evolution_checkpoint_is_truthful(proof):
                 return False
     payload = {
         key: content[key]
