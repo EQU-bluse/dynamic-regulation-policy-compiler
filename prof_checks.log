@@ -1,0 +1,1 @@
+/ddb/cap1/cb/task073/.venv/bin/python3: Error while finding module specification for 'pytest.tests/test_profile.py' (ModuleNotFoundError: No module named 'pytest.tests/test_profile'). Try using 'pytest.tests/test_profile' instead of 'pytest.tests/test_profile.py' as the module name.
