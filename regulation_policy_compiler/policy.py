@@ -5915,17 +5915,19 @@ def verify_checkpoint_chain_checkpoint_bundle_diff(
     adjacent diffs, and the stage chain through its commitment), both
     bundle member chains and roots, the full change set, and the diff digest
     over the five declared prefix items in their canonical compact-JSON
-    form. Returns ``False`` when a proof, chain link, bundle root, the
-    change set, the diff digest, or an ``expected`` value (the two roots,
-    the digest, or either id set after code point sorting) does not match;
-    otherwise ``True``.
+    form. Within this single top-level call each deep window proof is
+    normalized and fully recomputed only once; later comparison, assembly,
+    and digesting reuse that result. Returns ``False`` when a proof, chain
+    link, bundle root, the change set, the diff digest, or an ``expected``
+    value (the two roots, the digest, or either id set after code point
+    sorting) does not match; otherwise ``True``.
     """
-    content, before_members, after_members, changes, changes_complete = (
-        _normalize_verified_chain_checkpoint_diff_report(report, "report")
-    )
-    before_root = content["before_root"]
-    after_root = content["after_root"]
-    digest = content["digest"]
+    engine = _VEngine()
+    # Structural and semantic validation of the whole report first; any
+    # structural, ordering, change-classification, or embedded-proof semantic
+    # violation raises ValueError, and a false declared summary is carried as
+    # data so it yields False only below.
+    content = engine.proof_diff(1, report, "report")
 
     if not isinstance(expected, dict) or set(expected) != set(
         _CHECKPOINT_CHAIN_BUNDLE_DIFF_EXPECTED_KEYS
@@ -5951,37 +5953,25 @@ def verify_checkpoint_chain_checkpoint_bundle_diff(
     # Both inputs have now passed every key-set, type, digest-format,
     # ordering, and embedded-proof semantic check. Only now recompute and
     # compare; any mismatch yields False rather than raising.
-    if not _chain_checkpoint_bundle_is_truthful(before_root, before_members):
+    #
+    # Each deep window proof is fully recomputed once: the bundle members and
+    # every non-null change side resolve equal values to the same engine node
+    # (value key), so truth is computed on the first encounter and reused.
+    if not content.truth:
         return False
-    if not _chain_checkpoint_bundle_is_truthful(after_root, after_members):
+    if not content.complete:
         return False
-    if not changes_complete:
-        return False
-    for change in changes:
-        for proof in (change["before"], change["after"]):
-            if proof is None:
-                continue
-            # The non-null change side is a standalone window proof: its
-            # boundaries, anchor, embedded bundles and diffs, and stage
-            # chain through its commitment must all recompute as true.
-            if not _checkpoint_chain_checkpoint_is_truthful(proof):
-                return False
-    payload = {
-        key: content[key] for key in _CHECKPOINT_CHAIN_BUNDLE_DIFF_REPORT_KEYS[:5]
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    recomputed_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    if digest != recomputed_digest:
-        return False
+    before_node = content.before_node
+    after_node = content.after_node
     if (
-        before_root != expected_before_root
-        or after_root != expected_after_root
-        or digest != expected_digest
+        content.root != expected_before_root
+        or content.root_after != expected_after_root
+        or content.digest != expected_digest
     ):
         return False
-    if {member["id"] for member in before_members} != set(expected_before_ids):
+    if {member[0] for member in before_node.members} != set(expected_before_ids):
         return False
-    if {member["id"] for member in after_members} != set(expected_after_ids):
+    if {member[0] for member in after_node.members} != set(expected_after_ids):
         return False
     return True
 
