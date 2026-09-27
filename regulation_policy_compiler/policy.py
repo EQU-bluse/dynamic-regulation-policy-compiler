@@ -7418,9 +7418,13 @@ recomputes each *distinct* value once.
 
 Identity is a hash-consed *value* key:
 
-* leaf credentials are keyed by their order-insensitive compact JSON (they
-  are the bounded base case and those bytes are their digest payload anyway)
-  -- a whole multi-megabyte deep proof is never serialized for keying;
+* leaf credentials are keyed by a type-faithful structural identity (they
+  are the bounded base case): the key records the real type of every
+  container and key, so values whose JSON text merely folds types (an
+  integer fact or condition key vs the string with the same digits, a
+  tuple vs the list with the same items, ``True`` vs ``1``) never share an
+  identity -- and a whole multi-megabyte deep proof is never serialized
+  for keying;
 * composite keys are tuples of scalar fields plus their children's value
   keys, so building a key costs only the (small) member list, never the
   subtree, and equality is exact Python tuple equality (never object identity
@@ -7439,6 +7443,85 @@ Identity is a hash-consed *value* key:
 def _vjs(value: Any) -> str:
     # JSON encoding for scalars (ids, kinds, hex64 strings, timestamps).
     return json.dumps(value, ensure_ascii=False)
+
+
+# Sentinels tagging container and ambiguous-scalar kinds inside value keys.
+# They are plain objects, so they can never equal a string, number, or other
+# payload value; identity and hash are stable within the process, which is
+# all a per-call engine registry needs.
+_VKEY_BOOL = object()
+_VKEY_FLOAT = object()
+_VKEY_LIST = object()
+_VKEY_TUPLE = object()
+_VKEY_DICT = object()
+_VKEY_OTHER = object()
+
+
+def _vtype_key(value: Any) -> Any:
+    """Type-faithful, sortable identity of a dict key (or other hashable).
+
+    Every identity is a tag-first tuple, so identities of differently typed
+    keys always order and compare without ``TypeError`` — an integer fact
+    key never merges with or mis-sorts against the string with the same
+    digits, and a tuple key never merges with anything else.  Used only for
+    dict keys, which need a deterministic order; values use
+    :func:`_vvalue_key`.
+    """
+    if isinstance(value, str):
+        return ("s", value)
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, int):
+        return ("i", value)
+    if isinstance(value, float):
+        return ("f", value)
+    if value is None:
+        return ("n",)
+    if isinstance(value, tuple):
+        return ("t", tuple(_vtype_key(item) for item in value))
+    return ("o", type(value).__qualname__, repr(value))
+
+
+def _vvalue_key(value: Any) -> Any:
+    """Type-faithful structural identity of a leaf credential value.
+
+    The reuse registry must never merge values whose compact JSON text
+    merely *looks* equal while their Python types differ: an integer fact
+    or condition key and the string with the same digits, a tuple and the
+    list with the same items, ``True`` and ``1``.  This key walks the
+    value once and records the real type of every container and key, so
+    only values equal in both type and value share an identity; anything
+    else falls through to full validation, which rejects it.  Strings and
+    ints map to themselves (they cannot collide with any other type's
+    identity); containers, bools, floats, and exotica are tagged with
+    sentinels that no payload value can equal.  Dict item order is
+    normalized away by sorting on the (type-tagged) keys, and every legal
+    credential contains only dicts, lists, strings, bools, ints, and
+    nulls, for which the key is exact.  This is a structural walk, not a
+    serialization: no text or byte form of the value is produced for
+    keying.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        items = [
+            (_vtype_key(key), _vvalue_key(item)) for key, item in value.items()
+        ]
+        items.sort()
+        return (_VKEY_DICT, tuple(items))
+    if isinstance(value, list):
+        return (_VKEY_LIST, tuple(_vvalue_key(item) for item in value))
+    if isinstance(value, tuple):
+        return (_VKEY_TUPLE, tuple(_vvalue_key(item) for item in value))
+    if isinstance(value, bool):
+        return (_VKEY_BOOL, value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return (_VKEY_FLOAT, value)
+    if value is None:
+        return None
+    return (_VKEY_OTHER, type(value).__qualname__, repr(value))
 
 
 class _CanonicalDict(dict):
@@ -7542,31 +7625,25 @@ class _VEngine:
     def credential(self, value: Any, field: str) -> _VNode:
         if not isinstance(value, dict):
             raise ValueError(f"{field} must be a credential dict")
-        # The raw key is order-insensitive compact JSON. A non-JSON-native
-        # leaf simply cannot key yet: fall through to full validation, which
-        # reports the structural/type violation as ValueError (never a
-        # TypeError), so such a value is never cached.
-        try:
-            key = json.dumps(
-                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
-        except (TypeError, ValueError):
-            key = None
-        if key is not None:
-            node = self.cred.get(key)
-            if node is not None:
-                return node
+        # The reuse identity is a type-faithful structural key, not JSON
+        # text: it records the real type of every container and key, so a
+        # value that merely serializes like an already-seen credential (an
+        # integer fact or condition key where the same digits were verified
+        # as a string, a tuple where a list is required) never reuses that
+        # credential's verified node.  Such a value falls through to full
+        # validation, which reports the structural/type violation as
+        # ValueError (never a TypeError), so it is never cached; only a
+        # genuine type-and-value match resolves to the cached node.
+        key = _VKey(("cred", _vvalue_key(value)))
+        node = self.cred.get(key)
+        if node is not None:
+            return node
         content, declared, recomputed, chain_ok, chain_root = (
             _check_verified_matrix_attestation(value, field)
         )
         canonical = copy.deepcopy(content)
         canonical["digest"] = declared
         cjson = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
-        if key is None:
-            key = cjson
-        node = self.cred.get(key)
-        if node is not None:
-            return node
         node = _VNode()
         node.key = key
         node.canonical = canonical
