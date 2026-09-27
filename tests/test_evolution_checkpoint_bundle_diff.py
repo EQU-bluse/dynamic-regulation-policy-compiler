@@ -494,3 +494,129 @@ def test_http_value_error_in_function_is_422():
     )
     assert response.status_code == 422
     assert response.content == b'{"detail":"invalid request"}'
+
+
+# ----------------------------------------------- Python type reuse collisions
+
+
+def _one_key_report():
+    # A credential whose only fact key is the string "1": its compact JSON
+    # text is identical to one keyed by the integer 1.
+    return decision_matrix_attestation(
+        START, END, [{"id": "c1", "facts": {"1": True}}], [_rule()]
+    )
+
+
+def _one_key_proof():
+    bundle = decision_matrix_attestation_bundle(
+        [{"id": "a", "report": _one_key_report()}]
+    )
+    evolution = matrix_bundle_evolution([{"at": AT1, "bundle": bundle}])
+    return evolution_checkpoint(evolution, AT1, AT1)
+
+
+def _splice_int_fact_key(node):
+    if isinstance(node, dict):
+        if isinstance(node.get("facts"), dict) and list(node["facts"]) == ["1"]:
+            value = node["facts"]["1"]
+            return {
+                **{k: _splice_int_fact_key(v) for k, v in node.items() if k != "facts"},
+                "facts": {1: value},
+            }
+        return {k: _splice_int_fact_key(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_splice_int_fact_key(item) for item in node]
+    return node
+
+
+def _splice_tuple_cases(node):
+    if isinstance(node, dict) and isinstance(node.get("cases"), list) and node["cases"]:
+        first = node["cases"][0]
+        if isinstance(first, dict) and {"id", "facts"} <= set(first):
+            return {
+                **{k: _splice_tuple_cases(v) for k, v in node.items() if k != "cases"},
+                "cases": tuple(_splice_tuple_cases(item) for item in node["cases"]),
+            }
+    if isinstance(node, dict):
+        return {k: _splice_tuple_cases(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_splice_tuple_cases(item) for item in node]
+    return node
+
+
+def test_int_fact_key_after_equal_text_proof_raises():
+    proof = _one_key_proof()
+    before = evolution_checkpoint_bundle([{"id": "a", "proof": copy.deepcopy(proof)}])
+    after = evolution_checkpoint_bundle(
+        [
+            {"id": "a", "proof": copy.deepcopy(proof)},
+            {"id": "b", "proof": copy.deepcopy(proof)},
+        ]
+    )
+    after["proofs"][1]["proof"] = _splice_int_fact_key(
+        copy.deepcopy(after["proofs"][1]["proof"])
+    )
+    # The JSON text is unchanged, but the second occurrence carries an
+    # integer fact key and must not reuse the validated equal-text proof.
+    with pytest.raises(ValueError):
+        evolution_checkpoint_bundle_diff(before, after)
+
+
+def test_tuple_cases_after_equal_text_proof_raises():
+    proof = _one_key_proof()
+    before = evolution_checkpoint_bundle([{"id": "a", "proof": copy.deepcopy(proof)}])
+    after = evolution_checkpoint_bundle(
+        [
+            {"id": "a", "proof": copy.deepcopy(proof)},
+            {"id": "b", "proof": copy.deepcopy(proof)},
+        ]
+    )
+    after["proofs"][1]["proof"] = _splice_tuple_cases(
+        copy.deepcopy(after["proofs"][1]["proof"])
+    )
+    with pytest.raises(ValueError):
+        evolution_checkpoint_bundle_diff(before, after)
+
+
+def test_type_collision_never_produces_partial_report():
+    proof = _one_key_proof()
+    before = evolution_checkpoint_bundle([{"id": "a", "proof": copy.deepcopy(proof)}])
+    after = evolution_checkpoint_bundle(
+        [
+            {"id": "a", "proof": copy.deepcopy(proof)},
+            {"id": "b", "proof": copy.deepcopy(proof)},
+        ]
+    )
+    after["proofs"][1]["proof"] = _splice_int_fact_key(
+        copy.deepcopy(after["proofs"][1]["proof"])
+    )
+    with pytest.raises(ValueError):
+        evolution_checkpoint_bundle_diff(before, after)
+
+
+def test_equal_typed_proof_is_normalized_once(monkeypatch):
+    import regulation_policy_compiler.policy as policy_module
+
+    proof = _one_key_proof()
+    before = evolution_checkpoint_bundle([{"id": "a", "proof": copy.deepcopy(proof)}])
+    after = evolution_checkpoint_bundle(
+        [
+            {"id": "a", "proof": copy.deepcopy(proof)},
+            {"id": "b", "proof": copy.deepcopy(proof)},
+        ]
+    )
+    calls = 0
+    original = policy_module._check_verified_matrix_attestation
+
+    def counting(value, field="report"):
+        nonlocal calls
+        calls += 1
+        return original(value, field)
+
+    monkeypatch.setattr(
+        policy_module, "_check_verified_matrix_attestation", counting
+    )
+    evolution_checkpoint_bundle_diff(before, after)
+    # The one distinct typed leaf credential is fully normalized a single
+    # time no matter how many members carry it.
+    assert calls == 1

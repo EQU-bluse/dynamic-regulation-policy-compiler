@@ -4544,17 +4544,23 @@ def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
     embedded checkpoint proof (window boundaries, anchor, bundles, adjacent
     diffs, and stage chain through its commitment), both bundle member
     chains and roots, and the diff digest over the five declared prefix
-    items in their canonical compact-JSON form. Returns ``False`` when a
-    proof, chain link, bundle root, the diff digest, or an ``expected``
-    value (the two roots, the digest, or either id set after code point
-    sorting) does not match; otherwise ``True``.
+    items in their canonical compact-JSON form. Within this single top-level
+    call each deep proof is normalized and fully recomputed only once; later
+    comparison, assembly, and digesting reuse that result — yet every
+    occurrence still completes its own structural and Python-type checks, so
+    an equal-text value with an illegal type (an integer fact key or a tuple
+    where the contract requires an array) raises ``ValueError`` even when an
+    earlier occurrence hit the reuse cache. Returns ``False`` when a proof,
+    chain link, bundle root, the diff digest, or an ``expected`` value (the
+    two roots, the digest, or either id set after code point sorting) does
+    not match; otherwise ``True``.
     """
-    content, before_members, after_members, changes, changes_complete = (
-        _normalize_verified_checkpoint_diff_report(report, "report")
-    )
-    before_root = content["before_root"]
-    after_root = content["after_root"]
-    digest = content["digest"]
+    engine = _VEngine()
+    # Structural and semantic validation of the whole report first; any
+    # structural, ordering, change-classification, Python-type, or
+    # embedded-proof semantic violation raises ValueError, and a false
+    # declared summary is carried as data so it yields False only below.
+    content = engine.proof_diff(0, report, "report")
 
     if not isinstance(expected, dict) or set(expected) != set(
         _CHECKPOINT_BUNDLE_DIFF_EXPECTED_KEYS
@@ -4580,37 +4586,27 @@ def verify_evolution_checkpoint_bundle_diff(report: Any, expected: Any) -> bool:
     # Both inputs have now passed every key-set, type, digest-format,
     # ordering, and embedded-proof semantic check. Only now recompute and
     # compare; any mismatch yields False rather than raising.
-    if not _checkpoint_bundle_is_truthful(before_root, before_members):
+    #
+    # Each deep proof is fully recomputed once: the bundle members and every
+    # non-null change side resolve equal values to the same engine node
+    # (a value key shared only by type-conforming equal values), so
+    # normalization and truth recomputation happen on the first encounter
+    # and are reused afterwards.
+    if not content.truth:
         return False
-    if not _checkpoint_bundle_is_truthful(after_root, after_members):
+    if not content.complete:
         return False
-    if not changes_complete:
-        return False
-    for change in changes:
-        for proof in (change["before"], change["after"]):
-            if proof is None:
-                continue
-            # The non-null change side is a standalone proof: its window,
-            # anchor, embedded bundles and diffs, and stage chain through
-            # its commitment must all recompute as true.
-            if not _checkpoint_is_truthful(proof):
-                return False
-    payload = {
-        key: content[key] for key in _CHECKPOINT_BUNDLE_DIFF_REPORT_KEYS[:5]
-    }
-    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    recomputed_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    if digest != recomputed_digest:
-        return False
+    before_node = content.before_node
+    after_node = content.after_node
     if (
-        before_root != expected_before_root
-        or after_root != expected_after_root
-        or digest != expected_digest
+        content.root != expected_before_root
+        or content.root_after != expected_after_root
+        or content.digest != expected_digest
     ):
         return False
-    if {member["id"] for member in before_members} != set(expected_before_ids):
+    if {member[0] for member in before_node.members} != set(expected_before_ids):
         return False
-    if {member["id"] for member in after_members} != set(expected_after_ids):
+    if {member[0] for member in after_node.members} != set(expected_after_ids):
         return False
     return True
 
@@ -7471,6 +7467,35 @@ def _v_member_payload(singular: str, item_id: str, child_json: str) -> str:
     return '{"id":' + _vjs(item_id) + ',"' + singular + '":' + child_json + "}"
 
 
+def _strict_json_shape(value: Any) -> bool:
+    """Whether ``value`` uses only the JSON-native Python types.
+
+    A structurally valid credential contains only dicts with **string**
+    keys, lists (never tuples), and the scalars ``None``/``bool``/``int``/
+    ``float``/``str``. Allocation-free and short-circuiting: it returns on
+    the first hazard, so the valid hot path pays only a stack walk. This is
+    what lets compact JSON text serve as a reuse key: among strict values
+    equal order-insensitive JSON text means an equal Python value, while an
+    integer dict key or a tuple — types that JSON text silently folds onto
+    a string key or a list — is reported as a hazard and never keyed.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or not _strict_json_shape(item):
+                return False
+        return True
+    if isinstance(value, list):
+        for item in value:
+            if not _strict_json_shape(item):
+                return False
+        return True
+    return (
+        value is None
+        or isinstance(value, str)
+        or isinstance(value, (bool, int, float))
+    )
+
+
 class _VKey:
     """A hash-consed composite value key.
 
@@ -7542,15 +7567,17 @@ class _VEngine:
     def credential(self, value: Any, field: str) -> _VNode:
         if not isinstance(value, dict):
             raise ValueError(f"{field} must be a credential dict")
-        # The raw key is order-insensitive compact JSON. A non-JSON-native
-        # leaf simply cannot key yet: fall through to full validation, which
-        # reports the structural/type violation as ValueError (never a
-        # TypeError), so such a value is never cached.
-        try:
+        # Reuse identity is order-insensitive compact JSON text, but only for
+        # values that use the strict JSON-native Python types. JSON text
+        # folds an integer dict key onto the string "1" and a tuple onto a
+        # list, so such a value must not key: _strict_json_shape reports it,
+        # we skip the cache, and full validation below raises ValueError. A
+        # genuinely non-JSON-native leaf is handled the same way.
+        if _strict_json_shape(value):
             key = json.dumps(
                 value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             )
-        except (TypeError, ValueError):
+        else:
             key = None
         if key is not None:
             node = self.cred.get(key)
@@ -7563,7 +7590,10 @@ class _VEngine:
         canonical["digest"] = declared
         cjson = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
         if key is None:
-            key = cjson
+            # The value validated, so it is JSON-native and now has a key.
+            key = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
         node = self.cred.get(key)
         if node is not None:
             return node
