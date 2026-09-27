@@ -547,7 +547,15 @@ async def evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Respons
     try:
         report = evolution_checkpoint_bundle_diff(body["before"], body["after"])
     except ValueError:
-        return _invalid_request()
+        # A legal window-proof bundle pair is not an evolution checkpoint
+        # bundle pair; hand the same parsed objects to the existing deeper
+        # diff semantics instead of rejecting the request.
+        try:
+            report = bundle_evolution_checkpoint_bundle_diff(
+                body["before"], body["after"]
+            )
+        except ValueError:
+            return _invalid_request()
     return _record_response(report)
 
 
@@ -566,7 +574,14 @@ async def verify_evolution_checkpoint_bundle_diff_endpoint(
             body["report"], body["expected"]
         )
     except ValueError:
-        return _invalid_request()
+        # Same fallback as the generation entry: a legal window-proof bundle
+        # diff report is verified by the existing deeper semantics.
+        try:
+            valid = verify_bundle_evolution_checkpoint_bundle_diff(
+                body["report"], body["expected"]
+            )
+        except ValueError:
+            return _invalid_request()
     return _record_response({"valid": valid})
 
 
