@@ -2890,11 +2890,14 @@ def _matrix_credential_semantics(content: dict[str, Any]) -> dict[str, Any]:
     still raises ``ValueError``.
     """
     policy = content["policy"]
+    # The projection is compared by value within the current top-level call
+    # and never escapes into an emitted result, so it references the
+    # normalized content directly instead of defensively copying it.
     return {
         "start": content["start"],
         "end": content["end"],
-        "cases": copy.deepcopy(content["cases"]),
-        "matrix": copy.deepcopy(content["matrix"]),
+        "cases": content["cases"],
+        "matrix": content["matrix"],
         "policy": {
             "start": policy["start"],
             "end": policy["end"],
@@ -7504,23 +7507,34 @@ def _vvalue_key(value: Any) -> Any:
     if isinstance(value, str):
         return value
     if isinstance(value, dict):
-        items = [
-            (_vtype_key(key), _vvalue_key(item)) for key, item in value.items()
-        ]
+        # Fast path: a string key is its own identity (no other key type
+        # maps to a plain string, and plain strings sort unambiguously), so
+        # the common all-string-key dict skips the per-key type tagging.
+        items = []
+        for key, item in value.items():
+            if not isinstance(key, str):
+                items = None
+                break
+            items.append((key, _vvalue_key(item)))
+        if items is None:
+            items = [
+                (_vtype_key(key), _vvalue_key(item))
+                for key, item in value.items()
+            ]
         items.sort()
         return (_VKEY_DICT, tuple(items))
     if isinstance(value, list):
-        return (_VKEY_LIST, tuple(_vvalue_key(item) for item in value))
-    if isinstance(value, tuple):
-        return (_VKEY_TUPLE, tuple(_vvalue_key(item) for item in value))
+        return (_VKEY_LIST, tuple([_vvalue_key(item) for item in value]))
+    if value is None:
+        return None
     if isinstance(value, bool):
         return (_VKEY_BOOL, value)
     if isinstance(value, int):
         return value
     if isinstance(value, float):
         return (_VKEY_FLOAT, value)
-    if value is None:
-        return None
+    if isinstance(value, tuple):
+        return (_VKEY_TUPLE, tuple([_vvalue_key(item) for item in value]))
     return (_VKEY_OTHER, type(value).__qualname__, repr(value))
 
 
@@ -7532,14 +7546,15 @@ class _CanonicalDict(dict):
     are unchanged.  The only addition is a ``__deepcopy__`` that rebuilds
     the independent copy through the canonical compact JSON form, which is
     far cheaper than the generic recursive copier for the very large
-    credential trees these functions return.  The copy is made of plain
+    credential trees these functions return.  The copy is again a
+    ``_CanonicalDict`` (so repeated copies stay on the fast path) over plain
     dicts and lists, so nothing beyond copying speed is observable, and the
     copy remains fully independent of the original at every level.
     """
 
     def __deepcopy__(self, memo: dict) -> Any:
-        clone = json.loads(
-            json.dumps(self, ensure_ascii=False, separators=(",", ":"))
+        clone = _CanonicalDict(
+            json.loads(json.dumps(self, ensure_ascii=False, separators=(",", ":")))
         )
         memo[id(self)] = clone
         return clone
@@ -7548,10 +7563,6 @@ class _CanonicalDict(dict):
 def _emit(canonical_json: str) -> dict[str, Any]:
     """Materialize a canonical JSON document as an independent result tree."""
     return _CanonicalDict(json.loads(canonical_json))
-
-
-def _v_member_payload(singular: str, item_id: str, child_json: str) -> str:
-    return '{"id":' + _vjs(item_id) + ',"' + singular + '":' + child_json + "}"
 
 
 class _VKey:
@@ -7620,6 +7631,34 @@ class _VEngine:
         self.p2: dict[Any, _VNode] = {}
         self.b2: dict[Any, _VNode] = {}
         self.d2: dict[Any, _VNode] = {}
+        # Generated diffs are fully determined by the two side nodes and the
+        # derived change entries; memoizing on those avoids rebuilding the
+        # whole five-item payload (and its SHA-256) for a repeated pair.
+        self.gen: dict[Any, _VNode] = {}
+        # Format checks are pure in the input string, so a validated
+        # timestamp or hex64 summary is remembered for the life of the
+        # engine (one top-level call) instead of being re-checked at every
+        # occurrence.
+        self.times: dict[str, str] = {}
+        self.hexes: dict[str, str] = {}
+
+    def _time(self, value: Any, field: str) -> str:
+        if isinstance(value, str):
+            cached = self.times.get(value)
+            if cached is not None:
+                return cached
+        checked = _check_time(value, field)
+        self.times[checked] = checked
+        return checked
+
+    def _hex64(self, value: Any, field: str) -> str:
+        if isinstance(value, str):
+            cached = self.hexes.get(value)
+            if cached is not None:
+                return cached
+        checked = _check_hex64(value, field)
+        self.hexes[checked] = checked
+        return checked
 
     # ------------------------------------------------------------ leaf cred
     def credential(self, value: Any, field: str) -> _VNode:
@@ -7641,14 +7680,16 @@ class _VEngine:
         content, declared, recomputed, chain_ok, chain_root = (
             _check_verified_matrix_attestation(value, field)
         )
-        canonical = copy.deepcopy(content)
-        canonical["digest"] = declared
-        cjson = json.dumps(canonical, ensure_ascii=False, separators=(",", ":"))
+        # The normalized content is a fresh canonical-order dict owned by
+        # this call; appending the declared digest yields the canonical
+        # report directly, so no defensive copy is needed before encoding.
+        sem = _matrix_credential_semantics(content)
+        content["digest"] = declared
+        cjson = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
         node = _VNode()
         node.key = key
-        node.canonical = canonical
         node.json = cjson
-        node.sem = _matrix_credential_semantics(content)
+        node.sem = sem
         node.semkey = (
             "cred",
             json.dumps(node.sem, ensure_ascii=False, sort_keys=True,
@@ -7668,7 +7709,7 @@ class _VEngine:
             raise ValueError(
                 f"{field} must be a dict with exactly the keys root, {plural}"
             )
-        root = _check_hex64(value["root"], f"{field}.root")
+        root = self._hex64(value["root"], f"{field}.root")
         raw = value[plural]
         if not isinstance(raw, list) or not raw:
             raise ValueError(f"{field}.{plural} must be a non-empty list")
@@ -7695,8 +7736,8 @@ class _VEngine:
                     "Unicode code point order"
                 )
             child = parse_child(member[singular], f"{mf}.{singular}")
-            prev = _check_hex64(member["previous"], f"{mf}.previous")
-            dig = _check_hex64(member["digest"], f"{mf}.digest")
+            prev = self._hex64(member["previous"], f"{mf}.previous")
+            dig = self._hex64(member["digest"], f"{mf}.digest")
             members.append((item_id, child, prev, dig))
             seen.add(item_id)
             previous_id = item_id
@@ -7740,9 +7781,12 @@ class _VEngine:
             tag,
             tuple((i, n.semkey) for i, n, _p, _d in members),
         )
-        node.json = (
-            '{"root":' + _vjs(root) + ',"' + plural + '":['
-            + ",".join(parts) + "]}"
+        node.json = "".join(
+            [
+                '{"root":' + _vjs(root) + ',"' + plural + '":[',
+                ",".join(parts),
+                "]}",
+            ]
         )
         node.canonical = None
         registry[key] = node
@@ -7889,25 +7933,45 @@ class _VEngine:
             )
         return entries, seen == expected
 
+    @staticmethod
+    def _diff_five_segments(before_root, after_root, before, after, entries):
+        """Segments of the five-item diff payload, for one-join assembly."""
+        change_parts = [
+            '{"id":' + _vjs(_id)
+            + ',"kind":' + _vjs(kind)
+            + ',"before":' + ("null" if bn is None else bn.json)
+            + ',"after":' + ("null" if an is None else an.json)
+            + "}"
+            for _id, kind, bn, an in entries
+        ]
+        return [
+            '{"before_root":' + _vjs(before_root)
+            + ',"after_root":' + _vjs(after_root)
+            + ',"before":',
+            before.json,
+            ',"after":',
+            after.json,
+            ',"changes":[',
+            ",".join(change_parts),
+            "]}",
+        ]
+
+    @staticmethod
+    def _segments_digest(segments) -> str:
+        # Hash the payload incrementally from its segments instead of
+        # concatenating (and re-encoding) a throwaway full-size string.
+        hasher = hashlib.sha256()
+        for segment in segments:
+            hasher.update(segment.encode("utf-8"))
+        return hasher.hexdigest()
+
     def _assemble_diff(self, tag, registry, key, before_root, after_root,
-                       digest, before, after, entries, five=None):
-        if five is None:
-            change_parts: list[str] = []
-            for _id, kind, bn, an in entries:
-                change_parts.append(
-                    '{"id":' + _vjs(_id)
-                    + ',"kind":' + _vjs(kind)
-                    + ',"before":' + ("null" if bn is None else bn.json)
-                    + ',"after":' + ("null" if an is None else an.json)
-                    + "}"
-                )
-            five = (
-                '{"before_root":' + _vjs(before_root)
-                + ',"after_root":' + _vjs(after_root)
-                + ',"before":' + before.json
-                + ',"after":' + after.json
-                + ',"changes":[' + ",".join(change_parts) + "]}"
+                       digest, before, after, entries, segments=None):
+        if segments is None:
+            segments = self._diff_five_segments(
+                before_root, after_root, before, after, entries
             )
+        five_digest = self._segments_digest(segments)
         node = _VNode()
         node.key = key
         node.root = before_root
@@ -7916,7 +7980,9 @@ class _VEngine:
         node.before_node = before
         node.after_node = after
         node.members = entries
-        node.json = five[:-1] + ',"digest":' + _vjs(digest) + "}"
+        node.json = "".join(
+            segments[:-1] + ['],"digest":' + _vjs(digest), "}"]
+        )
         node.dsem = {
             "before": before.sem,
             "after": after.sem,
@@ -7946,7 +8012,7 @@ class _VEngine:
         )
         node.canonical = None
         registry[key] = node
-        return node, five
+        return node, five_digest
 
     def _parse_diff(self, tag, registry, value, field, bundle_parse,
                     side_parse, strict):
@@ -7957,9 +8023,9 @@ class _VEngine:
                 f"{field} must be a dict with exactly the keys "
                 "before_root, after_root, before, after, changes, digest"
             )
-        before_root = _check_hex64(value["before_root"], f"{field}.before_root")
-        after_root = _check_hex64(value["after_root"], f"{field}.after_root")
-        digest = _check_hex64(value["digest"], f"{field}.digest")
+        before_root = self._hex64(value["before_root"], f"{field}.before_root")
+        after_root = self._hex64(value["after_root"], f"{field}.after_root")
+        digest = self._hex64(value["digest"], f"{field}.digest")
         before = bundle_parse(value["before"], f"{field}.before")
         after = bundle_parse(value["after"], f"{field}.after")
         if before.root != before_root:
@@ -7983,11 +8049,10 @@ class _VEngine:
         node = registry.get(key)
         if node is not None:
             return node
-        node, five = self._assemble_diff(
+        node, recomputed = self._assemble_diff(
             tag, registry, key, before_root, after_root, digest,
             before, after, entries,
         )
-        recomputed = hashlib.sha256(five.encode("utf-8")).hexdigest()
         sides_ok = all(
             (bn is None or bn.truth) and (an is None or an.truth)
             for _i, _k, bn, an in entries
@@ -8045,35 +8110,29 @@ class _VEngine:
             (i, k, None if bn is None else bn.key, None if an is None else an.key)
             for i, k, bn, an in entries
         )
-        change_parts = [
-            '{"id":' + _vjs(_id)
-            + ',"kind":' + _vjs(kind)
-            + ',"before":' + ("null" if bn is None else bn.json)
-            + ',"after":' + ("null" if an is None else an.json)
-            + "}"
-            for _id, kind, bn, an in entries
-        ]
-        five = (
-            '{"before_root":' + _vjs(before.root)
-            + ',"after_root":' + _vjs(after.root)
-            + ',"before":' + before.json
-            + ',"after":' + after.json
-            + ',"changes":[' + ",".join(change_parts) + "]}"
+        memo_key = _VKey((tag, before.key, after.key, change_keys))
+        memoized = self.gen.get(memo_key)
+        if memoized is not None:
+            return memoized
+        segments = self._diff_five_segments(
+            before.root, after.root, before, after, entries
         )
-        digest = hashlib.sha256(five.encode("utf-8")).hexdigest()
+        digest = self._segments_digest(segments)
         full_key = _VKey(
             (tag, before.root, after.root, digest, before.key, after.key,
              change_keys)
         )
         existing = registry.get(full_key)
         if existing is not None:
+            self.gen[memo_key] = existing
             return existing
-        node, _five = self._assemble_diff(
+        node, _digest = self._assemble_diff(
             tag, registry, full_key, before.root, after.root, digest,
-            before, after, entries, five=five,
+            before, after, entries, segments=segments,
         )
         node.truth = True
         node.complete = True
+        self.gen[memo_key] = node
         return node
 
     # -------------------------------------------------------------- proofs
@@ -8086,12 +8145,12 @@ class _VEngine:
                 f"{field} must be a dict with exactly the keys "
                 "start, end, anchor, stages, commitment"
             )
-        start = _check_time(value["start"], f"{field}.start")
-        end = _check_time(value["end"], f"{field}.end")
+        start = self._time(value["start"], f"{field}.start")
+        end = self._time(value["end"], f"{field}.end")
         if start > end:
             raise ValueError(f"{field}.start must not be after {field}.end")
-        anchor = _check_hex64(value["anchor"], f"{field}.anchor")
-        commitment = _check_hex64(value["commitment"], f"{field}.commitment")
+        anchor = self._hex64(value["anchor"], f"{field}.anchor")
+        commitment = self._hex64(value["commitment"], f"{field}.commitment")
         raw_stages = value["stages"]
         if not isinstance(raw_stages, list) or not raw_stages:
             raise ValueError(f"{field}.stages must be a non-empty list")
@@ -8107,13 +8166,13 @@ class _VEngine:
                     f"{sf} must be a dict with exactly the keys "
                     "at, bundle, diff, previous, digest"
                 )
-            at = _check_time(stage["at"], f"{sf}.at")
+            at = self._time(stage["at"], f"{sf}.at")
             if previous_at is not None and at <= previous_at:
                 raise ValueError(
                     f"{sf}.at must be strictly greater than the preceding stage at"
                 )
-            prev = _check_hex64(stage["previous"], f"{sf}.previous")
-            dig = _check_hex64(stage["digest"], f"{sf}.digest")
+            prev = self._hex64(stage["previous"], f"{sf}.previous")
+            dig = self._hex64(stage["digest"], f"{sf}.digest")
             bundle = bundle_parse(stage["bundle"], f"{sf}.bundle")
             diff: _VNode | None
             if index == 0 and prev == genesis:
@@ -8177,7 +8236,10 @@ class _VEngine:
                     generated = self.generate_diff(
                         diff_level, rows[index - 1][1], bundle
                     )
-                if diff.json != generated.json:
+                # Equal values resolve to the same registry node, so an
+                # identity check stands in for comparing the full canonical
+                # JSON text of the declared and regenerated diffs.
+                if diff is not generated:
                     truth = False
             # Hash the stage payload incrementally from the cached child
             # bytes instead of concatenating a throwaway payload string.
@@ -8226,12 +8288,15 @@ class _VEngine:
         node.truth = truth
         node.members = rows
         node.stage_parts = stage_parts
-        node.json = (
-            '{"start":' + _vjs(start)
-            + ',"end":' + _vjs(end)
-            + ',"anchor":' + _vjs(anchor)
-            + ',"stages":[' + ",".join(stage_parts)
-            + '],"commitment":' + _vjs(commitment) + "}"
+        node.json = "".join(
+            [
+                '{"start":' + _vjs(start)
+                + ',"end":' + _vjs(end)
+                + ',"anchor":' + _vjs(anchor)
+                + ',"stages":[',
+                ",".join(stage_parts),
+                '],"commitment":' + _vjs(commitment) + "}",
+            ]
         )
         node.sem = {"start": start, "end": end, "stages": sem_stages}
         node.semkey = (tag, start, end, tuple(semkey_stages))
@@ -8310,7 +8375,7 @@ class _VEngine:
                 raise ValueError(
                     f"{sf} must be a dict with exactly the keys at, bundle"
                 )
-            at = _check_time(stage["at"], f"{sf}.at")
+            at = self._time(stage["at"], f"{sf}.at")
             if previous_at is not None and at <= previous_at:
                 raise ValueError(
                     f"{sf}.at must be strictly greater than the preceding at"
@@ -8330,23 +8395,35 @@ class _VEngine:
             diff_node = (
                 None if prior is None else self.generate_diff(diff_level, prior, node)
             )
-            payload = (
-                '{"at":' + _vjs(at)
-                + ',"bundle":' + node.json
-                + ',"diff":' + ("null" if diff_node is None else diff_node.json)
-                + "}"
-            )
-            digest = hashlib.sha256(
-                previous.encode("ascii") + payload.encode("utf-8")
-            ).hexdigest()
+            # Hash the stage payload incrementally from the cached child
+            # bytes and join the emitted stage once, instead of building
+            # (and re-encoding) throwaway payload strings.
+            head = '{"at":' + _vjs(at) + ',"bundle":'
+            diff_json = "null" if diff_node is None else diff_node.json
+            hasher = hashlib.sha256(previous.encode("ascii"))
+            hasher.update(head.encode("utf-8"))
+            hasher.update(node.json.encode("utf-8"))
+            hasher.update(b',"diff":')
+            hasher.update(diff_json.encode("utf-8"))
+            hasher.update(b"}")
+            digest = hasher.hexdigest()
             parts.append(
-                payload[:-1]
-                + ',"previous":' + _vjs(previous)
-                + ',"digest":' + _vjs(digest) + "}"
+                "".join(
+                    [
+                        head,
+                        node.json,
+                        ',"diff":',
+                        diff_json,
+                        ',"previous":' + _vjs(previous),
+                        ',"digest":' + _vjs(digest) + "}",
+                    ]
+                )
             )
             previous = digest
             prior = node
-        return '{"root":' + _vjs(previous) + ',"stages":[' + ",".join(parts) + "]}"
+        return "".join(
+            ['{"root":' + _vjs(previous) + ',"stages":[', ",".join(parts), "]}"]
+        )
 
     def _report_node(
         self, proof_parse: Any, genesis: str, report: Any, field: str
@@ -8365,7 +8442,7 @@ class _VEngine:
             raise ValueError(
                 f"{field} must be a dict with exactly the keys root, stages"
             )
-        root = _check_hex64(report["root"], f"{field}.root")
+        root = self._hex64(report["root"], f"{field}.root")
         raw_stages = report["stages"]
         if not isinstance(raw_stages, list) or not raw_stages:
             raise ValueError(f"{field}.stages must be a non-empty list")
@@ -8467,15 +8544,25 @@ class _VEngine:
         previous = _CHECKPOINT_BUNDLE_GENESIS
         parts: list[str] = []
         for item_id, node in parsed:
-            payload = _v_member_payload("proof", item_id, node.json)
-            digest = hashlib.sha256(
-                previous.encode("ascii") + payload.encode("utf-8")
-            ).hexdigest()
+            # Hash the member payload incrementally from the cached child
+            # bytes and join the emitted member once.
+            head = '{"id":' + _vjs(item_id) + ',"proof":'
+            hasher = hashlib.sha256(previous.encode("ascii"))
+            hasher.update(head.encode("utf-8"))
+            hasher.update(node.json.encode("utf-8"))
+            hasher.update(b"}")
+            digest = hasher.hexdigest()
             parts.append(
-                '{"id":' + _vjs(item_id)
-                + ',"proof":' + node.json
-                + ',"previous":' + _vjs(previous)
-                + ',"digest":' + _vjs(digest) + "}"
+                "".join(
+                    [
+                        head,
+                        node.json,
+                        ',"previous":' + _vjs(previous),
+                        ',"digest":' + _vjs(digest) + "}",
+                    ]
+                )
             )
             previous = digest
-        return '{"root":' + _vjs(previous) + ',"proofs":[' + ",".join(parts) + "]}"
+        return "".join(
+            ['{"root":' + _vjs(previous) + ',"proofs":[', ",".join(parts), "]}"]
+        )
