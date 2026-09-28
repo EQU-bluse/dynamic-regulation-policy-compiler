@@ -19,6 +19,7 @@ from .policy import (
     bundle_evolution_checkpoint_bundle,
     bundle_evolution_checkpoint_bundle_diff,
     bundle_evolution_checkpoint_bundle_evolution,
+    bundle_evolution_checkpoint_bundle_evolution_checkpoint,
     checkpoint_chain,
     checkpoint_chain_checkpoint,
     checkpoint_chain_checkpoint_bundle,
@@ -46,6 +47,7 @@ from .policy import (
     verify_bundle_evolution_checkpoint_bundle,
     verify_bundle_evolution_checkpoint_bundle_diff,
     verify_bundle_evolution_checkpoint_bundle_evolution,
+    verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint,
     verify_checkpoint_chain,
     verify_checkpoint_chain_checkpoint,
     verify_checkpoint_chain_checkpoint_bundle,
@@ -946,6 +948,56 @@ async def verify_bundle_evolution_checkpoint_bundle_evolution_endpoint(
     try:
         valid = verify_bundle_evolution_checkpoint_bundle_evolution(
             body["report"], body["expected"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response({"valid": valid})
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
+    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
+    "checkpoint"
+)
+async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != (
+        _CHECKPOINT_CHAIN_CHECKPOINT_KEYS
+    ):
+        return _invalid_request()
+    try:
+        proof = bundle_evolution_checkpoint_bundle_evolution_checkpoint(
+            body["report"], body["start"], body["end"]
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(proof)
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
+    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
+    "checkpoint/verify"
+)
+async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_endpoint(
+    request: Request,
+) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != (
+        _EVOLUTION_CHECKPOINT_VERIFY_KEYS
+    ):
+        return _invalid_request()
+    try:
+        valid = verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint(
+            body["proof"], body["expected"]
         )
     except ValueError:
         return _invalid_request()
