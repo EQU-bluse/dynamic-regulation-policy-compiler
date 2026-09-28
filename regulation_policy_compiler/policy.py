@@ -2543,6 +2543,127 @@ def verify_decision_matrix_attestation(report: Any, expected: Any) -> bool:
     return digest == recomputed
 
 
+def matrix_change_ledger(report: Any) -> dict[str, Any]:
+    """Build a deterministic change ledger from a decision matrix credential.
+
+    Pure function: it only inspects the passed matrix attestation, touches
+    neither history nor files, and never mutates an input object at any
+    level. ``report`` must fully conform to the published
+    :func:`decision_matrix_attestation` contract. Before the ledger is built
+    the report is re-verified with the existing semantics — the matrix is
+    rebuilt from the embedded schedule credential, the schedule hash chain
+    and root are recomputed, and the report digest is recomputed — exactly as
+    :func:`verify_decision_matrix_attestation` does. Any illegal key set,
+    type, time, case, rule, or explanation semantics, and any false report
+    digest, schedule chain, or root, raises ``ValueError``; no partial ledger
+    is returned.
+
+    Returns a deep copy with top-level keys ``start``, ``end``, ``source``,
+    ``transitions``, ``digest``. ``start``/``end`` come from the matrix
+    credential's window and ``source`` is the credential's ``digest``, binding
+    the ledger to the original matrix. ``transitions`` follow the matrix
+    retention points in ascending ``at`` order; the first point serves only as
+    a prior state and produces no entry of its own. Each entry has keys
+    ``from``, ``to``, ``policy``, ``cases`` for two adjacent retention points.
+    ``policy`` is rebuilt solely from the rule snapshots the embedded schedule
+    credential stores at the two endpoints; its structure, ordering, and
+    conflict add/remove semantics follow the published :func:`policy_delta`
+    contract. ``cases`` lists only the cases that change at the current point,
+    in the credential's canonical case order; each case item has keys ``id``,
+    ``changes``, ``before``, ``after`` with complete explanation snapshots at
+    both endpoints, and ``changes`` lists the actual differences in the order
+    ``decision``, ``trace``, ``basis``, ``conflicts``. An empty case
+    credential is valid: ``transitions`` is then an empty array and the digest
+    is still produced.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) over a payload containing exactly ``start``,
+    ``end``, ``source``, ``transitions`` in that key order. ``digest`` is the
+    lowercase 64-char hex SHA-256 of ``C``. Every level is an independent
+    deep copy, so mutating a result never affects the input or a later
+    equal-valued call, and equal-valued inputs yield byte-identical ledgers
+    regardless of input dict key order.
+    """
+    canonical_report = _canonical_matrix_attestation(report, "report")
+    source = canonical_report["digest"]
+    start = canonical_report["start"]
+    end = canonical_report["end"]
+    matrix_points = canonical_report["matrix"]["points"]
+    schedule_points = canonical_report["policy"]["points"]
+    schedule_by_at = {point["at"]: point for point in schedule_points}
+
+    transitions: list[dict[str, Any]] = []
+    for index in range(1, len(matrix_points)):
+        previous_point = matrix_points[index - 1]
+        current_point = matrix_points[index]
+        from_at = previous_point["at"]
+        to_at = current_point["at"]
+        before_snapshot = {
+            "at": from_at,
+            "rules": schedule_by_at[from_at]["rules"],
+            "conflicts": schedule_by_at[from_at]["conflicts"],
+        }
+        after_snapshot = {
+            "at": to_at,
+            "rules": schedule_by_at[to_at]["rules"],
+            "conflicts": schedule_by_at[to_at]["conflicts"],
+        }
+        policy = _delta_from_compiled(before_snapshot, after_snapshot)
+        previous_by_id = {entry["id"]: entry for entry in previous_point["cases"]}
+        changed_ids = set(current_point["changes"])
+        case_entries: list[dict[str, Any]] = []
+        for entry in current_point["cases"]:
+            case_id = entry["id"]
+            if case_id not in changed_ids:
+                continue
+            before_entry = previous_by_id[case_id]
+            changes = [
+                field
+                for field in _COMPARE_FIELDS
+                if before_entry[field] != entry[field]
+            ]
+            case_entries.append(
+                {
+                    "id": case_id,
+                    "changes": changes,
+                    "before": {
+                        "at": from_at,
+                        "decision": before_entry["decision"],
+                        "trace": before_entry["trace"],
+                        "basis": before_entry["basis"],
+                        "conflicts": before_entry["conflicts"],
+                    },
+                    "after": {
+                        "at": to_at,
+                        "decision": entry["decision"],
+                        "trace": entry["trace"],
+                        "basis": entry["basis"],
+                        "conflicts": entry["conflicts"],
+                    },
+                }
+            )
+        transitions.append(
+            {
+                "from": from_at,
+                "to": to_at,
+                "policy": policy,
+                "cases": case_entries,
+            }
+        )
+
+    payload = {
+        "start": start,
+        "end": end,
+        "source": source,
+        "transitions": transitions,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    ledger = copy.deepcopy(payload)
+    ledger["digest"] = digest
+    return ledger
+
+
 _MATRIX_BUNDLE_ITEM_KEYS = frozenset({"id", "report"})
 _MATRIX_BUNDLE_REPORT_KEYS = ("root", "reports")
 _MATRIX_BUNDLE_MEMBER_KEYS = ("id", "report", "previous", "digest")

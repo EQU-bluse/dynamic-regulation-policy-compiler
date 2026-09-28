@@ -41,6 +41,7 @@ from .policy import (
     explain,
     matrix_bundle_diff,
     matrix_bundle_evolution,
+    matrix_change_ledger,
     policy_attestation,
     policy_schedule,
     policy_schedule_attestation,
@@ -85,6 +86,7 @@ _MATRIX_BUNDLE_ITEMS_KEYS = {"items"}
 _MATRIX_BUNDLE_DIFF_KEYS = {"before", "after"}
 _MATRIX_BUNDLE_EVOLUTION_KEYS = {"stages"}
 _EVOLUTION_CHECKPOINT_KEYS = {"report", "start", "end"}
+_LEDGER_KEYS = {"report"}
 _VERIFY_KEYS = {"report", "expected"}
 _EVOLUTION_CHECKPOINT_VERIFY_KEYS = {"proof", "expected"}
 _CHECKPOINT_BUNDLE_ITEMS_KEYS = {"items"}
@@ -380,6 +382,21 @@ async def verify_decision_matrix_attestation_endpoint(
     except ValueError:
         return _invalid_request()
     return _record_response({"valid": valid})
+
+
+@app.post("/decision-matrix/ledger")
+async def matrix_change_ledger_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _LEDGER_KEYS:
+        return _invalid_request()
+    try:
+        ledger = matrix_change_ledger(body["report"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(ledger)
 
 
 @app.post("/decision-matrix/attest/bundle")
