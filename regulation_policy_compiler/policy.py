@@ -7693,6 +7693,196 @@ def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint(
     return True
 
 
+_DELIVERY_WINDOW_PROOF_BUNDLE_EXPECTED_KEYS = _CHECKPOINT_BUNDLE_EXPECTED_KEYS
+
+
+def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle(
+    items: Any,
+) -> dict[str, Any]:
+    """Bind multiple delivery-stage window proofs into one deterministic bundle.
+
+    Pure function: it only processes its argument, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    ``items`` must be a non-empty list whose members are dicts with exactly
+    the keys ``id`` and ``proof``; ``id`` must be a non-empty string unique
+    across the list (wrong member key sets, wrong types, or duplicates raise
+    ``ValueError``). Every ``proof`` must fully conform to the published
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint`
+    delivery-stage window contract; each proof is recomputed as true before
+    anything is produced. Invalid window boundaries, anchors, stage order,
+    embedded bundles, adjacent diffs, member links, or terminal commitments
+    (a structural/semantic violation or a proof that does not recompute as
+    true) raise ``ValueError``.
+
+    Members are ordered by ``id`` in ascending Unicode code point order, so
+    the caller's order never affects the result. Returns a deep copy with
+    keys ``root``, ``proofs`` in that order; each member has keys ``id``,
+    ``proof``, ``previous``, ``digest``. The first member's ``previous`` is
+    64 ASCII ``0`` characters; every later member's ``previous`` is the
+    preceding member's ``digest``. The per-member digest payload contains
+    exactly ``id``, ``proof`` in that key order, encoded as compact UTF-8
+    JSON (``ensure_ascii=False``, ``separators=(',', ':')``) with no
+    newline, and ``digest`` is the lowercase hexadecimal SHA-256 of
+    ``previous``'s ASCII bytes immediately followed by that payload.
+    ``root`` is the last member's ``digest``. Every returned branch is an
+    independent deep copy; equal-valued inputs yield byte-identical results.
+    """
+    # The value engine normalizes and recomputes each distinct proof once,
+    # however often it occurs; the bundle is assembled from the cached
+    # canonical bytes and parsed back into fresh containers.
+    return _emit(_VEngine().build_bundle(3, items))
+
+
+def _normalize_verified_delivery_window_proof_bundle(
+    report: Any,
+    field: str = "report",
+    engine: Any = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Run every structural and per-proof check on a delivery proof bundle.
+
+    Enforces the full
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle`
+    report contract: exact top-level and per-member key sets, hex64
+    ``root``/``previous``/``digest`` fields, unique strictly ascending member
+    ids, and every member proof's full delivery-stage window structural and
+    embedded-credential semantic checks (window boundaries, anchor, stage
+    order, embedded bundles, carried/adjacent diffs, and the terminal
+    commitment). A proof that merely recomputes as false is structural data,
+    so its parsed node is carried back inside the returned member entries and
+    yields ``False`` only after every input validates. Returns
+    ``(root, members)`` where each member carries its canonical proof node
+    (``node.json`` is the normalized compact proof), its declared
+    ``previous`` and ``digest``. Any structural or semantic violation raises
+    ``ValueError`` and the input is never mutated.
+    """
+    if engine is None:
+        engine = _VEngine()
+    if not isinstance(report, dict) or set(report) != set(
+        _CHECKPOINT_BUNDLE_REPORT_KEYS
+    ):
+        raise ValueError(f"{field} must be a dict with exactly the keys root, proofs")
+    bundle_root = engine._hex64(report["root"], f"{field}.root")
+    raw_proofs = report["proofs"]
+    if not isinstance(raw_proofs, list) or not raw_proofs:
+        raise ValueError(f"{field}.proofs must be a non-empty list")
+    members: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    previous_id: str | None = None
+    for index, member in enumerate(raw_proofs):
+        member_field = f"{field}.proofs[{index}]"
+        if not isinstance(member, dict) or set(member) != set(
+            _CHECKPOINT_BUNDLE_MEMBER_KEYS
+        ):
+            raise ValueError(
+                f"{member_field} must be a dict with exactly the keys "
+                "id, proof, previous, digest"
+            )
+        item_id = _check_non_empty_str(member["id"], f"{member_field}.id")
+        if item_id in seen_ids:
+            raise ValueError(
+                f"{field}.proofs contains a duplicate id: {item_id!r}"
+            )
+        if previous_id is not None and item_id <= previous_id:
+            raise ValueError(
+                f"{field}.proofs must be ordered by id in ascending "
+                "Unicode code point order"
+            )
+        node = engine.delivery_window_proof(member["proof"], f"{member_field}.proof")
+        previous = engine._hex64(member["previous"], f"{member_field}.previous")
+        digest = engine._hex64(member["digest"], f"{member_field}.digest")
+        members.append(
+            {
+                "id": item_id,
+                "node": node,
+                "previous": previous,
+                "digest": digest,
+            }
+        )
+        seen_ids.add(item_id)
+        previous_id = item_id
+    return bundle_root, members
+
+
+def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle(
+    report: Any, expected: Any
+) -> bool:
+    """Verify a delivery-stage window proof bundle by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level. It works
+    without the full evolution report: every embedded window proof is
+    self-verifying.
+
+    ``report`` must be a dict with exactly the keys ``root``, ``proofs`` and
+    ``expected`` a dict with exactly the keys ``root``, ``proof_ids``.
+    ``root`` must be 64 lowercase hexadecimal characters and ``proof_ids``
+    a non-empty list of unique non-empty strings (caller order is arbitrary;
+    comparison is by code point). ``proofs`` must be a non-empty list whose
+    members are dicts with exactly the keys ``id``, ``proof``, ``previous``,
+    ``digest``, ordered by ``id`` in ascending Unicode code point order with
+    bundle-wide unique non-empty ids; each ``previous`` and ``digest`` must
+    be 64 lowercase hexadecimal characters, and every ``proof`` must fully
+    pass the existing
+    :func:`verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint`
+    structural and window semantic checks. Both inputs complete every
+    key-set, type, digest-format, member-order, and per-proof
+    structural/semantic check before any comparison; any violation raises
+    ``ValueError``.
+
+    Once the structures are legal, nothing declared is trusted: every window
+    proof is recomputed from its own anchor — boundaries, embedded bundles,
+    adjacent diffs, the stage chain, and the terminal commitment — and the
+    member chain is recomputed from the 64-zero genesis (each member digest
+    over the ``previous`` bytes plus the compact JSON of ``id``, ``proof``).
+    Returns ``False`` when any proof does not recompute as true, a
+    ``previous``/``digest`` link does not chain, the final ``root`` does not
+    equal the last member digest, or the ``root`` or ``proof_ids`` set
+    differ from ``expected``; otherwise ``True``.
+    """
+    engine = _VEngine()
+    bundle_root, members = _normalize_verified_delivery_window_proof_bundle(
+        report, "report", engine
+    )
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _DELIVERY_WINDOW_PROOF_BUNDLE_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys root, proof_ids"
+        )
+    expected_root = engine._hex64(expected["root"], "expected.root")
+    expected_ids = _validate_matrix_bundle_report_ids(
+        expected["proof_ids"], "expected.proof_ids"
+    )
+
+    # Both inputs have now passed every key-set, type, digest-format,
+    # member-order, and per-proof structural/semantic check. Only now
+    # recompute and compare; any mismatch yields False rather than raising.
+    previous = _CHECKPOINT_BUNDLE_GENESIS
+    for member in members:
+        if not member["node"].truth:
+            return False
+        if member["previous"] != previous:
+            return False
+        head = '{"id":' + _vjs(member["id"]) + ',"proof":'
+        hasher = hashlib.sha256(previous.encode("ascii"))
+        hasher.update(head.encode("utf-8"))
+        hasher.update(member["node"].json.encode("utf-8"))
+        hasher.update(b"}")
+        recomputed = hasher.hexdigest()
+        if member["digest"] != recomputed:
+            return False
+        previous = recomputed
+    if bundle_root != previous:
+        return False
+    if bundle_root != expected_root:
+        return False
+    if {member["id"] for member in members} != set(expected_ids):
+        return False
+    return True
+
+
 """Value-identity proof engine (appended into policy.py).
 
 Within one top-level bundle-evolution bundle diff call the same deep
@@ -8925,10 +9115,12 @@ class _VEngine:
         engine and must recompute as true; equal-valued proofs collapse to
         one node, so a repeated proof is normalized and recomputed only
         once. ``level`` is 0 for evolution checkpoint proofs, 1 for chain
-        window proofs, and 2 for bundle evolution window proofs.
+        window proofs, 2 for bundle evolution window proofs, and 3 for
+        delivery-stage window proofs.
         """
         proof_parse = (
-            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof
+            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof,
+            self.delivery_window_proof,
         )[level]
         if not isinstance(items, list) or not items:
             raise ValueError(
