@@ -2543,6 +2543,132 @@ def verify_decision_matrix_attestation(report: Any, expected: Any) -> bool:
     return digest == recomputed
 
 
+def matrix_change_ledger(report: Any) -> dict[str, Any]:
+    """Derive a deterministic change ledger from a matrix attestation.
+
+    Pure function: it only inspects its argument, touches neither history
+    nor files, and never mutates the input at any level. ``report`` must
+    fully conform to the published :func:`decision_matrix_attestation`
+    contract; before the ledger is built the existing verification
+    semantics recompute the matrix, the embedded schedule chain, and the
+    credential digest. Any key-set, type, time, case, rule, or explanation
+    violation, and any structurally valid report whose declared digest,
+    schedule chain links, or schedule root is not truthful, raises
+    ``ValueError``; no partial ledger is returned.
+
+    Returns a deep copy with top-level keys ``start``, ``end``, ``source``,
+    ``transitions``, ``digest``. ``source`` equals the input report's
+    ``digest``, binding the ledger to the original matrix credential.
+    ``transitions`` follows the matrix retention points in ascending order;
+    the first point is only the prior state and produces no entry of its
+    own. Each transition has keys ``from``, ``to``, ``policy``, ``cases``
+    for one adjacent pair of retention points. ``policy`` is rebuilt from
+    the embedded schedule credential's rule snapshots at the two endpoints
+    using the :func:`policy_delta` contract (structure, ordering, and
+    conflict add/remove semantics included). ``cases`` lists, in the
+    credential's canonical case order, only the cases that change at the
+    current point; each item has keys ``id``, ``changes``, ``before``,
+    ``after`` with full case explanation snapshots at both endpoints and
+    ``changes`` listing the actual differences in the existing order
+    ``decision``, ``trace``, ``basis``, ``conflicts``. An empty-case
+    credential is valid: ``transitions`` is then an empty list and the
+    digest is still produced.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) over a payload containing exactly ``start``,
+    ``end``, ``source``, ``transitions`` in that key order. ``digest`` is
+    the lowercase 64-char hex SHA-256 of ``C``. Every level is an
+    independent deep copy; equal-valued reports yield byte-identical
+    ledgers regardless of input dict order.
+    """
+    content, digest, recomputed, chain_ok, chain_root = (
+        _check_verified_matrix_attestation(report, "report")
+    )
+    if not chain_ok or content["policy"]["root"] != chain_root:
+        raise ValueError("report.policy hash chain or root does not verify")
+    if digest != recomputed:
+        raise ValueError("report.digest does not match its recomputed value")
+
+    start = content["start"]
+    end = content["end"]
+    points = content["matrix"]["points"]
+
+    # Every matrix retention point is also a schedule retention point: an
+    # explanation change between two points implies the compiled policy
+    # snapshot changed, so the schedule retained the same boundary.
+    snapshots = {point["at"]: point for point in content["policy"]["points"]}
+
+    def explanation(point: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "at": point["at"],
+            "decision": entry["decision"],
+            "trace": entry["trace"],
+            "basis": entry["basis"],
+            "conflicts": entry["conflicts"],
+        }
+
+    transitions: list[dict[str, Any]] = []
+    for previous_point, current_point in zip(points, points[1:]):
+        previous_snapshot = snapshots.get(previous_point["at"])
+        current_snapshot = snapshots.get(current_point["at"])
+        if previous_snapshot is None or current_snapshot is None:
+            raise ValueError(
+                "matrix retention point has no matching policy schedule snapshot"
+            )
+        previous_compiled = {
+            "at": previous_snapshot["at"],
+            "rules": previous_snapshot["rules"],
+            "conflicts": previous_snapshot["conflicts"],
+        }
+        current_compiled = {
+            "at": current_snapshot["at"],
+            "rules": current_snapshot["rules"],
+            "conflicts": current_snapshot["conflicts"],
+        }
+        # Rebuilt solely from the embedded endpoint snapshots; the final
+        # deep copy of the payload detaches it from the normalized report.
+        policy = _delta_from_compiled(previous_compiled, current_compiled)
+        changed_cases: list[dict[str, Any]] = []
+        for previous_entry, current_entry in zip(
+            previous_point["cases"], current_point["cases"]
+        ):
+            changes = [
+                field
+                for field in _COMPARE_FIELDS
+                if previous_entry[field] != current_entry[field]
+            ]
+            if not changes:
+                continue
+            changed_cases.append(
+                {
+                    "id": current_entry["id"],
+                    "changes": changes,
+                    "before": explanation(previous_point, previous_entry),
+                    "after": explanation(current_point, current_entry),
+                }
+            )
+        transitions.append(
+            {
+                "from": previous_point["at"],
+                "to": current_point["at"],
+                "policy": policy,
+                "cases": changed_cases,
+            }
+        )
+
+    payload = {
+        "start": start,
+        "end": end,
+        "source": digest,
+        "transitions": transitions,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    ledger_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    ledger = copy.deepcopy(payload)
+    ledger["digest"] = ledger_digest
+    return ledger
+
+
 _MATRIX_BUNDLE_ITEM_KEYS = frozenset({"id", "report"})
 _MATRIX_BUNDLE_REPORT_KEYS = ("root", "reports")
 _MATRIX_BUNDLE_MEMBER_KEYS = ("id", "report", "previous", "digest")
