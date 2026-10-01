@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
 import re
 from datetime import datetime
@@ -945,6 +946,104 @@ def explain(
         "basis": basis,
         "conflicts": conflicts,
     }
+
+
+_COVERAGE_MAX_FACT_KEYS = 12
+
+
+def _normalize_fact_keys(fact_keys: Any) -> list[str]:
+    """Validate the coverage fact-key domain and return it sorted.
+
+    ``fact_keys`` must be a list of zero to twelve non-empty, pairwise
+    distinct strings. The result is a new list sorted in Unicode code
+    point order.
+    """
+    if not isinstance(fact_keys, list):
+        raise ValueError("fact_keys must be a list of non-empty strings")
+    if len(fact_keys) > _COVERAGE_MAX_FACT_KEYS:
+        raise ValueError("fact_keys must contain at most twelve keys")
+    seen: set[str] = set()
+    for index, key in enumerate(fact_keys):
+        _check_non_empty_str(key, f"fact_keys[{index}]")
+        if key in seen:
+            raise ValueError("fact_keys must not contain duplicates")
+        seen.add(key)
+    return sorted(fact_keys)
+
+
+def policy_coverage(
+    at: str, fact_keys: list[str], rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Exhaustively cover the boolean fact domain at ``at``.
+
+    ``fact_keys`` must be a list of zero to twelve non-empty, pairwise
+    distinct strings; it is normalized to Unicode code point order. ``at``
+    and ``rules`` go through exactly :func:`compile_rules`' validation,
+    effective-window selection, latest-version retention, and ranking
+    (raising ``ValueError`` on anything invalid). If any currently
+    selected rule's ``when`` references a key outside ``fact_keys``,
+    ``ValueError`` is raised. No history or file is accessed and the
+    inputs are not mutated at any level.
+
+    Every boolean assignment over the normalized keys is enumerated in
+    normalized key order, each key taking ``False`` before ``True``, and
+    each assignment is explained with exactly :func:`explain`'s semantics.
+
+    Returns a deep copy with top-level keys ``at``, ``fact_keys``,
+    ``cases``, ``summary``. ``cases`` keeps the enumeration order; each
+    case has keys ``facts`` (the full assignment) and ``explanation``
+    (the full :func:`explain` result). ``summary`` has keys ``total``,
+    ``decided``, ``undecided``, ``winners``, ``shadowed``; ``winners``
+    lists, in compiled-rule order, the ``[source, id, ver]`` identities
+    that served as ``basis`` at least once, and ``shadowed`` lists, in
+    the same order, the selected rules that never did. An empty
+    ``fact_keys`` yields a single case with ``facts == {}``; empty rules
+    leave that case undecided and both identity lists empty. Equal-valued
+    inputs yield byte-identical compact JSON regardless of input dict or
+    ``fact_keys`` order.
+    """
+    keys = _normalize_fact_keys(fact_keys)
+    ranked = _effective_rules(at, rules)
+    domain = set(keys)
+    for rule in ranked:
+        when = rule["when"]
+        if when is not None:
+            for key in when:
+                if key not in domain:
+                    raise ValueError(
+                        f"rule {rule['id']}@{rule['ver']} references fact key "
+                        f"outside fact_keys: {key!r}"
+                    )
+
+    cases: list[dict[str, Any]] = []
+    decided = 0
+    basis_seen: set[tuple[str, str, int]] = set()
+    for values in itertools.product((False, True), repeat=len(keys)):
+        facts = dict(zip(keys, values))
+        explanation = explain(at, facts, rules)
+        basis = explanation["basis"]
+        if basis is not None:
+            decided += 1
+            basis_seen.add((basis["source"], basis["id"], basis["ver"]))
+        cases.append({"facts": facts, "explanation": explanation})
+
+    winners: list[list[Any]] = []
+    shadowed: list[list[Any]] = []
+    for rule in ranked:
+        identity = [rule["source"], rule["id"], rule["ver"]]
+        if (rule["source"], rule["id"], rule["ver"]) in basis_seen:
+            winners.append(identity)
+        else:
+            shadowed.append(identity)
+
+    summary = {
+        "total": len(cases),
+        "decided": decided,
+        "undecided": len(cases) - decided,
+        "winners": winners,
+        "shadowed": shadowed,
+    }
+    return {"at": at, "fact_keys": keys, "cases": cases, "summary": summary}
 
 
 def _sorted_fact_map(facts: dict[str, bool]) -> dict[str, bool]:
