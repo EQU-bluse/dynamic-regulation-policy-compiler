@@ -30,6 +30,7 @@ from .policy import (
     compare_decisions,
     compile_rules,
     decision_attestation,
+    decision_counterfactual,
     decision_impact,
     decision_impact_attestation,
     decision_matrix_attestation,
@@ -79,6 +80,7 @@ H: DecisionHistory | None = (
 )
 
 _POST_KEYS = {"at", "facts", "rules"}
+_COUNTERFACTUAL_KEYS = {"at", "facts", "target", "rules"}
 _COMPILE_KEYS = {"at", "rules"}
 _COVERAGE_KEYS = {"at", "fact_keys", "rules"}
 _SCHEDULE_KEYS = {"start", "end", "rules"}
@@ -209,6 +211,23 @@ async def explain_decision(request: Request) -> Response:
         return _invalid_request()
     try:
         report = explain(body["at"], body["facts"], body["rules"])
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
+
+
+@app.post("/decision-counterfactual")
+async def decision_counterfactual_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _COUNTERFACTUAL_KEYS:
+        return _invalid_request()
+    try:
+        report = decision_counterfactual(
+            body["at"], body["facts"], body["target"], body["rules"]
+        )
     except ValueError:
         return _invalid_request()
     return _record_response(report)
