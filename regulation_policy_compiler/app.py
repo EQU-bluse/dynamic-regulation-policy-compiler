@@ -34,6 +34,7 @@ from .policy import (
     decision_counterfactual,
     decision_impact,
     decision_impact_attestation,
+    decision_journey,
     decision_matrix_attestation,
     decision_matrix_attestation_bundle,
     decision_timeline,
@@ -88,6 +89,7 @@ _COVERAGE_KEYS = {"at", "fact_keys", "rules"}
 _SCHEDULE_KEYS = {"start", "end", "rules"}
 _COMPARE_KEYS = {"from", "to", "facts", "rules"}
 _TIMELINE_KEYS = {"start", "end", "facts", "rules"}
+_JOURNEY_KEYS = {"start", "end", "initial_facts", "events", "rules"}
 _IMPACT_KEYS = {"from", "to", "cases", "rules"}
 _MATRIX_KEYS = {"start", "end", "cases", "rules"}
 _MATRIX_BUNDLE_ITEMS_KEYS = {"items"}
@@ -334,6 +336,27 @@ async def verify_decision_timeline_attestation_endpoint(
     except ValueError:
         return _invalid_request()
     return _record_response({"valid": valid})
+
+
+@app.post("/decision-journey")
+async def decision_journey_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _JOURNEY_KEYS:
+        return _invalid_request()
+    try:
+        report = decision_journey(
+            body["start"],
+            body["end"],
+            body["initial_facts"],
+            body["events"],
+            body["rules"],
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(report)
 
 
 @app.post("/decision-impact")
