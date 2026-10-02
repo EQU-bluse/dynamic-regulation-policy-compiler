@@ -602,3 +602,103 @@ class DecisionHistory:
         return copy.deepcopy(
             {"start": start, "end": end, "root": root, "reports": reports}
         )
+
+    def replay_diff(
+        self, record_ids: Any, from_at: str, to_at: str
+    ) -> dict[str, Any]:
+        """Compare replay results for ``record_ids`` between two cutoffs.
+
+        Only already-persisted records are read; nothing is recomputed,
+        written, or otherwise mutated. ``record_ids`` must be a non-empty list
+        of unique non-empty strings and ``from_at``/``to_at`` valid UTC
+        seconds with ``from_at <= to_at``; otherwise ``ValueError`` is raised.
+        Each id is compared once in ascending Unicode code point order; if any
+        id has no record at or before ``to_at``, ``KeyError`` is raised and no
+        partial result is returned. An id with no record at or before
+        ``from_at`` is an introduction rather than an error.
+
+        The result is a deep copy with keys ``from, to, entries, summary``;
+        each entry has keys ``id, kind, before, after, changes``, where
+        ``before``/``after`` are deep copies of the most recent record at or
+        before the respective cutoff in the replay record contract (``before``
+        is ``null`` for an introduction; ``after`` always exists). Entries with
+        both sides present compare only ``decision, trace, basis`` (in that
+        order): ``kind`` is ``changed`` when any differs and ``unchanged``
+        otherwise, so records at different ``at`` with equal compared fields
+        are still ``unchanged``. ``summary`` has keys
+        ``total, introduced, changed, unchanged`` with counts matching
+        ``entries``. Caller order never affects the result.
+        """
+        if not isinstance(record_ids, list) or not record_ids:
+            raise ValueError("record_ids must be a non-empty list of record id strings")
+        seen: set[str] = set()
+        for index, record_id in enumerate(record_ids):
+            _check_non_empty_str(record_id, f"record_ids[{index}]")
+            if record_id in seen:
+                raise ValueError(
+                    f"record_ids must not contain duplicates: {record_id!r}"
+                )
+            seen.add(record_id)
+        _check_time(from_at, "from_at")
+        _check_time(to_at, "to_at")
+        if from_at > to_at:
+            raise ValueError(
+                f"from_at must not be after to_at: {from_at!r} > {to_at!r}"
+            )
+
+        def latest(record_id: str, at: str) -> dict[str, Any] | None:
+            best: dict[str, Any] | None = None
+            for entry in self._records:
+                if entry["id"] == record_id and entry["at"] <= at:
+                    if best is None or entry["at"] > best["at"]:
+                        best = entry
+            return best
+
+        # Resolve every pair first; a missing after-snapshot fails the whole
+        # diff before any result is built.
+        snapshots: list[tuple[str, dict[str, Any] | None, dict[str, Any]]] = []
+        for record_id in sorted(seen):
+            after = latest(record_id, to_at)
+            if after is None:
+                raise KeyError(record_id)
+            snapshots.append((record_id, latest(record_id, from_at), after))
+
+        entries: list[dict[str, Any]] = []
+        introduced = changed = unchanged = 0
+        for record_id, before, after in snapshots:
+            if before is None:
+                kind = "introduced"
+                changes: list[str] = []
+                introduced += 1
+            else:
+                changes = [
+                    field
+                    for field in _EVOLUTION_FIELDS
+                    if before[field] != after[field]
+                ]
+                if changes:
+                    kind = "changed"
+                    changed += 1
+                else:
+                    kind = "unchanged"
+                    unchanged += 1
+            entries.append(
+                {
+                    "id": record_id,
+                    "kind": kind,
+                    "before": copy.deepcopy(before),
+                    "after": copy.deepcopy(after),
+                    "changes": changes,
+                }
+            )
+        return {
+            "from": from_at,
+            "to": to_at,
+            "entries": entries,
+            "summary": {
+                "total": len(entries),
+                "introduced": introduced,
+                "changed": changed,
+                "unchanged": unchanged,
+            },
+        }
