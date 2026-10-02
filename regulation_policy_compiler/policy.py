@@ -8103,6 +8103,163 @@ def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle(
     return True
 
 
+_DELIVERY_WINDOW_PROOF_BUNDLE_DIFF_EXPECTED_KEYS = (
+    _CHECKPOINT_BUNDLE_DIFF_EXPECTED_KEYS
+)
+
+
+def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff(
+    before: Any, after: Any
+) -> dict[str, Any]:
+    """Attest the difference between two delivery-stage window proof bundles.
+
+    Pure function: it only processes its arguments, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    Both ``before`` and ``after`` must be complete
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle`
+    reports. Before anything is produced, both sides pass the full
+    :func:`verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle`
+    structural and semantic checks: key sets, digest formats, unique strictly
+    ascending member ids, and every embedded delivery-stage window proof; the
+    second side is still fully checked when the first side merely carries a
+    false digest. Any structural or semantic violation, and any false window
+    proof, member chain link, or bundle root on either side, raises
+    ``ValueError`` and no partial result is returned.
+
+    Returns a deep copy with keys ``before_root``, ``after_root``,
+    ``before``, ``after``, ``changes``, ``digest`` in that order;
+    ``before_root``/``after_root`` are the two bundles' roots and
+    ``before``/``after`` are independent deep copies of the normalized
+    bundles. Members are matched by ``id``; ``changes`` keeps only the
+    ``added`` (only in ``after``), ``removed`` (only in ``before``), and
+    ``changed`` (present in both but with a different complete window proof)
+    members, ordered by ``id`` in ascending Unicode code point order. Each
+    change has keys ``id``, ``kind``, ``before``, ``after``; the two sides
+    are independent deep copies of the delivery-stage window proof or
+    ``null``. Identical bundles yield an empty ``changes`` list.
+
+    Let ``C`` be the UTF-8 bytes of compact JSON (``ensure_ascii=False``,
+    ``separators=(',', ':')``) with no newline over a payload containing
+    exactly the first five keys in order. ``digest`` is the lowercase
+    64-char hex SHA-256 of ``C``. Equal-valued inputs yield byte-identical
+    results regardless of input dict or member order, and no two levels
+    share a mutable container.
+    """
+    engine = _VEngine()
+    # Both sides complete every structural and embedded-proof check first;
+    # a false digest is carried as data, so parsing the second side still
+    # runs in full when the first side merely carries a false summary.
+    before_node = engine.top_delivery_bundle(before, "before")
+    after_node = engine.top_delivery_bundle(after, "after")
+    if not before_node.truth:
+        raise ValueError("before bundle root or hash chain does not verify")
+    if not after_node.truth:
+        raise ValueError("after bundle root or hash chain does not verify")
+    diff_node = engine.top_generate_delivery_diff(before_node, after_node)
+    # Rebuild the result from the cached canonical compact bytes: one parse
+    # yields a fully independent tree (the two bundles and every change side
+    # are distinct containers, no level shared) without re-walking objects.
+    return _emit(diff_node.json)
+
+
+def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff(
+    report: Any, expected: Any
+) -> bool:
+    """Verify a delivery-stage window proof bundle diff by recomputation.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level. Every
+    embedded window proof is self-verifying, so no full bundle evolution
+    report is required.
+
+    ``report`` must be a dict with exactly the keys ``before_root``,
+    ``after_root``, ``before``, ``after``, ``changes``, ``digest`` and
+    conform level by level to the
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff`
+    contract. The two roots and ``digest`` must be 64 lowercase hexadecimal
+    characters, and each root must equal the root declared by its embedded
+    bundle. ``before``/``after`` must be complete delivery-stage window
+    proof bundles that pass every structural, member-order, digest-format,
+    and embedded window proof semantic check. ``changes`` items must have
+    exactly the keys ``id``, ``kind``, ``before``, ``after`` with non-empty
+    unique strictly ascending ids, legal kinds, null sides matching each
+    kind, and non-null sides that are valid window proofs exactly
+    reproducing the corresponding bundle members. A structurally legal
+    change list that omits an expected change or lists an extra/unchanged
+    one is not a structural error: it yields ``False`` after validation.
+    ``expected`` must have exactly the keys ``before_root``,
+    ``after_root``, ``before_ids``, ``after_ids``, ``digest``; both id
+    arrays must be non-empty lists of unique non-empty strings (caller
+    order is arbitrary; comparison is by code point). Any structural,
+    value-domain, uniqueness, ordering, or change-consistency violation
+    raises ``ValueError``, and both inputs finish structural validation
+    before any comparison.
+
+    Only afterwards are values recomputed rather than trusted: every
+    embedded window proof (window boundaries, anchor, embedded bundles,
+    carried/adjacent diffs, the stage chain, and the terminal commitment),
+    both bundle member chains and roots, the full change set, and the diff
+    digest over the five declared prefix items in their canonical
+    compact-JSON form. Within this single top-level call each deep window
+    proof is normalized and fully recomputed only once; later comparison,
+    assembly, and digesting reuse that result. Returns ``False`` when a
+    proof, chain link, bundle root, the change set, the diff digest, or an
+    ``expected`` value (the two roots, the digest, or either id set after
+    code point sorting) does not match; otherwise ``True``.
+    """
+    engine = _VEngine()
+    # Structural and semantic validation of the whole report first; any
+    # structural, ordering, change-classification, or embedded-proof semantic
+    # violation raises ValueError, and a false declared summary is carried as
+    # data so it yields False only below.
+    content = engine.top_parse_delivery_diff(report, "report")
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _DELIVERY_WINDOW_PROOF_BUNDLE_DIFF_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys "
+            "before_root, after_root, before_ids, after_ids, digest"
+        )
+    expected_before_root = _check_hex64(
+        expected["before_root"], "expected.before_root"
+    )
+    expected_after_root = _check_hex64(expected["after_root"], "expected.after_root")
+    expected_digest = _check_hex64(expected["digest"], "expected.digest")
+    expected_before_ids = _validate_matrix_bundle_report_ids(
+        expected["before_ids"], "expected.before_ids"
+    )
+    expected_after_ids = _validate_matrix_bundle_report_ids(
+        expected["after_ids"], "expected.after_ids"
+    )
+
+    # Both inputs have now passed every key-set, type, digest-format,
+    # ordering, and embedded-proof semantic check. Only now recompute and
+    # compare; any mismatch yields False rather than raising.
+    #
+    # Each deep window proof is fully recomputed once: the bundle members and
+    # every non-null change side resolve equal values to the same engine node
+    # (value key), so truth is computed on the first encounter and reused.
+    if not content.truth:
+        return False
+    if not content.complete:
+        return False
+    before_node = content.before_node
+    after_node = content.after_node
+    if (
+        content.root != expected_before_root
+        or content.root_after != expected_after_root
+        or content.digest != expected_digest
+    ):
+        return False
+    if {member[0] for member in before_node.members} != set(expected_before_ids):
+        return False
+    if {member[0] for member in after_node.members} != set(expected_after_ids):
+        return False
+    return True
+
+
 """Value-identity proof engine (appended into policy.py).
 
 Within one top-level bundle-evolution bundle diff call the same deep
@@ -8323,6 +8480,8 @@ class _VEngine:
         self.b2: dict[Any, _VNode] = {}
         self.d2: dict[Any, _VNode] = {}
         self.p3: dict[Any, _VNode] = {}
+        self.b3: dict[Any, _VNode] = {}
+        self.d3: dict[Any, _VNode] = {}
         # Generated diffs are fully determined by the two side nodes and the
         # derived change entries; memoizing on those avoids rebuilding the
         # whole five-item payload (and its SHA-256) for a repeated pair.
@@ -8503,10 +8662,11 @@ class _VEngine:
 
     # ------------------------------------------------------------- pbundle
     def proof_bundle(self, level: int, value: Any, field: str) -> _VNode:
-        tag = {0: "b0", 1: "b1", 2: "b2"}[level]
-        registry = (self.b0, self.b1, self.b2)[level]
+        tag = {0: "b0", 1: "b1", 2: "b2", 3: "b3"}[level]
+        registry = (self.b0, self.b1, self.b2, self.b3)[level]
         proof_parse = (
-            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof
+            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof,
+            self.delivery_window_proof,
         )[level]
         root, members = self._bundle_members(
             value, field, "proofs", "proof", proof_parse
@@ -8764,15 +8924,17 @@ class _VEngine:
         )
 
     def proof_diff(self, level: int, value: Any, field: str) -> _VNode:
-        tag = {0: "d0", 1: "d1", 2: "d2"}[level]
-        registry = (self.d0, self.d1, self.d2)[level]
+        tag = {0: "d0", 1: "d1", 2: "d2", 3: "d3"}[level]
+        registry = (self.d0, self.d1, self.d2, self.d3)[level]
         bundle_parse = (
             (lambda v, f: self.proof_bundle(0, v, f)),
             (lambda v, f: self.proof_bundle(1, v, f)),
             (lambda v, f: self.proof_bundle(2, v, f)),
+            (lambda v, f: self.proof_bundle(3, v, f)),
         )[level]
         side_parse = (
-            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof
+            self.evolution_proof, self.chain_proof, self.bundle_evolution_proof,
+            self.delivery_window_proof,
         )[level]
         return self._parse_diff(
             tag, registry, value, field, bundle_parse, side_parse, strict=False
@@ -8783,8 +8945,8 @@ class _VEngine:
         if level == -1:
             tag, registry = "mdiff", self.mdiff
         else:
-            tag = {0: "d0", 1: "d1", 2: "d2"}[level]
-            registry = (self.d0, self.d1, self.d2)[level]
+            tag = {0: "d0", 1: "d1", 2: "d2", 3: "d3"}[level]
+            registry = (self.d0, self.d1, self.d2, self.d3)[level]
         before_by_id = {m[0]: m for m in before.members}
         after_by_id = {m[0]: m for m in after.members}
         entries: list[tuple[str, str, _VNode | None, _VNode | None]] = []
@@ -9143,6 +9305,17 @@ class _VEngine:
 
     def top_parse_diff(self, value: Any, field: str) -> _VNode:
         return self.proof_diff(2, value, field)
+
+    def top_delivery_bundle(self, value: Any, field: str) -> _VNode:
+        return self.proof_bundle(3, value, field)
+
+    def top_generate_delivery_diff(
+        self, before: _VNode, after: _VNode
+    ) -> _VNode:
+        return self.generate_diff(3, before, after)
+
+    def top_parse_delivery_diff(self, value: Any, field: str) -> _VNode:
+        return self.proof_diff(3, value, field)
 
     # --------------------------------------------------------- generators
     def build_chain(self, level: int, stages: Any, field: str = "stages") -> str:
