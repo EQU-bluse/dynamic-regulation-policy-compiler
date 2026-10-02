@@ -909,6 +909,30 @@ def verify_policy_schedule_attestation(report: Any, expected: Any) -> bool:
     return ok and normalized["root"] == root
 
 
+def _explain_ranked(
+    at: str, facts: dict[str, bool], ranked: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Build the :func:`explain` result from already validated ranked rules."""
+    matched = [rule for rule in ranked if _matches(rule, facts)]
+    if not matched:
+        return {"at": at, "decision": None, "trace": [], "basis": None, "conflicts": []}
+    basis = _snapshot_rule(matched[0])
+    basis_key = [basis["source"], basis["id"], basis["ver"]]
+    conflicts = [
+        conflict
+        for conflict in _find_conflicts(ranked)
+        if conflict["winner"] == basis_key or conflict["loser"] == basis_key
+    ]
+    trace = [f"{rule['id']}@{rule['ver']}" for rule in matched]
+    return {
+        "at": at,
+        "decision": matched[0]["result"],
+        "trace": trace,
+        "basis": basis,
+        "conflicts": conflicts,
+    }
+
+
 def explain(
     at: str, facts: dict[str, bool], rules: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -928,23 +952,167 @@ def explain(
     """
     _check_fact_map(facts, "facts")
     ranked = _effective_rules(at, rules)
-    matched = [rule for rule in ranked if _matches(rule, facts)]
-    if not matched:
-        return {"at": at, "decision": None, "trace": [], "basis": None, "conflicts": []}
-    basis = _snapshot_rule(matched[0])
-    basis_key = [basis["source"], basis["id"], basis["ver"]]
-    conflicts = [
-        conflict
-        for conflict in _find_conflicts(ranked)
-        if conflict["winner"] == basis_key or conflict["loser"] == basis_key
-    ]
-    trace = [f"{rule['id']}@{rule['ver']}" for rule in matched]
+    return _explain_ranked(at, facts, ranked)
+
+
+_COUNTERFACTUAL_MAX_KEYS = 12
+_TRISTATE_RANK = {None: 0, False: 1, True: 2}
+
+
+def decision_counterfactual(
+    at: str,
+    facts: dict[str, bool],
+    target: str | None,
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Find the minimal fact changes that flip the decision to ``target``.
+
+    ``at``, ``facts``, and ``rules`` are validated exactly as in
+    :func:`explain`; ``target`` must be a non-empty string or ``None`` (the
+    undecided outcome). More than twelve fact keys referenced by the
+    currently selected rules' ``when`` conditions raises ``ValueError``.
+    No history or file is accessed and the inputs are not mutated at any
+    level.
+
+    The editable keys are exactly the keys referenced by the selected
+    rules' ``when`` conditions; all other facts stay untouched. An
+    existing key may flip its boolean value or be deleted; a missing key
+    may be set to ``False`` or ``True``; each key changed once costs one
+    step. The full three-state space (absent, ``False``, ``True``) over at
+    most twelve editable keys is enumerated, and every scheme whose
+    resulting decision equals ``target`` is collected at the smallest
+    achievable distance.
+
+    Returns a deep copy with top-level keys ``at``, ``facts``, ``target``,
+    ``explanation``, ``distance``, ``counterfactuals``. ``facts`` is the
+    normalized input (keys in Unicode code point order); ``explanation``
+    is the full current :func:`explain` result. When the current decision
+    already equals ``target``, ``distance`` is ``0`` and the sole scheme
+    changes nothing; when no scheme reaches ``target``, ``distance`` is
+    ``None`` and ``counterfactuals`` is empty. Each scheme has keys
+    ``changes``, ``facts``, ``explanation``: ``changes`` lists, in Unicode
+    code point order of the keys, entries with key order ``key``,
+    ``before``, ``after``, using ``null`` on the missing side; ``facts``
+    is the normalized post-change fact map; ``explanation`` is the full
+    :func:`explain` result under it. Schemes are ordered stably by key
+    order and the ``null``, ``false``, ``true`` order of ``before`` and
+    ``after``, independently of the input dict order.
+    """
+    _check_fact_map(facts, "facts")
+    if target is not None and (not isinstance(target, str) or not target):
+        raise ValueError("target must be a non-empty string or null")
+    ranked = _effective_rules(at, rules)
+    editable = sorted(
+        {
+            key
+            for rule in ranked
+            if rule["when"] is not None
+            for key in rule["when"]
+        }
+    )
+    if len(editable) > _COUNTERFACTUAL_MAX_KEYS:
+        raise ValueError(
+            "counterfactual editable keys must contain at most twelve keys"
+        )
+
+    normalized_facts = _sorted_fact_map(facts)
+    current = _explain_ranked(at, normalized_facts, ranked)
+
+    # Every when key is editable, so matching only needs the editable keys'
+    # tri-state values (None means absent); non-editable facts never matter.
+    states = {key: facts[key] if key in facts else None for key in editable}
+
+    def _decides(values: dict[str, Any]) -> bool:
+        for rule in ranked:
+            when = rule["when"]
+            if when is None or all(
+                values[key] is value for key, value in when.items()
+            ):
+                return rule["result"] == target
+        return target is None
+
+    # Distance zero: the unchanged facts.
+    if _decides(states):
+        return {
+            "at": at,
+            "facts": normalized_facts,
+            "target": target,
+            "explanation": current,
+            "distance": 0,
+            "counterfactuals": [
+                {
+                    "changes": [],
+                    "facts": copy.deepcopy(normalized_facts),
+                    "explanation": copy.deepcopy(current),
+                }
+            ],
+        }
+
+    # For each editable key, the alternative destinations in null, false,
+    # true order, excluding its current state: an existing key may be deleted
+    # or flipped; a missing key may become false or true.
+    alternatives = {
+        key: [state for state in (None, False, True) if state is not states[key]]
+        for key in editable
+    }
+
+    # Enumerate by increasing distance: choose the changed keys, then each
+    # chosen key's alternative. The first reachable distance is the minimum.
+    for distance in range(1, len(editable) + 1):
+        winners: list[tuple[tuple, dict[str, Any]]] = []
+        for keys in itertools.combinations(editable, distance):
+            option_lists = [alternatives[key] for key in keys]
+            for destinations in itertools.product(*option_lists):
+                trial = dict(states)
+                trial.update(zip(keys, destinations))
+                if not _decides(trial):
+                    continue
+                changes = [
+                    {"key": key, "before": states[key], "after": after}
+                    for key, after in zip(keys, destinations)
+                ]
+                candidate = dict(facts)
+                for key, after in zip(keys, destinations):
+                    if after is None:
+                        del candidate[key]
+                    else:
+                        candidate[key] = after
+                signature = tuple(
+                    (
+                        change["key"],
+                        _TRISTATE_RANK[change["before"]],
+                        _TRISTATE_RANK[change["after"]],
+                    )
+                    for change in changes
+                )
+                winners.append(
+                    (
+                        signature,
+                        {
+                            "changes": changes,
+                            "facts": _sorted_fact_map(candidate),
+                            "explanation": _explain_ranked(at, candidate, ranked),
+                        },
+                    )
+                )
+        if winners:
+            winners.sort(key=lambda item: item[0])
+            return {
+                "at": at,
+                "facts": normalized_facts,
+                "target": target,
+                "explanation": current,
+                "distance": distance,
+                "counterfactuals": [scheme for _, scheme in winners],
+            }
+
     return {
         "at": at,
-        "decision": matched[0]["result"],
-        "trace": trace,
-        "basis": basis,
-        "conflicts": conflicts,
+        "facts": normalized_facts,
+        "target": target,
+        "explanation": current,
+        "distance": None,
+        "counterfactuals": [],
     }
 
 
