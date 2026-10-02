@@ -433,18 +433,110 @@ class DecisionHistory:
             raise
         return copy.deepcopy(entry)
 
-    def replay(self, record_id: str, at: str) -> dict[str, Any]:
-        """Return a copy of the most recent record for ``record_id`` at or before ``at``."""
-        _check_non_empty_str(record_id, "record_id")
-        _check_time(at, "at")
+    def _latest_at_or_before(
+        self, record_id: str, at: str
+    ) -> dict[str, Any] | None:
         best: dict[str, Any] | None = None
         for entry in self._records:
             if entry["id"] == record_id and entry["at"] <= at:
                 if best is None or entry["at"] > best["at"]:
                     best = entry
+        return best
+
+    def replay(self, record_id: str, at: str) -> dict[str, Any]:
+        """Return a copy of the most recent record for ``record_id`` at or before ``at``."""
+        _check_non_empty_str(record_id, "record_id")
+        _check_time(at, "at")
+        best = self._latest_at_or_before(record_id, at)
         if best is None:
             raise KeyError(record_id)
         return copy.deepcopy(best)
+
+    def replay_diff(
+        self, record_ids: Any, from_at: str, to_at: str
+    ) -> dict[str, Any]:
+        """Compare replayed records for ``record_ids`` at two cutoff times.
+
+        Only already-persisted records are read; nothing is recomputed,
+        written, or otherwise mutated. ``record_ids`` must be a non-empty list
+        of unique non-empty strings and ``from_at``/``to_at`` valid UTC
+        seconds with ``from_at <= to_at``; otherwise ``ValueError`` is raised
+        and the inputs are left untouched. If any id has no record at or
+        before ``to_at``, ``KeyError`` is raised and no partial result is
+        returned.
+
+        Each id is examined once in ascending Unicode code point order,
+        independently of the caller's ordering. The result is a deep copy
+        with keys ``from, to, entries, summary``. Each entry has keys
+        ``id, kind, before, after, changes``: ``before``/``after`` are the
+        most recent records at or before ``from_at``/``to_at`` in the replay
+        record shape (``before`` is ``None`` when no such record exists, in
+        which case ``kind`` is ``"introduced"`` and ``changes`` is empty).
+        When both sides exist only ``decision, trace, basis`` are compared,
+        in that order; a non-empty ``changes`` makes ``kind`` ``"changed"``,
+        otherwise ``"unchanged"`` (differing ``at`` values alone do not).
+        ``summary`` has keys ``total, introduced, changed, unchanged`` with
+        counts matching ``entries``.
+        """
+        if not isinstance(record_ids, list) or not record_ids:
+            raise ValueError("record_ids must be a non-empty list of record id strings")
+        seen: set[str] = set()
+        for index, record_id in enumerate(record_ids):
+            _check_non_empty_str(record_id, f"record_ids[{index}]")
+            if record_id in seen:
+                raise ValueError(
+                    f"record_ids must not contain duplicates: {record_id!r}"
+                )
+            seen.add(record_id)
+        _check_time(from_at, "from_at")
+        _check_time(to_at, "to_at")
+        if from_at > to_at:
+            raise ValueError(f"from_at must not be after to_at: {from_at!r} > {to_at!r}")
+        entries: list[dict[str, Any]] = []
+        introduced = changed = unchanged = 0
+        for record_id in sorted(record_ids):
+            after_entry = self._latest_at_or_before(record_id, to_at)
+            if after_entry is None:
+                raise KeyError(record_id)
+            before_entry = self._latest_at_or_before(record_id, from_at)
+            if before_entry is None:
+                kind = "introduced"
+                before = None
+                changes: list[str] = []
+                introduced += 1
+            else:
+                changes = [
+                    field
+                    for field in _EVOLUTION_FIELDS
+                    if before_entry[field] != after_entry[field]
+                ]
+                if changes:
+                    kind = "changed"
+                    changed += 1
+                else:
+                    kind = "unchanged"
+                    unchanged += 1
+                before = copy.deepcopy(before_entry)
+            entries.append(
+                {
+                    "id": record_id,
+                    "kind": kind,
+                    "before": before,
+                    "after": copy.deepcopy(after_entry),
+                    "changes": changes,
+                }
+            )
+        return {
+            "from": from_at,
+            "to": to_at,
+            "entries": entries,
+            "summary": {
+                "total": len(entries),
+                "introduced": introduced,
+                "changed": changed,
+                "unchanged": unchanged,
+            },
+        }
 
     def evolution(self, record_id: str, start: str, end: str) -> dict[str, Any]:
         """Return stored snapshots for ``record_id`` within the closed ``[start, end]``.

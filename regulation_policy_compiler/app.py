@@ -102,6 +102,7 @@ _CHECKPOINT_BUNDLE_DIFF_KEYS = {"before", "after"}
 _CHECKPOINT_CHAIN_KEYS = {"stages"}
 _CHECKPOINT_CHAIN_CHECKPOINT_KEYS = {"report", "start", "end"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
+_REPLAY_DIFF_KEYS = {"record_ids", "from", "to"}
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -1385,3 +1386,38 @@ async def verify_audit_bundle_endpoint(request: Request) -> Response:
     except ValueError:
         return _invalid_request()
     return _record_response({"valid": valid})
+
+
+@app.post("/history/replay-diff")
+async def replay_diff_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != _REPLAY_DIFF_KEYS:
+        return _invalid_request()
+    try:
+        record_ids = body["record_ids"]
+        if not isinstance(record_ids, list) or not record_ids:
+            raise ValueError("record_ids must be a non-empty list of record id strings")
+        seen: set[str] = set()
+        for index, record_id in enumerate(record_ids):
+            _check_non_empty_str(record_id, f"record_ids[{index}]")
+            if record_id in seen:
+                raise ValueError("record_ids must not contain duplicates")
+            seen.add(record_id)
+        _check_time(body["from"], "from")
+        _check_time(body["to"], "to")
+        if body["from"] > body["to"]:
+            raise ValueError("from must not be after to")
+    except ValueError:
+        return _invalid_request()
+    if H is None:
+        return _history_unavailable()
+    try:
+        report = H.replay_diff(record_ids, body["from"], body["to"])
+    except KeyError:
+        return _error(404, "record not found")
+    except OSError:
+        return _history_unavailable()
+    return _record_response(report)
