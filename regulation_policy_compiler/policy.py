@@ -8428,6 +8428,169 @@ def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff(
     return True
 
 
+_DELIVERY_WINDOW_PROOF_BUNDLE_EVOLUTION_EXPECTED_KEYS = (
+    _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_EXPECTED_KEYS
+)
+_DELIVERY_WINDOW_PROOF_BUNDLE_EVOLUTION_EXPECTED_STAGE_KEYS = (
+    _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_EXPECTED_STAGE_KEYS
+)
+_DELIVERY_WINDOW_PROOF_BUNDLE_EVOLUTION_GENESIS = "0" * 64
+
+
+def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution(
+    stages: Any,
+) -> dict[str, Any]:
+    """Chain delivery-stage window proof bundles across multiple publish times.
+
+    Pure function: it only processes its argument, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    ``stages`` must be a non-empty list whose items are dicts with exactly
+    the keys ``at`` and ``bundle``; array order is publish order. Each
+    ``at`` must be a valid UTC second strictly increasing (a non-list, an
+    empty list, duplicates, disorder, missing fields, or extra fields raise
+    ``ValueError``), and every ``bundle`` must fully pass the existing
+    :func:`verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle`
+    checks — every embedded delivery-stage window proof (window boundaries,
+    anchor, embedded bundles, carried/adjacent diffs, the stage chain, and
+    the terminal commitment), the member chain, and the bundle root — or
+    raise ``ValueError``.
+
+    Returns a deep copy with keys ``root``, ``stages`` in that order; each
+    stage has keys ``at``, ``bundle``, ``diff``, ``previous``, ``digest``.
+    The first stage's ``diff`` is ``null``; every later ``diff`` is the full
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff`
+    credential from the preceding bundle to the current one under the
+    existing diff semantics (changes judged on the complete normalized
+    window proofs, every non-null change side equal to the corresponding
+    bundle member), so no real addition, removal, or replacement is omitted
+    and no unchanged member is listed. The first stage's ``previous`` is 64
+    ASCII ``0`` characters; every later stage's ``previous`` is the
+    preceding stage's ``digest``. The per-stage payload contains exactly
+    ``at``, ``bundle``, ``diff`` in that key order, encoded as compact UTF-8
+    JSON (``ensure_ascii=False``, ``separators=(',', ':')``) with no
+    newline; ``digest`` is the lowercase hexadecimal SHA-256 of
+    ``previous``'s ASCII bytes immediately followed by that payload, and
+    ``root`` is the last stage's ``digest``. Equal-valued inputs yield
+    byte-identical results regardless of the original dict key order, and
+    no level shares an input object.
+    """
+    # The value engine normalizes and recomputes each distinct embedded
+    # proof, bundle, and adjacent diff once; the emitted chain is built
+    # from the cached canonical bytes and parsed back into fresh containers.
+    return _emit(_VEngine().build_chain(3, stages))
+
+
+def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution(
+    report: Any, expected: Any
+) -> bool:
+    """Verify a
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution`
+    report.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level. Every
+    embedded window proof and diff is self-verifying, so no external state
+    is required.
+
+    ``report`` must be a dict with exactly the keys ``root``, ``stages`` and
+    conform level by level to the
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution`
+    contract; ``expected`` must have exactly the keys ``root``, ``stages``
+    with a non-empty stage list whose items contain only ``at``,
+    ``bundle_root``, and ``diff_digest``: strictly increasing valid ``at``
+    values, ``root`` and every ``bundle_root`` 64 lowercase hexadecimal
+    characters, the first ``diff_digest`` ``null`` and every later one 64
+    lowercase hexadecimal characters. Every structure and embedded-proof
+    semantic check — key sets, types, digest formats, strictly increasing
+    timestamps, fully valid per-stage delivery-stage window proof bundles
+    and their embedded credentials, a ``null`` first diff, and each later
+    stage's complete adjacent
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff`
+    credential reproducing its neighbors on semantics — completes on both
+    inputs before any comparison; any violation raises ``ValueError``.
+
+    Only afterwards are values recomputed rather than trusted: every
+    bundle's embedded window proofs, member chain, and root; each adjacent
+    diff credential (its full content and digest, including that the change
+    set lists exactly the added, removed, and replaced members and omits
+    unchanged ones); every stage digest over the ``previous`` bytes plus
+    the compact JSON of ``at``, ``bundle``, ``diff``; the stage
+    ``previous``/``digest`` chain from the 64-zero genesis; the final
+    ``root``; and the ``expected`` timestamp/bundle-root/diff-digest
+    triples and overall root. Returns ``False`` when any chain link, stage
+    digest, bundle, diff, root, or expected value does not match, a change
+    is omitted or invented, or a stage is skipped; otherwise ``True``.
+    """
+    engine = _VEngine()
+    # Structural and embedded-credential validation of the whole report
+    # first; any key-set, type, time, ordering, bundle, or adjacent-diff
+    # structural/semantic violation raises ValueError, and a false declared
+    # bundle, chain link, diff, change set, stage digest, or root is carried
+    # back as node.truth so it yields False only below. Distinct deep window
+    # proofs are hash-consed and recomputed once across the whole report.
+    node = engine.bundle_evolution_chain_report(report, "report", 3)
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _DELIVERY_WINDOW_PROOF_BUNDLE_EVOLUTION_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys root, stages"
+        )
+    expected_root = _check_hex64(expected["root"], "expected.root")
+    raw_expected_stages = expected["stages"]
+    if not isinstance(raw_expected_stages, list) or not raw_expected_stages:
+        raise ValueError("expected.stages must be a non-empty list")
+    expected_stages: list[tuple[str, str, str | None]] = []
+    previous_at: str | None = None
+    for index, stage in enumerate(raw_expected_stages):
+        field = f"expected.stages[{index}]"
+        if not isinstance(stage, dict) or set(stage) != (
+            _DELIVERY_WINDOW_PROOF_BUNDLE_EVOLUTION_EXPECTED_STAGE_KEYS
+        ):
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys "
+                "at, bundle_root, diff_digest"
+            )
+        at = _check_time(stage["at"], f"{field}.at")
+        if previous_at is not None and at <= previous_at:
+            raise ValueError(
+                f"{field}.at must be strictly greater than the preceding at"
+            )
+        bundle_root = _check_hex64(stage["bundle_root"], f"{field}.bundle_root")
+        diff_digest = stage["diff_digest"]
+        if index == 0:
+            if diff_digest is not None:
+                raise ValueError(f"{field}.diff_digest must be null on the first stage")
+        else:
+            _check_hex64(diff_digest, f"{field}.diff_digest")
+        expected_stages.append((at, bundle_root, diff_digest))
+        previous_at = at
+
+    # Both inputs have now passed every key-set, type, digest-format, time,
+    # ordering, bundle, and adjacent-diff structural/semantic check. Only
+    # now recompute and compare; any mismatch yields False rather than raising.
+    rows = node.members
+    if len(rows) != len(expected_stages):
+        return False
+    if not node.truth:
+        return False
+    for index, (at, bundle, diff_node, _prev, _dig) in enumerate(rows):
+        expected_at, expected_bundle_root, expected_diff_digest = expected_stages[
+            index
+        ]
+        if at != expected_at or bundle.root != expected_bundle_root:
+            return False
+        if index == 0:
+            if expected_diff_digest is not None:
+                return False
+        elif diff_node is None or diff_node.digest != expected_diff_digest:
+            return False
+    if node.root != expected_root:
+        return False
+    return True
+
+
 """Value-identity proof engine (appended into policy.py).
 
 Within one top-level bundle-evolution bundle diff call the same deep
@@ -9358,8 +9521,10 @@ class _VEngine:
             2, lambda v, f: self.proof_diff(2, v, f),
         )
 
-    def bundle_evolution_chain_report(self, value: Any, field: str) -> _VNode:
-        """Parse a full window-proof bundle evolution ``root, stages`` report.
+    def bundle_evolution_chain_report(
+        self, value: Any, field: str, level: int = 2
+    ) -> _VNode:
+        """Parse a full proof-bundle evolution ``root, stages`` report.
 
         Unlike a window proof, a full report always anchors at the 64-zero
         genesis: the first stage's ``diff`` must be ``null`` (a structural
@@ -9372,10 +9537,15 @@ class _VEngine:
         non-adjacent/non-canonical diff, a broken stage link/digest, an
         incomplete change list, or a false root is carried back on the node
         as ``truth == False`` so the verifier turns it into ``False`` after
-        both inputs validate. Distinct deep window proofs are hash-consed
-        across the call, so each is normalized and recomputed only once.
+        both inputs validate. Distinct deep proofs are hash-consed across the
+        call, so each is normalized and recomputed only once. ``level`` is 2
+        for the window-proof bundle evolution report and 3 for the
+        delivery-stage window proof bundle evolution report.
         """
-        genesis = _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_GENESIS
+        genesis = {
+            2: _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_GENESIS,
+            3: _DELIVERY_WINDOW_PROOF_BUNDLE_EVOLUTION_GENESIS,
+        }[level]
         if not isinstance(value, dict) or set(value) != {"root", "stages"}:
             raise ValueError(
                 f"{field} must be a dict with exactly the keys root, stages"
@@ -9403,13 +9573,13 @@ class _VEngine:
                 )
             prev = self._hex64(stage["previous"], f"{sf}.previous")
             dig = self._hex64(stage["digest"], f"{sf}.digest")
-            bundle = self.proof_bundle(2, stage["bundle"], f"{sf}.bundle")
+            bundle = self.proof_bundle(level, stage["bundle"], f"{sf}.bundle")
             if index == 0:
                 if stage["diff"] is not None:
                     raise ValueError(f"{sf}.diff must be null on the first stage")
                 diff_node: _VNode | None = None
             else:
-                diff_node = self.proof_diff(2, stage["diff"], f"{sf}.diff")
+                diff_node = self.proof_diff(level, stage["diff"], f"{sf}.diff")
                 preceding = rows[-1][1]
                 if diff_node.root_after != bundle.root:
                     raise ValueError(
@@ -9438,7 +9608,7 @@ class _VEngine:
             if not bundle.truth:
                 truth = False
             if diff_node is not None:
-                generated = self.generate_diff(2, rows[index - 1][1], bundle)
+                generated = self.generate_diff(level, rows[index - 1][1], bundle)
                 if not diff_node.truth or diff_node is not generated:
                     truth = False
             hasher = hashlib.sha256(running.encode("ascii"))
@@ -9494,7 +9664,8 @@ class _VEngine:
         diffs reuse the parsed bundle nodes directly, so no proof is
         normalized or recomputed twice. ``level`` is -1 for matrix bundle
         evolution, 0 for the checkpoint chain, 1 for the chain window
-        proof bundle evolution, and 2 for the window-proof bundle
+        proof bundle evolution, 2 for the window-proof bundle
+        evolution, and 3 for the delivery-stage window proof bundle
         evolution.
         """
         genesis, bundle_parse, diff_level = {
@@ -9517,6 +9688,11 @@ class _VEngine:
                 _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_GENESIS,
                 lambda v, f: self.proof_bundle(2, v, f),
                 2,
+            ),
+            3: (
+                _DELIVERY_WINDOW_PROOF_BUNDLE_EVOLUTION_GENESIS,
+                lambda v, f: self.proof_bundle(3, v, f),
+                3,
             ),
         }[level]
         if not isinstance(stages, list) or not stages:
