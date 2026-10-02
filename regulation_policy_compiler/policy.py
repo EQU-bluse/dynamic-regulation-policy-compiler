@@ -1846,6 +1846,168 @@ def decision_timeline_attestation(
     return attestation
 
 
+_EVENT_KEYS = frozenset({"at", "set", "unset"})
+
+
+def _validate_events(
+    events: Any, start: str, end: str
+) -> list[dict[str, Any]]:
+    """Validate journey events and return deep-copied normalized dicts.
+
+    Each event must be a dict with exactly the keys ``at``, ``set``,
+    ``unset``; ``at`` must be a valid UTC second in ``(start, end]`` and
+    unique across events; ``set`` must be a dict of non-empty string keys
+    to bools; ``unset`` must be a duplicate-free list of non-empty
+    strings; the ``set`` and ``unset`` key domains must be disjoint.
+    """
+    if not isinstance(events, list):
+        raise ValueError("events must be a list of event dicts")
+    seen_at: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, event in enumerate(events):
+        field = f"events[{index}]"
+        if not isinstance(event, dict) or set(event) != _EVENT_KEYS:
+            raise ValueError(
+                f"{field} must be a dict with exactly the keys at, set, unset"
+            )
+        at = _check_time(event["at"], f"{field}.at")
+        if not start < at <= end:
+            raise ValueError(f"{field}.at must lie in (start, end]: {at!r}")
+        if at in seen_at:
+            raise ValueError(f"duplicate event at: {at!r}")
+        seen_at.add(at)
+        set_map = _check_fact_map(event["set"], f"{field}.set")
+        unset = event["unset"]
+        if not isinstance(unset, list):
+            raise ValueError(f"{field}.unset must be a list of non-empty strings")
+        seen_unset: set[str] = set()
+        for uindex, key in enumerate(unset):
+            _check_non_empty_str(key, f"{field}.unset[{uindex}]")
+            if key in seen_unset:
+                raise ValueError(f"{field}.unset must not contain duplicates")
+            seen_unset.add(key)
+        if seen_unset.intersection(set_map):
+            raise ValueError(f"{field} set and unset keys must be disjoint")
+        normalized.append(
+            {"at": at, "set": dict(set_map), "unset": list(unset)}
+        )
+    return normalized
+
+
+def decision_journey(
+    start: str,
+    end: str,
+    initial_facts: dict[str, bool],
+    events: list[dict[str, Any]],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Explain the decision journey under fact events and rule changes.
+
+    ``start`` and ``end`` must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``start <= end``; ``initial_facts`` and
+    ``rules`` are validated exactly as in :func:`explain`; ``events`` is
+    validated by :func:`_validate_events`. Any type, time, fact, event, or
+    rule violation raises ``ValueError`` without mutating the inputs.
+
+    Events are applied in ascending ``at`` order: at a given time the
+    ``set`` entries first override the facts and the ``unset`` keys are
+    deleted, then the effective rules are evaluated. The candidate
+    timestamps are ``start``, every event ``at``, and every rule ``from``
+    and non-``None`` ``to`` falling in ``(start, end]``, deduplicated and
+    sorted ascending. The first point is always kept; a later point is
+    kept only when its facts or full explanation differs from the
+    previously kept point.
+
+    Returns a deep copy with top-level keys ``start``, ``end``,
+    ``initial_facts``, ``points``; every fact map has keys sorted in
+    Unicode code point order. Each point has keys ``at``, ``facts``,
+    ``decision``, ``trace``, ``basis``, ``conflicts``, ``causes``,
+    ``changes``; the five explanation fields are exactly the
+    :func:`explain` values at ``at`` under the point's facts. ``causes``
+    lists the point's sources: ``["start"]`` for the first point,
+    otherwise ``"facts"`` when an event lands at ``at`` and/or ``"rules"``
+    when a rule boundary lands at ``at``, in that order. ``changes`` has
+    exactly the keys ``facts`` and ``explanation``: the fact keys added,
+    removed, or value-changed relative to the previously kept point in
+    Unicode code point order, and the changed fields among ``decision``,
+    ``trace``, ``basis``, ``conflicts`` in that order; both are empty for
+    the first point.
+    """
+    _check_time(start, "start")
+    _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    _check_fact_map(initial_facts, "initial_facts")
+    normalized_events = _validate_events(events, start, end)
+    rules = _validate_rules(rules)
+
+    events_by_at = {event["at"]: event for event in normalized_events}
+    boundaries: set[str] = set()
+    for rule in rules:
+        for boundary in (rule["from"], rule["to"]):
+            if boundary is not None and start < boundary <= end:
+                boundaries.add(boundary)
+    candidates = boundaries | set(events_by_at) | {start}
+
+    facts = _sorted_fact_map(initial_facts)
+    points: list[dict[str, Any]] = []
+    previous_facts: dict[str, bool] | None = None
+    previous_report: dict[str, Any] | None = None
+    for at in sorted(candidates):
+        causes: list[str] = []
+        event = events_by_at.get(at)
+        if event is not None:
+            for key, value in event["set"].items():
+                facts[key] = value
+            for key in event["unset"]:
+                facts.pop(key, None)
+            causes.append("facts")
+        if at in boundaries:
+            causes.append("rules")
+        report = _explain_ranked(at, facts, _effective_rules(at, rules))
+        point_facts = _sorted_fact_map(facts)
+        if previous_report is None:
+            causes = ["start"]
+            changes: dict[str, Any] = {"facts": [], "explanation": []}
+        else:
+            assert previous_facts is not None
+            fact_changes = sorted(
+                key
+                for key in set(point_facts) | set(previous_facts)
+                if key not in previous_facts
+                or key not in point_facts
+                or previous_facts[key] != point_facts[key]
+            )
+            explanation_changes = [
+                field
+                for field in _COMPARE_FIELDS
+                if previous_report[field] != report[field]
+            ]
+            if not fact_changes and not explanation_changes:
+                continue
+            changes = {"facts": fact_changes, "explanation": explanation_changes}
+        points.append(
+            {
+                "at": at,
+                "facts": point_facts,
+                "decision": report["decision"],
+                "trace": report["trace"],
+                "basis": report["basis"],
+                "conflicts": report["conflicts"],
+                "causes": causes,
+                "changes": changes,
+            }
+        )
+        previous_facts = point_facts
+        previous_report = report
+    return {
+        "start": start,
+        "end": end,
+        "initial_facts": _sorted_fact_map(initial_facts),
+        "points": points,
+    }
+
+
 _CASE_KEYS = frozenset({"id", "facts"})
 
 
