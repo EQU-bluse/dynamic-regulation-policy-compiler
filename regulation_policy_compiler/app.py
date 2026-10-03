@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
@@ -124,1117 +125,646 @@ def _record_response(record: dict[str, Any]) -> Response:
     return Response(content=text, media_type="application/json")
 
 
+async def _policy_request(
+    request: Request,
+    keys: frozenset[str] | set[str],
+    fields: tuple[str, ...],
+    operation: Callable[..., Any],
+    *,
+    verify: bool = False,
+) -> Response:
+    """Shared HTTP boundary for stateless policy endpoints.
+
+    Reads and parses the request body, enforces the exact key set, calls the
+    pure policy operation with the listed fields in order, maps ValueError to
+    422, and encodes the result as compact UTF-8 JSON. Verify operations wrap
+    their boolean outcome as {"valid": ...}; any other exception propagates.
+    """
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) != keys:
+        return _invalid_request()
+    try:
+        result = operation(*(body[field] for field in fields))
+    except ValueError:
+        return _invalid_request()
+    if verify:
+        result = {"valid": result}
+    return _record_response(result)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/rules/compile")
+@app.post(
+    "/rules/compile",
+)
 async def compile_rules_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _COMPILE_KEYS:
-        return _invalid_request()
-    try:
-        compiled = compile_rules(body["at"], body["rules"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(compiled)
-
-
-@app.post("/rules/coverage")
-async def policy_coverage_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _COVERAGE_KEYS:
-        return _invalid_request()
-    try:
-        report = policy_coverage(body["at"], body["fact_keys"], body["rules"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/rules/attest")
-async def policy_attestation_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _COMPILE_KEYS:
-        return _invalid_request()
-    try:
-        attestation = policy_attestation(body["at"], body["rules"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(attestation)
-
-
-@app.post("/rules/schedule")
-async def policy_schedule_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _SCHEDULE_KEYS:
-        return _invalid_request()
-    try:
-        report = policy_schedule(body["start"], body["end"], body["rules"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/rules/schedule/attest")
-async def policy_schedule_attestation_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _SCHEDULE_KEYS:
-        return _invalid_request()
-    try:
-        report = policy_schedule_attestation(
-            body["start"], body["end"], body["rules"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/explanations")
-async def explain_decision(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _POST_KEYS:
-        return _invalid_request()
-    try:
-        report = explain(body["at"], body["facts"], body["rules"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-counterfactual")
-async def decision_counterfactual_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _COUNTERFACTUAL_KEYS:
-        return _invalid_request()
-    try:
-        report = decision_counterfactual(
-            body["at"], body["facts"], body["target"], body["rules"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/explanations/attest")
-async def decision_attestation_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _POST_KEYS:
-        return _invalid_request()
-    try:
-        attestation = decision_attestation(body["at"], body["facts"], body["rules"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(attestation)
-
-
-@app.post("/explanations/attest/verify")
-async def verify_decision_attestation_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_decision_attestation(body["report"], body["expected"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-changes")
-async def decision_changes(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _COMPARE_KEYS:
-        return _invalid_request()
-    try:
-        report = compare_decisions(
-            body["from"], body["to"], body["facts"], body["rules"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-timeline")
-async def decision_timeline_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _TIMELINE_KEYS:
-        return _invalid_request()
-    try:
-        report = decision_timeline(
-            body["start"], body["end"], body["facts"], body["rules"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-timeline/attest")
-async def decision_timeline_attestation_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _TIMELINE_KEYS:
-        return _invalid_request()
-    try:
-        report = decision_timeline_attestation(
-            body["start"], body["end"], body["facts"], body["rules"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-timeline/attest/verify")
-async def verify_decision_timeline_attestation_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_decision_timeline_attestation(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-journey")
-async def decision_journey_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _JOURNEY_KEYS:
-        return _invalid_request()
-    try:
-        report = decision_journey(
-            body["start"],
-            body["end"],
-            body["initial_facts"],
-            body["events"],
-            body["rules"],
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-impact")
-async def decision_impact_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _IMPACT_KEYS:
-        return _invalid_request()
-    try:
-        report = decision_impact(
-            body["from"], body["to"], body["cases"], body["rules"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-impact/attest")
-async def decision_impact_attestation_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _IMPACT_KEYS:
-        return _invalid_request()
-    try:
-        report = decision_impact_attestation(
-            body["from"], body["to"], body["cases"], body["rules"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-impact/attest/verify")
-async def verify_decision_impact_attestation_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_decision_impact_attestation(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-matrix/attest")
-async def decision_matrix_attestation_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _MATRIX_KEYS:
-        return _invalid_request()
-    try:
-        report = decision_matrix_attestation(
-            body["start"], body["end"], body["cases"], body["rules"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-matrix/attest/verify")
-async def verify_decision_matrix_attestation_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_decision_matrix_attestation(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-matrix/ledger")
-async def matrix_change_ledger_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _LEDGER_KEYS:
-        return _invalid_request()
-    try:
-        ledger = matrix_change_ledger(body["report"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(ledger)
-
-
-@app.post("/decision-matrix/attest/bundle")
-async def decision_matrix_attestation_bundle_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _MATRIX_BUNDLE_ITEMS_KEYS:
-        return _invalid_request()
-    try:
-        bundle = decision_matrix_attestation_bundle(body["items"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(bundle)
-
-
-@app.post("/decision-matrix/attest/bundle/verify")
-async def verify_decision_matrix_attestation_bundle_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_decision_matrix_attestation_bundle(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-matrix/attest/bundle/diff")
-async def matrix_bundle_diff_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _MATRIX_BUNDLE_DIFF_KEYS:
-        return _invalid_request()
-    try:
-        report = matrix_bundle_diff(body["before"], body["after"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-matrix/attest/bundle/diff/verify")
-async def verify_matrix_bundle_diff_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_matrix_bundle_diff(body["report"], body["expected"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-matrix/attest/bundle/evolution")
-async def matrix_bundle_evolution_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _MATRIX_BUNDLE_EVOLUTION_KEYS:
-        return _invalid_request()
-    try:
-        report = matrix_bundle_evolution(body["stages"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-matrix/attest/bundle/evolution/verify")
-async def verify_matrix_bundle_evolution_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_matrix_bundle_evolution(body["report"], body["expected"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-matrix/attest/bundle/evolution/checkpoint")
-async def evolution_checkpoint_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _EVOLUTION_CHECKPOINT_KEYS:
-        return _invalid_request()
-    try:
-        proof = evolution_checkpoint(body["report"], body["start"], body["end"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(proof)
-
-
-@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/verify")
-async def verify_evolution_checkpoint_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != (
-        _EVOLUTION_CHECKPOINT_VERIFY_KEYS
-    ):
-        return _invalid_request()
-    try:
-        valid = verify_evolution_checkpoint(body["proof"], body["expected"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/bundle")
-async def evolution_checkpoint_bundle_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_ITEMS_KEYS:
-        return _invalid_request()
-    try:
-        bundle = evolution_checkpoint_bundle(body["items"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(bundle)
-
-
-@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/bundle/verify")
-async def verify_evolution_checkpoint_bundle_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_evolution_checkpoint_bundle(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff")
-async def evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_DIFF_KEYS:
-        return _invalid_request()
-    try:
-        report = evolution_checkpoint_bundle_diff(body["before"], body["after"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
-
-
-@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/verify")
-async def verify_evolution_checkpoint_bundle_diff_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_evolution_checkpoint_bundle_diff(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
-
-
-@app.post("/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain")
-async def checkpoint_chain_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_CHAIN_KEYS:
-        return _invalid_request()
-    try:
-        report = checkpoint_chain(body["stages"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
+    return await _policy_request(
+        request, _COMPILE_KEYS, ("at", "rules",), compile_rules
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain/verify"
+    "/rules/coverage",
+)
+async def policy_coverage_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _COVERAGE_KEYS, ("at", "fact_keys", "rules",), policy_coverage
+    )
+
+
+@app.post(
+    "/rules/attest",
+)
+async def policy_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _COMPILE_KEYS, ("at", "rules",), policy_attestation
+    )
+
+
+@app.post(
+    "/rules/schedule",
+)
+async def policy_schedule_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _SCHEDULE_KEYS, ("start", "end", "rules",), policy_schedule
+    )
+
+
+@app.post(
+    "/rules/schedule/attest",
+)
+async def policy_schedule_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _SCHEDULE_KEYS, ("start", "end", "rules",), policy_schedule_attestation
+    )
+
+
+@app.post(
+    "/explanations",
+)
+async def explain_decision(request: Request) -> Response:
+    return await _policy_request(
+        request, _POST_KEYS, ("at", "facts", "rules",), explain
+    )
+
+
+@app.post(
+    "/decision-counterfactual",
+)
+async def decision_counterfactual_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _COUNTERFACTUAL_KEYS, ("at", "facts", "target", "rules",), decision_counterfactual
+    )
+
+
+@app.post(
+    "/explanations/attest",
+)
+async def decision_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _POST_KEYS, ("at", "facts", "rules",), decision_attestation
+    )
+
+
+@app.post(
+    "/explanations/attest/verify",
+)
+async def verify_decision_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_decision_attestation, verify=True
+    )
+
+
+@app.post(
+    "/decision-changes",
+)
+async def decision_changes(request: Request) -> Response:
+    return await _policy_request(
+        request, _COMPARE_KEYS, ("from", "to", "facts", "rules",), compare_decisions
+    )
+
+
+@app.post(
+    "/decision-timeline",
+)
+async def decision_timeline_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _TIMELINE_KEYS, ("start", "end", "facts", "rules",), decision_timeline
+    )
+
+
+@app.post(
+    "/decision-timeline/attest",
+)
+async def decision_timeline_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _TIMELINE_KEYS, ("start", "end", "facts", "rules",), decision_timeline_attestation
+    )
+
+
+@app.post(
+    "/decision-timeline/attest/verify",
+)
+async def verify_decision_timeline_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_decision_timeline_attestation, verify=True
+    )
+
+
+@app.post(
+    "/decision-journey",
+)
+async def decision_journey_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _JOURNEY_KEYS, ("start", "end", "initial_facts", "events", "rules",), decision_journey
+    )
+
+
+@app.post(
+    "/decision-impact",
+)
+async def decision_impact_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _IMPACT_KEYS, ("from", "to", "cases", "rules",), decision_impact
+    )
+
+
+@app.post(
+    "/decision-impact/attest",
+)
+async def decision_impact_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _IMPACT_KEYS, ("from", "to", "cases", "rules",), decision_impact_attestation
+    )
+
+
+@app.post(
+    "/decision-impact/attest/verify",
+)
+async def verify_decision_impact_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_decision_impact_attestation, verify=True
+    )
+
+
+@app.post(
+    "/decision-matrix/attest",
+)
+async def decision_matrix_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _MATRIX_KEYS, ("start", "end", "cases", "rules",), decision_matrix_attestation
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/verify",
+)
+async def verify_decision_matrix_attestation_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_decision_matrix_attestation, verify=True
+    )
+
+
+@app.post(
+    "/decision-matrix/ledger",
+)
+async def matrix_change_ledger_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _LEDGER_KEYS, ("report",), matrix_change_ledger
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle",
+)
+async def decision_matrix_attestation_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _MATRIX_BUNDLE_ITEMS_KEYS, ("items",), decision_matrix_attestation_bundle
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/verify",
+)
+async def verify_decision_matrix_attestation_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_decision_matrix_attestation_bundle, verify=True
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/diff",
+)
+async def matrix_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _MATRIX_BUNDLE_DIFF_KEYS, ("before", "after",), matrix_bundle_diff
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/diff/verify",
+)
+async def verify_matrix_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_matrix_bundle_diff, verify=True
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution",
+)
+async def matrix_bundle_evolution_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _MATRIX_BUNDLE_EVOLUTION_KEYS, ("stages",), matrix_bundle_evolution
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/verify",
+)
+async def verify_matrix_bundle_evolution_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_matrix_bundle_evolution, verify=True
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint",
+)
+async def evolution_checkpoint_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _EVOLUTION_CHECKPOINT_KEYS, ("report", "start", "end",), evolution_checkpoint
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/verify",
+)
+async def verify_evolution_checkpoint_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _EVOLUTION_CHECKPOINT_VERIFY_KEYS, ("proof", "expected",), verify_evolution_checkpoint, verify=True
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle",
+)
+async def evolution_checkpoint_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_BUNDLE_ITEMS_KEYS, ("items",), evolution_checkpoint_bundle
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/verify",
+)
+async def verify_evolution_checkpoint_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_evolution_checkpoint_bundle, verify=True
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff",
+)
+async def evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_BUNDLE_DIFF_KEYS, ("before", "after",), evolution_checkpoint_bundle_diff
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/verify",
+)
+async def verify_evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_evolution_checkpoint_bundle_diff, verify=True
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain",
+)
+async def checkpoint_chain_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_CHAIN_KEYS, ("stages",), checkpoint_chain
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain/verify",
 )
 async def verify_checkpoint_chain_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_checkpoint_chain(body["report"], body["expected"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_checkpoint_chain, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint"
+    ),
 )
 async def checkpoint_chain_checkpoint_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != (
-        _CHECKPOINT_CHAIN_CHECKPOINT_KEYS
-    ):
-        return _invalid_request()
-    try:
-        proof = checkpoint_chain_checkpoint(
-            body["report"], body["start"], body["end"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(proof)
+    return await _policy_request(
+        request, _CHECKPOINT_CHAIN_CHECKPOINT_KEYS, ("report", "start", "end",), checkpoint_chain_checkpoint
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/verify"
+    ),
 )
-async def verify_checkpoint_chain_checkpoint_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != (
-        _EVOLUTION_CHECKPOINT_VERIFY_KEYS
-    ):
-        return _invalid_request()
-    try:
-        valid = verify_checkpoint_chain_checkpoint(
-            body["proof"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_checkpoint_chain_checkpoint_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _EVOLUTION_CHECKPOINT_VERIFY_KEYS, ("proof", "expected",), verify_checkpoint_chain_checkpoint, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle"
+    ),
 )
-async def checkpoint_chain_checkpoint_bundle_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_ITEMS_KEYS:
-        return _invalid_request()
-    try:
-        bundle = checkpoint_chain_checkpoint_bundle(body["items"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(bundle)
+async def checkpoint_chain_checkpoint_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_BUNDLE_ITEMS_KEYS, ("items",), checkpoint_chain_checkpoint_bundle
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/verify"
+    ),
 )
-async def verify_checkpoint_chain_checkpoint_bundle_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_checkpoint_chain_checkpoint_bundle(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_checkpoint_chain_checkpoint_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_checkpoint_chain_checkpoint_bundle, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/diff"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/diff"
+    ),
 )
-async def checkpoint_chain_checkpoint_bundle_diff_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_DIFF_KEYS:
-        return _invalid_request()
-    try:
-        report = checkpoint_chain_checkpoint_bundle_diff(
-            body["before"], body["after"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
+async def checkpoint_chain_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_BUNDLE_DIFF_KEYS, ("before", "after",), checkpoint_chain_checkpoint_bundle_diff
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/diff/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/diff/verify"
+    ),
 )
-async def verify_checkpoint_chain_checkpoint_bundle_diff_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_checkpoint_chain_checkpoint_bundle_diff(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_checkpoint_chain_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_checkpoint_chain_checkpoint_bundle_diff, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution"
+    ),
 )
-async def checkpoint_chain_checkpoint_bundle_evolution_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _MATRIX_BUNDLE_EVOLUTION_KEYS:
-        return _invalid_request()
-    try:
-        report = checkpoint_chain_checkpoint_bundle_evolution(body["stages"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
+async def checkpoint_chain_checkpoint_bundle_evolution_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _MATRIX_BUNDLE_EVOLUTION_KEYS, ("stages",), checkpoint_chain_checkpoint_bundle_evolution
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/verify"
+    ),
 )
-async def verify_checkpoint_chain_checkpoint_bundle_evolution_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_checkpoint_chain_checkpoint_bundle_evolution(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_checkpoint_chain_checkpoint_bundle_evolution_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_checkpoint_chain_checkpoint_bundle_evolution, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint"
+    ),
 )
 async def bundle_evolution_checkpoint_endpoint(request: Request) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != (
-        _CHECKPOINT_CHAIN_CHECKPOINT_KEYS
-    ):
-        return _invalid_request()
-    try:
-        proof = bundle_evolution_checkpoint(
-            body["report"], body["start"], body["end"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(proof)
+    return await _policy_request(
+        request, _CHECKPOINT_CHAIN_CHECKPOINT_KEYS, ("report", "start", "end",), bundle_evolution_checkpoint
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/verify"
+    ),
 )
-async def verify_bundle_evolution_checkpoint_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != (
-        _EVOLUTION_CHECKPOINT_VERIFY_KEYS
-    ):
-        return _invalid_request()
-    try:
-        valid = verify_bundle_evolution_checkpoint(
-            body["proof"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_bundle_evolution_checkpoint_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _EVOLUTION_CHECKPOINT_VERIFY_KEYS, ("proof", "expected",), verify_bundle_evolution_checkpoint, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle"
+    ),
 )
-async def bundle_evolution_checkpoint_bundle_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_ITEMS_KEYS:
-        return _invalid_request()
-    try:
-        bundle = bundle_evolution_checkpoint_bundle(body["items"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(bundle)
+async def bundle_evolution_checkpoint_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_BUNDLE_ITEMS_KEYS, ("items",), bundle_evolution_checkpoint_bundle
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "verify"
+    ),
 )
-async def verify_bundle_evolution_checkpoint_bundle_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_bundle_evolution_checkpoint_bundle(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_bundle_evolution_checkpoint_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_bundle_evolution_checkpoint_bundle, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff"
+    ),
 )
-async def bundle_evolution_checkpoint_bundle_diff_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_DIFF_KEYS:
-        return _invalid_request()
-    try:
-        report = bundle_evolution_checkpoint_bundle_diff(
-            body["before"], body["after"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
+async def bundle_evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_BUNDLE_DIFF_KEYS, ("before", "after",), bundle_evolution_checkpoint_bundle_diff
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/verify"
+    ),
 )
-async def verify_bundle_evolution_checkpoint_bundle_diff_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_bundle_evolution_checkpoint_bundle_diff(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_bundle_evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_bundle_evolution_checkpoint_bundle_diff, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution"
+    ),
 )
-async def bundle_evolution_checkpoint_bundle_evolution_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _MATRIX_BUNDLE_EVOLUTION_KEYS:
-        return _invalid_request()
-    try:
-        report = bundle_evolution_checkpoint_bundle_evolution(body["stages"])
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
+async def bundle_evolution_checkpoint_bundle_evolution_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _MATRIX_BUNDLE_EVOLUTION_KEYS, ("stages",), bundle_evolution_checkpoint_bundle_evolution
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/verify"
+    ),
 )
-async def verify_bundle_evolution_checkpoint_bundle_evolution_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = verify_bundle_evolution_checkpoint_bundle_evolution(
-            body["report"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_bundle_evolution_checkpoint_bundle_evolution_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_bundle_evolution_checkpoint_bundle_evolution, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
-    "checkpoint"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/checkpoint"
+    ),
 )
-async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != (
-        _CHECKPOINT_CHAIN_CHECKPOINT_KEYS
-    ):
-        return _invalid_request()
-    try:
-        proof = bundle_evolution_checkpoint_bundle_evolution_checkpoint(
-            body["report"], body["start"], body["end"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(proof)
+async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_CHAIN_CHECKPOINT_KEYS, ("report", "start", "end",), bundle_evolution_checkpoint_bundle_evolution_checkpoint
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
-    "checkpoint/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/checkpoint/verify"
+    ),
 )
-async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != (
-        _EVOLUTION_CHECKPOINT_VERIFY_KEYS
-    ):
-        return _invalid_request()
-    try:
-        valid = verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint(
-            body["proof"], body["expected"]
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _EVOLUTION_CHECKPOINT_VERIFY_KEYS, ("proof", "expected",), verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
-    "checkpoint/bundle"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/checkpoint/bundle"
+    ),
 )
-async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_ITEMS_KEYS:
-        return _invalid_request()
-    try:
-        bundle = (
-            bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle(
-                body["items"]
-            )
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(bundle)
+async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_BUNDLE_ITEMS_KEYS, ("items",), bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
-    "checkpoint/bundle/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/checkpoint/bundle/verify"
+    ),
 )
-async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = (
-            verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle(
-                body["report"], body["expected"]
-            )
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
-    "checkpoint/bundle/diff"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/checkpoint/bundle/diff"
+    ),
 )
-async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _CHECKPOINT_BUNDLE_DIFF_KEYS:
-        return _invalid_request()
-    try:
-        report = (
-            bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff(
-                body["before"], body["after"]
-            )
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
+async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _CHECKPOINT_BUNDLE_DIFF_KEYS, ("before", "after",), bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
-    "checkpoint/bundle/diff/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/checkpoint/bundle/diff/verify"
+    ),
 )
-async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = (
-            verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff(
-                body["report"], body["expected"]
-            )
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff, verify=True
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
-    "checkpoint/bundle/diff/evolution"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/checkpoint/bundle/diff/evolution"
+    ),
 )
-async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _MATRIX_BUNDLE_EVOLUTION_KEYS:
-        return _invalid_request()
-    try:
-        report = (
-            bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution(
-                body["stages"]
-            )
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response(report)
+async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _MATRIX_BUNDLE_EVOLUTION_KEYS, ("stages",), bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution
+    )
 
 
 @app.post(
-    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/"
-    "chain/checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
-    "checkpoint/bundle/diff/evolution/verify"
+    (
+        "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/"
+        "diff/chain/checkpoint/bundle/evolution/checkpoint/bundle/"
+        "diff/evolution/checkpoint/bundle/diff/evolution/verify"
+    ),
 )
-async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_endpoint(
-    request: Request,
-) -> Response:
-    try:
-        body = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_request()
-    if not isinstance(body, dict) or set(body) != _VERIFY_KEYS:
-        return _invalid_request()
-    try:
-        valid = (
-            verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution(
-                body["report"], body["expected"]
-            )
-        )
-    except ValueError:
-        return _invalid_request()
-    return _record_response({"valid": valid})
+async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_endpoint(request: Request) -> Response:
+    return await _policy_request(
+        request, _VERIFY_KEYS, ("report", "expected",), verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution, verify=True
+    )
 
 
 @app.post("/decisions/{record_id}")
