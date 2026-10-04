@@ -8740,6 +8740,138 @@ def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_e
     return True
 
 
+_BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_DIFF_EVOLUTION_CHECKPOINT_EXPECTED_KEYS = (
+    _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_CHECKPOINT_EXPECTED_KEYS
+)
+
+
+def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint(
+    report: Any, start: str, end: str
+) -> dict[str, Any]:
+    """Cut a stage window out of a delivery-stage window proof bundle
+    evolution report.
+
+    Pure function: it only processes its arguments, accesses neither history
+    nor files, and never mutates an input object at any level.
+
+    ``start`` and ``end`` must be valid UTC seconds with ``start <= end`` and
+    both must be the ``at`` of stages that actually exist in ``report`` (an
+    illegal time, a missing boundary, a reversed window, or an illegal
+    report raises ``ValueError``). ``report`` must be a complete, fully
+    verifiable
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution`
+    report: any structural, time, ordering, window proof, member-chain,
+    adjacent-diff, stage-summary, stage-link, stage-digest, or root forgery
+    raises ``ValueError`` before anything is produced, and no partial result
+    is returned.
+
+    The proof covers the continuous run of stages from ``start`` through
+    ``end`` inclusive, with no stage skipped, reordered, substituted, or
+    fabricated. Returns a deep copy containing exactly the keys ``start``,
+    ``end``, ``anchor``, ``stages``, ``commitment`` in that order; every
+    level is an independent deep copy. When the window begins at the
+    report's first stage, ``anchor`` is 64 ASCII ``0`` characters;
+    otherwise it is the window's first stage ``previous`` (the immediately
+    preceding stage's ``digest``). ``stages`` keep the full window stages;
+    the first stage of a non-head window keeps its original adjacent diff
+    and the bundle on its front side, so the window can be recomputed
+    without the report outside it. ``commitment`` is the last window
+    stage's ``digest`` and also equals the original report ``root`` when
+    the window reaches the report's end. Equal-valued inputs yield
+    byte-identical compact JSON results.
+    """
+    start = _check_time(start, "start")
+    end = _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    # The value engine validates and recomputes the whole report once;
+    # the window is assembled from the cached canonical stage bytes.
+    return _emit(_VEngine().cut_window(3, report, start, end))
+
+
+def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint(
+    proof: Any, expected: Any
+) -> bool:
+    """Verify a
+    :func:`bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint`
+    proof without the report.
+
+    Pure function: it only inspects its arguments, touches neither history
+    nor files, and never mutates an input object at any level. The carried
+    first-stage diff brings the front-side bundle, so no report outside the
+    window is required.
+
+    ``proof`` must be a dict with exactly the keys ``start``, ``end``,
+    ``anchor``, ``stages``, ``commitment``; ``start``/``end`` must be valid
+    UTC seconds with ``start <= end`` and ``anchor``/``commitment`` 64
+    lowercase hexadecimal characters. ``stages`` must be a non-empty list of
+    full delivery-stage window proof bundle evolution stages whose ``at``
+    values are strictly increasing, whose delivery-stage window proof
+    bundles pass every bundle structural and embedded-proof semantic check,
+    and whose adjacent diffs correspond to their neighbors: the genesis
+    stage carries 64 zeroes as ``previous`` and a ``null`` diff; any other
+    first stage keeps its front-side bundle diff whose ``after`` bundle
+    reproduces that stage, and every later diff must reproduce the
+    preceding and current bundles. ``expected`` must have exactly the keys
+    ``start``, ``end``, ``anchor``, ``commitment`` and is validated the
+    same way. Exact key sets, times, digest formats, stage order, and every
+    embedded credential semantic are checked on both inputs first; an
+    illegal structure, an invalid bundle, a wrong change classification, or
+    an adjacent diff that does not correspond raises ``ValueError``.
+
+    Only afterwards are values recomputed rather than trusted: the first
+    stage from ``anchor`` (its carried diff and front-side bundle
+    recomputed), every embedded window proof and member chain, each
+    adjacent diff, every ``previous``/``digest`` stage link, the stage
+    digests, and the terminal ``commitment``. Returns ``False`` for a wrong
+    anchor, a broken link, a skipped stage, a tampered diff (including a
+    structurally legal change list that omits or invents a change), a
+    boundary mismatch, or any ``expected`` disagreement after the
+    structures are legal; otherwise ``True``.
+    """
+    # Structural and embedded-credential validation plus full recomputation
+    # of the whole proof first; any key-set, type, time, ordering, bundle,
+    # or adjacent-diff structural/semantic violation raises ValueError, and
+    # a false anchor, link, bundle, diff/change set, stage digest, boundary,
+    # or commitment is carried on the node as truth == False.
+    node = _VEngine().delivery_chain_window_proof(proof, "proof")
+
+    if not isinstance(expected, dict) or set(expected) != set(
+        _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_DIFF_EVOLUTION_CHECKPOINT_EXPECTED_KEYS
+    ):
+        raise ValueError(
+            "expected must be a dict with exactly the keys "
+            "start, end, anchor, commitment"
+        )
+    expected_start = _check_time(expected["start"], "expected.start")
+    expected_end = _check_time(expected["end"], "expected.end")
+    if expected_start > expected_end:
+        raise ValueError("expected.start must not be after expected.end")
+    expected_anchor = _check_hex64(expected["anchor"], "expected.anchor")
+    expected_commitment = _check_hex64(
+        expected["commitment"], "expected.commitment"
+    )
+
+    # Both inputs have now passed every structural and embedded-credential
+    # semantic check. Only now compare; any mismatch yields False rather
+    # than raising.
+    if not node.truth:
+        return False
+    rows = node.members
+    declared_anchor = proof["anchor"]
+    declared_commitment = proof["commitment"]
+    if (
+        proof["start"] != expected_start
+        or proof["end"] != expected_end
+        or declared_anchor != expected_anchor
+        or declared_commitment != expected_commitment
+    ):
+        return False
+    if rows[0][0] != expected_start or rows[-1][0] != expected_end:
+        return False
+    return True
+
+
 """Value-identity proof engine (appended into policy.py).
 
 Within one top-level bundle-evolution bundle diff call the same deep
@@ -8962,6 +9094,7 @@ class _VEngine:
         self.p3: dict[Any, _VNode] = {}
         self.b3: dict[Any, _VNode] = {}
         self.d3: dict[Any, _VNode] = {}
+        self.p4: dict[Any, _VNode] = {}
         # Generated diffs are fully determined by the two side nodes and the
         # derived change entries; memoizing on those avoids rebuilding the
         # whole five-item payload (and its SHA-256) for a repeated pair.
@@ -9670,6 +9803,17 @@ class _VEngine:
             2, lambda v, f: self.proof_diff(2, v, f),
         )
 
+    def delivery_chain_window_proof(self, value, field):
+        # A window cut from a delivery-stage window proof bundle evolution
+        # report: the stages carry the same level-3 bundles and adjacent
+        # level-3 diffs as the chain, so only the proof tag/registry are new.
+        return self._proof(
+            "p4", self.p4, value, field,
+            _DELIVERY_BUNDLE_DIFF_EVOLUTION_GENESIS,
+            lambda v, f: self.proof_bundle(3, v, f),
+            3, lambda v, f: self.proof_diff(3, v, f),
+        )
+
     def _chain_report(self, level: int, value: Any, field: str) -> _VNode:
         """Parse a full ``root, stages`` chain report into a truth node.
 
@@ -9970,7 +10114,8 @@ class _VEngine:
         JSON text reuses the parsed stage bytes, so window stages are not
         normalized again. ``level`` is -1 for matrix bundle evolution
         reports, 0 for checkpoint chain reports, 1 for chain window
-        proof bundle evolution reports, and 2 for window-proof bundle
+        proof bundle evolution reports, 2 for window-proof bundle
+        evolution reports, and 3 for delivery-stage window proof bundle
         evolution reports.
         """
         genesis, proof_parse = {
@@ -9983,6 +10128,10 @@ class _VEngine:
             2: (
                 _BUNDLE_EVOLUTION_CHECKPOINT_BUNDLE_EVOLUTION_GENESIS,
                 self.delivery_window_proof,
+            ),
+            3: (
+                _DELIVERY_BUNDLE_DIFF_EVOLUTION_GENESIS,
+                self.delivery_chain_window_proof,
             ),
         }[level]
         node = self._report_node(proof_parse, genesis, report, field)
