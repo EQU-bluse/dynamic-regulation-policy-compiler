@@ -24,6 +24,7 @@ from .policy import (
     bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle,
     bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff,
     bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution,
+    bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint,
     checkpoint_chain,
     checkpoint_chain_checkpoint,
     checkpoint_chain_checkpoint_bundle,
@@ -59,6 +60,7 @@ from .policy import (
     verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle,
     verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff,
     verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution,
+    verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint,
     verify_checkpoint_chain,
     verify_checkpoint_chain_checkpoint,
     verify_checkpoint_chain_checkpoint_bundle,
@@ -907,6 +909,39 @@ async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_
         _VERIFY_KEYS,
         verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution,
         ("report", "expected"),
+        wrap_valid=True,
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain/"
+    "checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
+    "checkpoint/bundle/diff/evolution/checkpoint"
+)
+async def bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint_endpoint(
+    request: Request,
+) -> Response:
+    return await _policy_response(
+        request,
+        _CHECKPOINT_CHAIN_CHECKPOINT_KEYS,
+        bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint,
+        ("report", "start", "end"),
+    )
+
+
+@app.post(
+    "/decision-matrix/attest/bundle/evolution/checkpoint/bundle/diff/chain/"
+    "checkpoint/bundle/evolution/checkpoint/bundle/diff/evolution/"
+    "checkpoint/bundle/diff/evolution/checkpoint/verify"
+)
+async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint_endpoint(
+    request: Request,
+) -> Response:
+    return await _policy_response(
+        request,
+        _EVOLUTION_CHECKPOINT_VERIFY_KEYS,
+        verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_diff_evolution_checkpoint,
+        ("proof", "expected"),
         wrap_valid=True,
     )
 
