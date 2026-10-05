@@ -1319,6 +1319,146 @@ def policy_shadow_report(
     }
 
 
+_COVERAGE_TIMELINE_COMPARE_FIELDS = ("decision", "trace", "basis", "conflicts")
+
+
+def policy_coverage_timeline(
+    start: str,
+    end: str,
+    fact_keys: list[str],
+    rules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Track exhaustive fact-domain coverage across a time range.
+
+    ``start`` and ``end`` must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``start <= end``; ``fact_keys`` is
+    normalized exactly as in :func:`policy_coverage` and ``rules`` is
+    validated exactly as in :func:`compile_rules`. Any type, time,
+    fact-key, or rule-structure violation raises ``ValueError`` without
+    mutating the inputs, as does any rule selected at a candidate point
+    whose ``when`` references a key outside ``fact_keys``. No history or
+    file is accessed.
+
+    The candidate timestamps are ``start`` plus every rule ``from`` and
+    non-``None`` ``to`` falling in ``(start, end]``, deduplicated and
+    sorted ascending; :func:`compile_rules` and :func:`policy_coverage`
+    are computed at each candidate.
+
+    Returns a deep copy with keys ``start``, ``end``, ``fact_keys``,
+    ``points``, ``gaps``; ``fact_keys`` is the normalized domain. The
+    first point is always kept; a later candidate is kept only when the
+    compiled rules or conflicts changed or when some combination's
+    ``decision``, ``trace``, ``basis``, or ``conflicts`` changed. Each
+    point has keys ``at``, ``policy``, ``coverage``, ``changes``;
+    ``policy`` is the full :func:`compile_rules` result at ``at`` and
+    ``coverage`` the full :func:`policy_coverage` result at ``at``. The
+    first point's ``changes`` is ``[]``; a later point's ``changes``
+    lists, in combination enumeration order, the full ``facts`` of every
+    combination whose explanation changed, so a point kept only for a
+    policy change has ``changes == []``.
+
+    ``gaps`` lists, in combination enumeration order and then ``from``
+    ascending, the maximal consecutive intervals over which the
+    combination's ``decision`` is ``None``; each item has keys ``facts``,
+    ``from``, ``to``. When the decision recovers, ``to`` is the recovery
+    point and the interval excludes it; when the combination stays
+    undecided through the end, ``to`` is ``end`` and includes it.
+    ``start == end`` still yields one snapshot, and a combination
+    undecided there produces a gap with both ends equal to ``start``. An
+    empty ``fact_keys`` analyzes only ``facts == {}``; empty rules leave
+    every combination undecided over the whole range. Equal-valued inputs
+    yield byte-identical compact JSON regardless of rule, dict, or
+    ``fact_keys`` order, and the result shares no containers with the
+    inputs.
+    """
+    _check_time(start, "start")
+    _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    keys = _normalize_fact_keys(fact_keys)
+    _validate_rules(rules)
+
+    candidates = {start}
+    for rule in rules:
+        for boundary in (rule["from"], rule["to"]):
+            if boundary is not None and start < boundary <= end:
+                candidates.add(boundary)
+
+    points: list[dict[str, Any]] = []
+    combination_facts: list[dict[str, bool]] = []
+    gap_lists: list[list[dict[str, Any]]] = []
+    open_gaps: list[str | None] = []
+    previous_policy: dict[str, Any] | None = None
+    previous_explanations: list[dict[str, Any]] | None = None
+    for at in sorted(candidates):
+        policy = compile_rules(at, rules)
+        coverage = policy_coverage(at, keys, rules)
+        explanations = [case["explanation"] for case in coverage["cases"]]
+        if previous_explanations is None:
+            combination_facts = [case["facts"] for case in coverage["cases"]]
+            gap_lists = [[] for _ in explanations]
+            open_gaps = [None for _ in explanations]
+            changes: list[dict[str, bool]] = []
+            keep = True
+        else:
+            changes = [
+                copy.deepcopy(facts)
+                for facts, previous, current in zip(
+                    combination_facts, previous_explanations, explanations
+                )
+                if any(
+                    previous[field] != current[field]
+                    for field in _COVERAGE_TIMELINE_COMPARE_FIELDS
+                )
+            ]
+            keep = (
+                policy["rules"] != previous_policy["rules"]
+                or policy["conflicts"] != previous_policy["conflicts"]
+                or bool(changes)
+            )
+        for index, explanation in enumerate(explanations):
+            if explanation["decision"] is None:
+                if open_gaps[index] is None:
+                    open_gaps[index] = at
+            elif open_gaps[index] is not None:
+                gap_lists[index].append(
+                    {
+                        "facts": copy.deepcopy(combination_facts[index]),
+                        "from": open_gaps[index],
+                        "to": at,
+                    }
+                )
+                open_gaps[index] = None
+        if keep:
+            points.append(
+                {
+                    "at": at,
+                    "policy": policy,
+                    "coverage": coverage,
+                    "changes": changes,
+                }
+            )
+        previous_policy = policy
+        previous_explanations = explanations
+    for index, gap_from in enumerate(open_gaps):
+        if gap_from is not None:
+            gap_lists[index].append(
+                {
+                    "facts": copy.deepcopy(combination_facts[index]),
+                    "from": gap_from,
+                    "to": end,
+                }
+            )
+    gaps = [gap for combo_gaps in gap_lists for gap in combo_gaps]
+    return {
+        "start": start,
+        "end": end,
+        "fact_keys": keys,
+        "points": points,
+        "gaps": gaps,
+    }
+
+
 def _sorted_fact_map(facts: dict[str, bool]) -> dict[str, bool]:
     """Return a deep-copied fact map with keys in Unicode code point order."""
     return {key: facts[key] for key in sorted(facts)}
