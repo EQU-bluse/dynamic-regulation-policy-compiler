@@ -1214,6 +1214,111 @@ def policy_coverage(
     return {"at": at, "fact_keys": keys, "cases": cases, "summary": summary}
 
 
+def policy_shadow_report(
+    at: str, fact_keys: list[str], rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Explain why non-winning rules are shadowed across the fact domain.
+
+    Validation, effective-version selection, ranking, fact-key
+    normalization, and the boolean enumeration order (normalized key
+    order, ``False`` before ``True``) are exactly those of
+    :func:`policy_coverage`; invalid input raises ``ValueError``. No
+    history or file is accessed and the inputs are not mutated at any
+    level.
+
+    Returns a deep copy with top-level keys ``at``, ``fact_keys``,
+    ``total_cases``, ``rules``. ``rules`` lists every selected rule in
+    compiled order; each entry has keys ``rule`` (the full normalized
+    rule snapshot), ``matched`` (number of enumerated assignments whose
+    condition holds), ``won`` (number of them for which the rule is the
+    final basis), and ``blockers``. For every matched but not won
+    assignment, the actual basis of that assignment is recorded as a
+    blocker; blockers are deduplicated in compiled order and each has
+    keys ``rule`` (the blocker's ``[source, id, ver]`` triple),
+    ``cases`` (how many assignments it blocked), and ``witness`` (the
+    full normalized fact object of the first such assignment in
+    enumeration order). A blocker with the same ``result`` as the
+    shadowed rule is still recorded, since the report explains the
+    basis rather than the result value. For every rule, ``won`` plus
+    all blocker ``cases`` equals ``matched``. With no rules, ``rules``
+    is empty and ``total_cases`` is still the fact-combination count;
+    an empty ``fact_keys`` analyzes only ``facts == {}``.
+    """
+    keys = _normalize_fact_keys(fact_keys)
+    ranked = _effective_rules(at, rules)
+    domain = set(keys)
+    for rule in ranked:
+        when = rule["when"]
+        if when is not None:
+            for key in when:
+                if key not in domain:
+                    raise ValueError(
+                        f"rule {rule['id']}@{rule['ver']} references fact key "
+                        f"outside fact_keys: {key!r}"
+                    )
+
+    identities = [
+        (rule["source"], rule["id"], rule["ver"]) for rule in ranked
+    ]
+    matched = [0 for _ in ranked]
+    won = [0 for _ in ranked]
+    blocker_cases: list[dict[int, int]] = [
+        {} for _ in ranked
+    ]
+    witnesses: list[dict[int, dict[str, bool]]] = [
+        {} for _ in ranked
+    ]
+
+    total_cases = 0
+    for values in itertools.product((False, True), repeat=len(keys)):
+        facts = dict(zip(keys, values))
+        total_cases += 1
+        matching_indices = [
+            index
+            for index, rule in enumerate(ranked)
+            if _matches(rule, facts)
+        ]
+        for index in matching_indices:
+            matched[index] += 1
+        if matching_indices:
+            basis_index = matching_indices[0]
+            won[basis_index] += 1
+            # Every other rule that matches this assignment is blocked by
+            # the assignment's actual basis, even when the blocker shares
+            # the rule's result: the report explains bases, not values.
+            for index in matching_indices[1:]:
+                counts = blocker_cases[index]
+                counts[basis_index] = counts.get(basis_index, 0) + 1
+                if basis_index not in witnesses[index]:
+                    witnesses[index][basis_index] = dict(facts)
+
+    entries: list[dict[str, Any]] = []
+    for index, rule in enumerate(ranked):
+        blockers = [
+            {
+                "rule": list(identities[basis_index]),
+                "cases": blocker_cases[index][basis_index],
+                "witness": dict(witnesses[index][basis_index]),
+            }
+            for basis_index in sorted(blocker_cases[index])
+        ]
+        entries.append(
+            {
+                "rule": _snapshot_rule(rule),
+                "matched": matched[index],
+                "won": won[index],
+                "blockers": blockers,
+            }
+        )
+
+    return {
+        "at": at,
+        "fact_keys": list(keys),
+        "total_cases": total_cases,
+        "rules": entries,
+    }
+
+
 def _sorted_fact_map(facts: dict[str, bool]) -> dict[str, bool]:
     """Return a deep-copied fact map with keys in Unicode code point order."""
     return {key: facts[key] for key in sorted(facts)}

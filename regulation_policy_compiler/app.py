@@ -52,6 +52,7 @@ from .policy import (
     policy_coverage,
     policy_schedule,
     policy_schedule_attestation,
+    policy_shadow_report,
     verify_bundle_evolution_checkpoint,
     verify_bundle_evolution_checkpoint_bundle,
     verify_bundle_evolution_checkpoint_bundle_diff,
@@ -177,6 +178,16 @@ async def policy_coverage_endpoint(request: Request) -> Response:
         request,
         _COVERAGE_KEYS,
         policy_coverage,
+        ("at", "fact_keys", "rules"),
+    )
+
+
+@app.post("/rules/shadows")
+async def policy_shadow_report_endpoint(request: Request) -> Response:
+    return await _policy_response(
+        request,
+        _COVERAGE_KEYS,
+        policy_shadow_report,
         ("at", "fact_keys", "rules"),
     )
 
