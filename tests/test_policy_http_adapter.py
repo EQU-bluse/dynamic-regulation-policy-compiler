@@ -24,6 +24,7 @@ raising_client = TestClient(app, raise_server_exceptions=True)
 ROUTES = [
     ('/rules/compile', 'compile_rules_endpoint', 'compile_rules', ('at', 'rules'), False),
     ('/rules/coverage', 'policy_coverage_endpoint', 'policy_coverage', ('at', 'fact_keys', 'rules'), False),
+    ('/rules/shadows', 'policy_shadow_report_endpoint', 'policy_shadow_report', ('at', 'fact_keys', 'rules'), False),
     ('/rules/attest', 'policy_attestation_endpoint', 'policy_attestation', ('at', 'rules'), False),
     ('/rules/schedule', 'policy_schedule_endpoint', 'policy_schedule', ('start', 'end', 'rules'), False),
     ('/rules/schedule/attest', 'policy_schedule_attestation_endpoint', 'policy_schedule_attestation', ('start', 'end', 'rules'), False),
