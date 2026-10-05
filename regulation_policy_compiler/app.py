@@ -50,6 +50,7 @@ from .policy import (
     matrix_change_ledger,
     policy_attestation,
     policy_coverage,
+    policy_coverage_timeline,
     policy_schedule,
     policy_schedule_attestation,
     policy_shadow_report,
@@ -90,6 +91,7 @@ _POST_KEYS = {"at", "facts", "rules"}
 _COUNTERFACTUAL_KEYS = {"at", "facts", "target", "rules"}
 _COMPILE_KEYS = {"at", "rules"}
 _COVERAGE_KEYS = {"at", "fact_keys", "rules"}
+_COVERAGE_TIMELINE_KEYS = {"start", "end", "fact_keys", "rules"}
 _SCHEDULE_KEYS = {"start", "end", "rules"}
 _COMPARE_KEYS = {"from", "to", "facts", "rules"}
 _TIMELINE_KEYS = {"start", "end", "facts", "rules"}
@@ -179,6 +181,16 @@ async def policy_coverage_endpoint(request: Request) -> Response:
         _COVERAGE_KEYS,
         policy_coverage,
         ("at", "fact_keys", "rules"),
+    )
+
+
+@app.post("/rules/coverage/timeline")
+async def policy_coverage_timeline_endpoint(request: Request) -> Response:
+    return await _policy_response(
+        request,
+        _COVERAGE_TIMELINE_KEYS,
+        policy_coverage_timeline,
+        ("start", "end", "fact_keys", "rules"),
     )
 
 

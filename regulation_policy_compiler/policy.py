@@ -1319,6 +1319,135 @@ def policy_shadow_report(
     }
 
 
+_COVERAGE_TIMELINE_EXPLANATION_FIELDS = ("decision", "trace", "basis", "conflicts")
+
+
+def policy_coverage_timeline(
+    start: str, end: str, fact_keys: list[str], rules: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Track coverage and decision gaps across the rule boundaries in a range.
+
+    ``start`` and ``end`` must be valid UTC seconds of the form
+    ``YYYY-MM-DDTHH:MM:SSZ`` with ``start <= end``; ``fact_keys`` is
+    normalized exactly as in :func:`policy_coverage` (zero to twelve
+    non-empty, pairwise distinct strings, sorted in Unicode code point
+    order) and ``rules`` is validated exactly as in :func:`compile_rules`.
+    Any type, time, fact-key, or rule-structure violation raises
+    ``ValueError`` without mutating the inputs. If any rule selected at a
+    candidate timestamp references a key outside ``fact_keys`` in its
+    ``when``, ``ValueError`` is raised. No history or file is accessed and
+    the inputs are not mutated at any level.
+
+    The candidate timestamps are ``start`` plus every rule ``from`` and
+    non-``None`` ``to`` falling in ``(start, end]``, deduplicated and
+    sorted ascending; :func:`compile_rules` and :func:`policy_coverage`
+    are computed at each candidate. The first point is always kept; a
+    later point is kept only when the compiled ``rules`` or ``conflicts``
+    differ from the previously kept point, or when any enumerated fact
+    combination's ``decision``, ``trace``, ``basis``, or ``conflicts``
+    changed. A point kept solely because the compiled policy changed has
+    an empty ``changes``.
+
+    Returns a deep copy with top-level keys ``start``, ``end``,
+    ``fact_keys``, ``points``, ``gaps``. Each point has keys ``at``,
+    ``policy``, ``coverage``, ``changes``; ``policy`` is the full
+    :func:`compile_rules` result and ``coverage`` the full
+    :func:`policy_coverage` result at ``at``, each keeping its own
+    contract at every level. The first point's ``changes`` is ``[]``; a
+    later point's ``changes`` lists, in the fact-combination enumeration
+    order, the complete ``facts`` of every combination whose explanation
+    changed. ``gaps`` lists, in the fact-combination enumeration order
+    and then by ascending ``from``, the maximal consecutive intervals in
+    which a combination's ``decision`` is ``None``; each gap has keys
+    ``facts``, ``from``, ``to``, where ``from`` is the point at which the
+    decision was lost, ``to`` is the point at which it resumed (the
+    resuming point itself is not covered by the gap), or ``end``
+    (inclusive) when the gap runs to the end of the range. ``start ==
+    end`` still yields a single snapshot, and an undecided combination
+    produces a gap whose ``from`` and ``to`` both equal ``start``; empty
+    ``fact_keys`` analyzes only ``facts == {}`` and empty rules leave
+    every combination undecided over the whole range. Equal-valued inputs
+    yield byte-identical compact JSON regardless of rule, dict, or
+    ``fact_keys`` order, and the returned containers share no mutable
+    state with each other or the inputs.
+    """
+    _check_time(start, "start")
+    _check_time(end, "end")
+    if start > end:
+        raise ValueError(f"start must not be after end: {start!r} > {end!r}")
+    keys = _normalize_fact_keys(fact_keys)
+    _validate_rules(rules)
+
+    candidates = {start}
+    for rule in rules:
+        for boundary in (rule["from"], rule["to"]):
+            if boundary is not None and start < boundary <= end:
+                candidates.add(boundary)
+
+    points: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for at in sorted(candidates):
+        policy = compile_rules(at, rules)
+        coverage = policy_coverage(at, keys, rules)
+        if previous is None:
+            changes: list[dict[str, bool]] = []
+        else:
+            changes = [
+                copy.deepcopy(case["facts"])
+                for case, before in zip(
+                    coverage["cases"], previous["coverage"]["cases"]
+                )
+                if any(
+                    case["explanation"][field] != before["explanation"][field]
+                    for field in _COVERAGE_TIMELINE_EXPLANATION_FIELDS
+                )
+            ]
+            policy_changed = (
+                policy["rules"] != previous["policy"]["rules"]
+                or policy["conflicts"] != previous["policy"]["conflicts"]
+            )
+            if not policy_changed and not changes:
+                continue
+        point = {
+            "at": at,
+            "policy": policy,
+            "coverage": coverage,
+            "changes": changes,
+        }
+        points.append(point)
+        previous = point
+
+    gaps: list[dict[str, Any]] = []
+    for case_index in range(len(points[0]["coverage"]["cases"])):
+        facts = points[0]["coverage"]["cases"][case_index]["facts"]
+        gap_from: str | None = None
+        for point in points:
+            case = point["coverage"]["cases"][case_index]
+            if case["explanation"]["decision"] is None:
+                if gap_from is None:
+                    gap_from = point["at"]
+            elif gap_from is not None:
+                gaps.append(
+                    {
+                        "facts": copy.deepcopy(facts),
+                        "from": gap_from,
+                        "to": point["at"],
+                    }
+                )
+                gap_from = None
+        if gap_from is not None:
+            gaps.append(
+                {"facts": copy.deepcopy(facts), "from": gap_from, "to": end}
+            )
+    return {
+        "start": start,
+        "end": end,
+        "fact_keys": keys,
+        "points": points,
+        "gaps": gaps,
+    }
+
+
 def _sorted_fact_map(facts: dict[str, bool]) -> dict[str, bool]:
     """Return a deep-copied fact map with keys in Unicode code point order."""
     return {key: facts[key] for key in sorted(facts)}
