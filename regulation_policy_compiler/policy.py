@@ -7,7 +7,7 @@ import hashlib
 import itertools
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import cmp_to_key
 from typing import Any
 
@@ -50,36 +50,45 @@ def _check_fact_map(value: Any, field: str) -> dict[str, bool]:
     return value
 
 
+def _check_rule(rule: Any, field: str) -> None:
+    """Validate one rule's shape and field values.
+
+    Uniqueness of ``(source, id, ver)`` across a rule list is checked
+    separately by :func:`_validate_rules`.
+    """
+    if not isinstance(rule, dict) or set(rule) != _RULE_KEYS:
+        raise ValueError(
+            f"{field} must be a dict with exactly the keys "
+            "id, ver, source, priority, from, to, when, result"
+        )
+    _check_non_empty_str(rule["id"], f"{field}.id")
+    _check_non_empty_str(rule["result"], f"{field}.result")
+    ver = _check_int(rule["ver"], f"{field}.ver")
+    if ver < 1:
+        raise ValueError(f"{field}.ver must be a positive integer")
+    source = rule["source"]
+    if source not in _SOURCES:
+        raise ValueError(f"{field}.source must be 'law' or 'org'")
+    _check_int(rule["priority"], f"{field}.priority")
+    frm = _check_time(rule["from"], f"{field}.from")
+    to = rule["to"]
+    if to is not None:
+        _check_time(to, f"{field}.to")
+        if not frm < to:
+            raise ValueError(f"{field} requires from < to")
+    when = rule["when"]
+    if when is not None:
+        _check_fact_map(when, f"{field}.when")
+
+
 def _validate_rules(rules: Any) -> list[dict[str, Any]]:
     if not isinstance(rules, list):
         raise ValueError("rules must be a list of rule dicts")
     seen: set[tuple[str, str, int]] = set()
     for index, rule in enumerate(rules):
         field = f"rules[{index}]"
-        if not isinstance(rule, dict) or set(rule) != _RULE_KEYS:
-            raise ValueError(
-                f"{field} must be a dict with exactly the keys "
-                "id, ver, source, priority, from, to, when, result"
-            )
-        _check_non_empty_str(rule["id"], f"{field}.id")
-        _check_non_empty_str(rule["result"], f"{field}.result")
-        ver = _check_int(rule["ver"], f"{field}.ver")
-        if ver < 1:
-            raise ValueError(f"{field}.ver must be a positive integer")
-        source = rule["source"]
-        if source not in _SOURCES:
-            raise ValueError(f"{field}.source must be 'law' or 'org'")
-        _check_int(rule["priority"], f"{field}.priority")
-        frm = _check_time(rule["from"], f"{field}.from")
-        to = rule["to"]
-        if to is not None:
-            _check_time(to, f"{field}.to")
-            if not frm < to:
-                raise ValueError(f"{field} requires from < to")
-        when = rule["when"]
-        if when is not None:
-            _check_fact_map(when, f"{field}.when")
-        key = (source, rule["id"], ver)
+        _check_rule(rule, field)
+        key = (rule["source"], rule["id"], rule["ver"])
         if key in seen:
             raise ValueError(f"duplicate (source, id, ver): {key!r}")
         seen.add(key)
@@ -953,6 +962,362 @@ def explain(
     _check_fact_map(facts, "facts")
     ranked = _effective_rules(at, rules)
     return _explain_ranked(at, facts, ranked)
+
+
+class ReplayInputError(ValueError):
+    """Raised when a replay batch or its shared parameters are invalid.
+
+    Subclasses ``ValueError`` so the HTTP boundary keeps mapping it to a
+    422 response, exactly like the other input-validation failures. Raised
+    for a non-array batch, duplicate record ids, structurally malformed
+    records, a missing or ambiguous policy input, or an invalid cutoff;
+    in every case the whole call fails and no partial result is returned.
+    """
+
+
+_ISO_INSTANT_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?"
+    r"(Z|[+-]\d{2}:\d{2})"
+)
+
+
+def _normalize_instant(value: Any, field: str) -> str:
+    """Normalize an ISO 8601 timestamp with a timezone to a UTC ``...Z`` second.
+
+    Offsets are converted to UTC and fractional seconds are truncated, so
+    two spellings of the same instant (for example ``Z`` and a ``±HH:MM``
+    offset) normalize to the same string. Naive timestamps, malformed
+    strings, and out-of-range calendar or offset values raise
+    ``ValueError``.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{field} must be an ISO 8601 timestamp string with a timezone offset"
+        )
+    match = _ISO_INSTANT_RE.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            f"{field} must be an ISO 8601 timestamp of the form "
+            "YYYY-MM-DDTHH:MM:SS with Z or a ±HH:MM offset"
+        )
+    year, month, day, hour, minute, second, fraction, zone = match.groups()
+    microsecond = int(fraction.ljust(6, "0")[:6]) if fraction else 0
+    try:
+        if zone == "Z":
+            tz = timezone.utc
+        else:
+            sign = 1 if zone[0] == "+" else -1
+            tz = timezone(
+                sign * timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6]))
+            )
+        moment = datetime(
+            int(year), int(month), int(day),
+            int(hour), int(minute), int(second), microsecond, tzinfo=tz,
+        )
+        utc = moment.astimezone(timezone.utc).replace(microsecond=0)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} is not a valid calendar time: {value!r}") from exc
+    return (
+        f"{utc.year:04d}-{utc.month:02d}-{utc.day:02d}T"
+        f"{utc.hour:02d}:{utc.minute:02d}:{utc.second:02d}Z"
+    )
+
+
+_REPLAY_RECORD_KEYS = ("id", "at", "facts")
+
+
+def _check_replay_records(records: Any) -> list[dict[str, Any]]:
+    """Validate the replay batch structure, raising :class:`ReplayInputError`."""
+    if not isinstance(records, list):
+        raise ReplayInputError("records must be an array of replay record objects")
+    seen: set[str] = set()
+    for index, record in enumerate(records):
+        field = f"records[{index}]"
+        if not isinstance(record, dict) or not all(
+            key in record for key in _REPLAY_RECORD_KEYS
+        ):
+            raise ReplayInputError(
+                f"{field} must be an object carrying at least the keys id, at, facts"
+            )
+        record_id = record["id"]
+        if not isinstance(record_id, str) or not record_id:
+            raise ReplayInputError(f"{field}.id must be a non-empty string")
+        if record_id in seen:
+            raise ReplayInputError(f"records contain a duplicate id: {record_id!r}")
+        seen.add(record_id)
+        try:
+            _check_fact_map(record["facts"], f"{field}.facts")
+        except ValueError as exc:
+            raise ReplayInputError(str(exc)) from exc
+    return records
+
+
+def _replay_pool(rules: Any, compiled: Any) -> tuple[list[dict[str, Any]], bool]:
+    """Resolve the candidate rule pool for a replay batch.
+
+    Returns the pool and whether latest-version selection per ``(source,
+    id)`` still has to run (true for a raw policy set, false for an
+    already-compiled artifact, whose rules are trusted as the selected
+    versions and are validated field-by-field without the uniqueness
+    check so twin versions can surface as ``UNRESOLVED_CONFLICT``).
+    """
+    if rules is None and compiled is None:
+        raise ReplayInputError("a policy input is required: pass rules or compiled")
+    if rules is not None and compiled is not None:
+        raise ReplayInputError(
+            "rules and compiled are mutually exclusive policy inputs"
+        )
+    if rules is not None:
+        _validate_rules(rules)
+        return rules, True
+    if not isinstance(compiled, dict) or set(compiled) != {"at", "rules", "conflicts"}:
+        raise ValueError(
+            "compiled must be a compile_rules result with exactly the keys "
+            "at, rules, conflicts"
+        )
+    _check_time(compiled["at"], "compiled.at")
+    pool = compiled["rules"]
+    if not isinstance(pool, list):
+        raise ValueError("compiled.rules must be a list of rule dicts")
+    for index, rule in enumerate(pool):
+        _check_rule(rule, f"compiled.rules[{index}]")
+    return pool, False
+
+
+def _replay_candidates(
+    pool: list[dict[str, Any]],
+    select_latest: bool,
+    at: str,
+    cutoff: str | None,
+) -> list[dict[str, Any]]:
+    """Select and rank the candidate versions for one replay record.
+
+    A version participates when the record's occurrence time falls in its
+    ``[from, to)`` window (start inclusive, end exclusive) and, when a
+    cutoff is given, its ``from`` is not after the cutoff. The current
+    system time is never consulted.
+    """
+    effective = [
+        rule
+        for rule in pool
+        if rule["from"] <= at and (rule["to"] is None or at < rule["to"])
+    ]
+    if cutoff is not None:
+        effective = [rule for rule in effective if rule["from"] <= cutoff]
+    if select_latest:
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        for rule in effective:
+            key = (rule["source"], rule["id"])
+            if key not in latest or rule["ver"] > latest[key]["ver"]:
+                latest[key] = rule
+        effective = list(latest.values())
+    effective.sort(key=cmp_to_key(_compare))
+    return effective
+
+
+def _replay_error(
+    record_id: str, at: str | None, code: str, message: str, details: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "at": at,
+        "status": "error",
+        "error": {"code": code, "message": message, "details": details},
+    }
+
+
+def _replay_record(
+    record: dict[str, Any],
+    pool: list[dict[str, Any]],
+    select_latest: bool,
+    cutoff: str | None,
+) -> dict[str, Any]:
+    """Replay one record against the shared pool; never raises on bad data."""
+    record_id = record["id"]
+    try:
+        at = _normalize_instant(record["at"], "at")
+    except ValueError:
+        return _replay_error(
+            record_id,
+            None,
+            "INVALID_TIMESTAMP",
+            "at must be an ISO 8601 timestamp with a timezone offset",
+            {"field": "at", "value": copy.deepcopy(record["at"])},
+        )
+    ranked = _replay_candidates(pool, select_latest, at, cutoff)
+    if not ranked:
+        return _replay_error(
+            record_id,
+            at,
+            "VERSION_NOT_FOUND",
+            f"no policy version is effective at {at} and visible at the cutoff",
+            {"at": at, "cutoff": cutoff},
+        )
+    facts = record["facts"]
+    required = sorted(
+        {
+            key
+            for rule in ranked
+            if rule["when"] is not None
+            for key in rule["when"]
+        }
+    )
+    missing = [key for key in required if key not in facts]
+    if missing:
+        return _replay_error(
+            record_id,
+            at,
+            "MISSING_FACT",
+            "facts are missing required fields: " + ", ".join(missing),
+            {"fields": missing},
+        )
+    matched = [rule for rule in ranked if _matches(rule, facts)]
+    if matched:
+        tied = [rule for rule in matched if _compare(rule, matched[0]) == 0]
+        if len(tied) > 1 and len({rule["result"] for rule in tied}) > 1:
+            return _replay_error(
+                record_id,
+                at,
+                "UNRESOLVED_CONFLICT",
+                "the top-ranked matched candidates do not yield a unique winner",
+                {
+                    "candidates": [
+                        [rule["source"], rule["id"], rule["ver"]] for rule in tied
+                    ]
+                },
+            )
+    law = [f"{rule['id']}@{rule['ver']}" for rule in ranked if rule["source"] == "law"]
+    org = [f"{rule['id']}@{rule['ver']}" for rule in ranked if rule["source"] == "org"]
+    matched_flags = [_matches(rule, facts) for rule in ranked]
+    hit_index = next(
+        (index for index, flag in enumerate(matched_flags) if flag), None
+    )
+    candidates: list[dict[str, Any]] = []
+    for index, rule in enumerate(ranked):
+        if not matched_flags[index]:
+            reason = "unmatched"
+            when = rule["when"]
+            unmet: dict[str, bool] | None = {
+                key: when[key] for key in sorted(when) if facts[key] != when[key]
+            }
+        elif index == hit_index:
+            reason = "hit"
+            unmet = None
+        else:
+            reason = "outranked"
+            unmet = None
+        candidates.append(
+            {
+                "rule": _snapshot_rule(rule),
+                "matched": matched_flags[index],
+                "reason": reason,
+                "unmet": unmet,
+            }
+        )
+    if hit_index is None:
+        decision: str | None = None
+        hit: dict[str, Any] | None = None
+        conflicts: list[dict[str, Any]] = []
+    else:
+        winner = ranked[hit_index]
+        decision = winner["result"]
+        hit = _snapshot_rule(winner)
+        hit_key = [winner["source"], winner["id"], winner["ver"]]
+        conflicts = [
+            conflict
+            for conflict in _find_conflicts(ranked)
+            if conflict["winner"] == hit_key or conflict["loser"] == hit_key
+        ]
+    return {
+        "id": record_id,
+        "at": at,
+        "status": "ok",
+        "law": law,
+        "org": org,
+        "decision": decision,
+        "explanation": {
+            "candidates": candidates,
+            "conflicts": conflicts,
+            "hit": hit,
+        },
+    }
+
+
+def replay_decisions(
+    records: Any,
+    rules: Any = None,
+    compiled: Any = None,
+    cutoff: Any = None,
+) -> dict[str, Any]:
+    """Replay a batch of historical fact records against one shared policy.
+
+    Rebuilds, for every record, the decision the policy would have
+    produced at the record's business occurrence time. Exactly one policy
+    input must be given: ``rules`` is a raw versioned policy set validated
+    like :func:`compile_rules` (raising ``ValueError`` on anything
+    invalid), and ``compiled`` is an existing :func:`compile_rules` result
+    whose already-selected rule versions are used as the candidate pool.
+    ``cutoff`` is an optional ISO 8601 timestamp simulating the rule set
+    knowable at that moment: versions whose ``from`` lies after the cutoff
+    never participate. The cutoff never replaces the record's occurrence
+    time; without a cutoff only versions effective at the record time can
+    be selected. Version selection depends only on each record's
+    occurrence time — the current system time is never read — with the
+    ``from`` boundary inclusive and the ``to`` boundary exclusive.
+    Overlapping scopes keep the existing conflict priority and
+    deterministic ordering of :func:`evaluate`.
+
+    ``records`` must be an array; each record carries at least ``id`` (a
+    caller-provided non-empty string unique within the batch), ``at`` (an
+    ISO 8601 timestamp with a timezone offset), and ``facts`` (a
+    ``dict[str, bool]``). A non-array batch, duplicate ids, structurally
+    malformed records, a missing or ambiguous policy input, or an invalid
+    cutoff raise :class:`ReplayInputError` and no partial result is
+    returned. An empty batch succeeds with an empty ``results`` array.
+
+    The result is a fresh structure with top-level keys ``cutoff`` (the
+    normalized cutoff or ``None``) and ``results``. ``results`` preserves
+    the input record order; each entry keeps the caller's ``id`` and the
+    normalized UTC occurrence time ``at``. A successful entry has
+    ``status`` ``"ok"``, the selected law and organization rule versions
+    as ``id@ver`` lists under ``law`` and ``org``, the final ``decision``,
+    and an ``explanation`` with keys ``candidates``, ``conflicts``,
+    ``hit``: every candidate rule snapshot in ranking order annotated with
+    ``matched``, a ``reason`` (``hit``, ``outranked``, or ``unmatched``
+    with the unmet conditions under ``unmet``), the compile conflicts
+    involving the hit rule (the priority comparisons), and the winning
+    rule snapshot (``None`` when nothing matched).
+
+    A failing record never blocks the others and never fabricates a
+    decision: its entry has ``status`` ``"error"`` and an ``error`` object
+    with a stable ``code``, a human-readable ``message``, and ``details``
+    holding the relevant fields or candidate rule identities — ``at`` is
+    ``None`` when normalization failed. Codes are ``INVALID_TIMESTAMP``
+    (occurrence time not parseable), ``VERSION_NOT_FOUND`` (no version
+    effective at the record time and visible at the cutoff),
+    ``MISSING_FACT`` (facts lack fields required by the selected rules),
+    and ``UNRESOLVED_CONFLICT`` (the existing conflict semantics cannot
+    pick a unique winner among the top-ranked matched candidates). Error
+    entries contain no current time, random identifier, or environment
+    information.
+
+    Neither the inputs nor the compiled artifact are mutated at any
+    level. Identical policies, parameters, and records always yield
+    identical content and order; permuting the records only permutes the
+    results, never any record's decision. Timestamps spelling the same
+    instant with different offsets select the same versions.
+    """
+    pool, select_latest = _replay_pool(rules, compiled)
+    if cutoff is not None:
+        try:
+            cutoff = _normalize_instant(cutoff, "cutoff")
+        except ValueError as exc:
+            raise ReplayInputError(str(exc)) from exc
+    records = _check_replay_records(records)
+    results = [
+        _replay_record(record, pool, select_latest, cutoff) for record in records
+    ]
+    return {"cutoff": cutoff, "results": results}
 
 
 _COUNTERFACTUAL_MAX_KEYS = 12

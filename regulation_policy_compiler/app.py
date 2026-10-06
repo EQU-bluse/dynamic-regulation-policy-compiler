@@ -54,6 +54,7 @@ from .policy import (
     policy_schedule,
     policy_schedule_attestation,
     policy_shadow_report,
+    replay_decisions,
     verify_bundle_evolution_checkpoint,
     verify_bundle_evolution_checkpoint_bundle,
     verify_bundle_evolution_checkpoint_bundle_diff,
@@ -111,6 +112,7 @@ _CHECKPOINT_CHAIN_KEYS = {"stages"}
 _CHECKPOINT_CHAIN_CHECKPOINT_KEYS = {"report", "start", "end"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
 _REPLAY_DIFF_KEYS = {"record_ids", "from", "to"}
+_REPLAY_KEYS = {"records", "rules", "compiled", "cutoff"}
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -316,6 +318,30 @@ async def verify_decision_timeline_attestation_endpoint(
         ("report", "expected"),
         wrap_valid=True,
     )
+
+
+@app.post("/decision-replay")
+async def decision_replay_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if (
+        not isinstance(body, dict)
+        or "records" not in body
+        or not set(body) <= _REPLAY_KEYS
+    ):
+        return _invalid_request()
+    try:
+        result = replay_decisions(
+            body["records"],
+            rules=body.get("rules"),
+            compiled=body.get("compiled"),
+            cutoff=body.get("cutoff"),
+        )
+    except ValueError:
+        return _invalid_request()
+    return _record_response(result)
 
 
 @app.post("/decision-journey")
