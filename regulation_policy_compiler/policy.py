@@ -7,7 +7,7 @@ import hashlib
 import itertools
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import cmp_to_key
 from typing import Any
 
@@ -10451,3 +10451,358 @@ class _VEngine:
         return "".join(
             ['{"root":' + _vjs(previous) + ',"proofs":[', ",".join(parts), "]}"]
         )
+
+
+class ReplayInputError(ValueError):
+    """A batch replay request is structurally invalid.
+
+    Raised by :func:`replay_history` when the policy input is missing or
+    malformed, the record batch is not an array, a record is not a dict
+    carrying at least ``id``, ``at``, and ``facts``, a record identifier is
+    missing, mistyped, or duplicated, a record's ``facts`` is not a
+    ``dict[str, bool]``, or the uniform cutoff is not a valid ISO 8601
+    timestamp. No partial result is produced in any of these cases.
+    """
+
+
+_REPLAY_RECORD_REQUIRED_KEYS = frozenset({"id", "at", "facts"})
+_REPLAY_COMPILED_KEYS = frozenset({"at", "rules", "conflicts"})
+_REPLAY_SOURCES = ("law", "org")
+
+
+def _parse_iso8601(value: Any, field: str) -> datetime:
+    """Parse an ISO 8601 timestamp with an explicit offset as a UTC instant."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be an ISO 8601 timestamp string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field} is not a valid ISO 8601 timestamp: {value!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"{field} must carry an explicit timezone offset: {value!r}"
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_utc_instant(moment: datetime) -> str:
+    """Render a UTC datetime in the canonical ``...Z`` ISO 8601 form."""
+    text = moment.isoformat()
+    if text.endswith("+00:00"):
+        return text[:-6] + "Z"
+    return text
+
+
+def _rule_moment(value: str) -> datetime:
+    """Parse a validated ``YYYY-MM-DDTHH:MM:SSZ`` rule boundary to UTC."""
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+
+
+def _replay_policy_rules(policy: Any) -> list[dict[str, Any]]:
+    """Extract the validated rule list from a policy set or compiled artifact."""
+    if isinstance(policy, list):
+        try:
+            return _validate_rules(policy)
+        except ValueError as exc:
+            raise ReplayInputError(f"policy rules are invalid: {exc}") from exc
+    if isinstance(policy, dict) and set(policy) == _REPLAY_COMPILED_KEYS:
+        try:
+            _check_time(policy["at"], "policy.at")
+            rules = _validate_rules(policy["rules"])
+            _normalize_conflicts(policy["conflicts"], "policy.conflicts")
+        except ValueError as exc:
+            raise ReplayInputError(f"compiled policy is invalid: {exc}") from exc
+        return rules
+    raise ReplayInputError(
+        "policy must be a list of rules or a compile_rules result with "
+        "exactly the keys at, rules, conflicts"
+    )
+
+
+def _check_replay_records(records: Any) -> list[dict[str, Any]]:
+    """Validate the batch-level record structure without touching ``at``."""
+    if not isinstance(records, list):
+        raise ReplayInputError("records must be an array of replay records")
+    seen: set[str] = set()
+    for index, record in enumerate(records):
+        field = f"records[{index}]"
+        if not isinstance(record, dict) or not _REPLAY_RECORD_REQUIRED_KEYS <= set(
+            record
+        ):
+            raise ReplayInputError(
+                f"{field} must be a dict carrying at least the keys id, at, facts"
+            )
+        record_id = record["id"]
+        if not isinstance(record_id, str) or not record_id:
+            raise ReplayInputError(f"{field}.id must be a non-empty string")
+        if record_id in seen:
+            raise ReplayInputError(
+                f"records contain a duplicate id: {record_id!r}"
+            )
+        seen.add(record_id)
+        try:
+            _check_fact_map(record["facts"], f"{field}.facts")
+        except ValueError as exc:
+            raise ReplayInputError(str(exc)) from exc
+    return records
+
+
+def _replay_error_item(
+    record_id: str,
+    at: str | None,
+    versions: dict[str, Any] | None,
+    code: str,
+    message: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build one positional failure item with a stable error code."""
+    error: dict[str, Any] = {"code": code, "message": message}
+    for key, value in extra.items():
+        error[key] = value
+    return {"id": record_id, "at": at, "versions": versions, "error": error}
+
+
+def _replay_record(
+    record: dict[str, Any],
+    rules: list[dict[str, Any]],
+    cutoff_moment: datetime | None,
+) -> dict[str, Any]:
+    """Replay one validated record against the validated rule list."""
+    record_id = record["id"]
+    facts = record["facts"]
+    try:
+        occurred = _parse_iso8601(record["at"], "at")
+    except ValueError as exc:
+        return _replay_error_item(
+            record_id, None, None, "INVALID_TIMESTAMP", str(exc), field="at"
+        )
+    at_text = _format_utc_instant(occurred)
+
+    candidates: list[tuple[dict[str, Any], str, str]] = []
+    visible: list[dict[str, Any]] = []
+    for rule in rules:
+        frm = _rule_moment(rule["from"])
+        to = _rule_moment(rule["to"]) if rule["to"] is not None else None
+        if not (frm <= occurred and (to is None or occurred < to)):
+            candidates.append(
+                (rule, "not_effective", "the rule is not effective at the record time")
+            )
+            continue
+        if cutoff_moment is not None and frm > cutoff_moment:
+            candidates.append(
+                (rule, "after_cutoff", "the rule became effective after the cutoff")
+            )
+            continue
+        visible.append(rule)
+
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    for rule in visible:
+        key = (rule["source"], rule["id"])
+        if key not in latest or rule["ver"] > latest[key]["ver"]:
+            latest[key] = rule
+    retained = sorted(latest.values(), key=cmp_to_key(_compare))
+    retained_ids = {id(rule) for rule in retained}
+    for rule in visible:
+        if id(rule) not in retained_ids:
+            kept = latest[(rule["source"], rule["id"])]
+            candidates.append(
+                (
+                    rule,
+                    "superseded",
+                    f"superseded by {kept['source']} {kept['id']}@{kept['ver']} "
+                    "at the record time",
+                )
+            )
+
+    if not retained:
+        return _replay_error_item(
+            record_id,
+            at_text,
+            {"law": {}, "org": {}},
+            "VERSION_NOT_FOUND",
+            "no rule version is effective at the record time and visible "
+            "at the cutoff",
+        )
+
+    versions = {
+        source: {
+            rule["id"]: rule["ver"]
+            for rule in retained
+            if rule["source"] == source
+        }
+        for source in _REPLAY_SOURCES
+    }
+    versions = {
+        source: {key: versions[source][key] for key in sorted(versions[source])}
+        for source in _REPLAY_SOURCES
+    }
+
+    required = sorted(
+        {key for rule in retained if rule["when"] for key in rule["when"]}
+    )
+    missing = [key for key in required if key not in facts]
+    if missing:
+        return _replay_error_item(
+            record_id,
+            at_text,
+            versions,
+            "MISSING_FACT",
+            "the record facts are missing required fields declared by the "
+            "selected rules",
+            fields=missing,
+        )
+
+    matched = [rule for rule in retained if _matches(rule, facts)]
+    if len(matched) >= 2 and _compare(matched[0], matched[1]) == 0:
+        tied = [rule for rule in matched if _compare(matched[0], rule) == 0]
+        return _replay_error_item(
+            record_id,
+            at_text,
+            versions,
+            "UNRESOLVED_CONFLICT",
+            "the conflict semantics cannot produce a unique winner among the "
+            "top-priority candidates",
+            candidates=[
+                [rule["source"], rule["id"], rule["ver"]] for rule in tied
+            ],
+        )
+
+    winner = matched[0] if matched else None
+    for rule in retained:
+        if rule is winner:
+            candidates.append((rule, "hit", "selected as the final basis"))
+        elif any(rule is item for item in matched):
+            candidates.append(
+                (
+                    rule,
+                    "outranked",
+                    f"matched but outranked by {winner['source']} "
+                    f"{winner['id']}@{winner['ver']}",
+                )
+            )
+        else:
+            candidates.append(
+                (
+                    rule,
+                    "not_matched",
+                    "the when condition is not satisfied by the record facts",
+                )
+            )
+
+    candidates.sort(key=lambda entry: cmp_to_key(_compare)(entry[0]))
+    rank_of = {id(rule): index for index, rule in enumerate(retained)}
+    candidate_entries = [
+        {
+            "rule": [rule["source"], rule["id"], rule["ver"]],
+            "status": status,
+            "reason": reason,
+            "rank": rank_of.get(id(rule)),
+        }
+        for rule, status, reason in candidates
+    ]
+
+    if winner is not None:
+        decision: str | None = winner["result"]
+        trace = [f"{rule['id']}@{rule['ver']}" for rule in matched]
+        basis: dict[str, Any] | None = _snapshot_rule(winner)
+        basis_key = [winner["source"], winner["id"], winner["ver"]]
+        conflicts = [
+            conflict
+            for conflict in _find_conflicts(retained)
+            if conflict["winner"] == basis_key or conflict["loser"] == basis_key
+        ]
+    else:
+        decision = None
+        trace = []
+        basis = None
+        conflicts = []
+    return {
+        "id": record_id,
+        "at": at_text,
+        "versions": versions,
+        "decision": decision,
+        "explanation": {
+            "trace": trace,
+            "basis": basis,
+            "conflicts": conflicts,
+            "candidates": candidate_entries,
+        },
+    }
+
+
+def replay_history(
+    policy: Any, records: Any, cutoff: Any = None
+) -> dict[str, Any]:
+    """Replay a batch of fact records against one versioned policy.
+
+    Pure function: it touches neither history nor files, never reads the
+    system clock, and does not mutate ``policy``, ``records``, or any nested
+    value at any level. ``policy`` is either a list of rule dicts (validated
+    exactly as in :func:`compile_rules`) or an existing :func:`compile_rules`
+    result (a dict with exactly the keys ``at, rules, conflicts``); anything
+    else raises :class:`ReplayInputError`. ``records`` must be an array whose
+    items are dicts carrying at least the keys ``id`` (a non-empty string,
+    unique within the batch), ``at`` (an ISO 8601 timestamp with an explicit
+    timezone offset), and ``facts`` (a ``dict[str, bool]``); extra record
+    keys are ignored. ``cutoff`` is ``None`` or an ISO 8601 timestamp with an
+    explicit offset. A non-array batch, a structurally malformed record, a
+    duplicate identifier, a missing or malformed policy, or an invalid cutoff
+    raises :class:`ReplayInputError` and no partial result is returned.
+
+    Each record is replayed independently against the same policy. Version
+    selection uses only the record's own occurrence instant (normalized to
+    UTC, so two offsets naming the same instant select the same versions): a
+    rule participates when its ``from`` is at or before the instant and its
+    ``to`` is ``None`` or after it (start inclusive, end exclusive), and —
+    when ``cutoff`` is given — only when its ``from`` is at or before the
+    cutoff, so versions published or becoming effective after the cutoff
+    never participate. The cutoff only limits the visible rule set; it never
+    overrides the record's occurrence time. The highest ``ver`` per
+    ``(source, id)`` is retained and survivors are ranked exactly as
+    :func:`evaluate` ranks them.
+
+    Returns a fresh dict with keys ``cutoff, results``. ``cutoff`` is the
+    normalized cutoff or ``None``. ``results`` mirrors the input order, one
+    item per record, so reordering the input only reorders the output and
+    equal inputs always produce identical results; an empty batch yields an
+    empty ``results``. A successful item has keys ``id, at, versions,
+    decision, explanation``: ``at`` is the normalized occurrence time,
+    ``versions`` maps each source (``law``, ``org``) to a sorted ``id -> ver``
+    object of the retained versions, ``decision`` is the top-ranked matching
+    rule's ``result`` (``None`` when nothing matches), and ``explanation``
+    has keys ``trace, basis, conflicts, candidates`` — the first three
+    follow :func:`explain`'s semantics for the retained rules, and
+    ``candidates`` lists every policy rule in ranking order with its
+    ``status`` (``hit``, ``outranked``, ``not_matched``, ``superseded``,
+    ``not_effective``, or ``after_cutoff``), a human-readable ``reason``,
+    and its ``rank`` among the retained rules (``null`` when not retained).
+
+    A failing record does not block the others: its position holds an item
+    with keys ``id, at, versions, error`` and no fabricated decision. The
+    ``error`` carries a stable ``code`` and a human-readable ``message``
+    containing no current time, random identifier, or environment detail:
+    ``INVALID_TIMESTAMP`` (the occurrence time is not a valid offset-carrying
+    ISO 8601 timestamp; also carries ``field``), ``VERSION_NOT_FOUND`` (no
+    version is effective at the instant and visible at the cutoff),
+    ``MISSING_FACT`` (the facts lack fields declared by the selected rules;
+    also carries the sorted ``fields``), and ``UNRESOLVED_CONFLICT`` (the
+    conflict semantics cannot produce a unique winner among the top-priority
+    candidates; also carries the tied ``candidates``).
+    """
+    rules = _replay_policy_rules(policy)
+    if cutoff is None:
+        cutoff_moment: datetime | None = None
+        cutoff_text: str | None = None
+    else:
+        try:
+            cutoff_moment = _parse_iso8601(cutoff, "cutoff")
+        except ValueError as exc:
+            raise ReplayInputError(str(exc)) from exc
+        cutoff_text = _format_utc_instant(cutoff_moment)
+    checked = _check_replay_records(records)
+    items = [_replay_record(record, rules, cutoff_moment) for record in checked]
+    return {"cutoff": cutoff_text, "results": items}

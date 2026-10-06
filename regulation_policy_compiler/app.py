@@ -54,6 +54,7 @@ from .policy import (
     policy_schedule,
     policy_schedule_attestation,
     policy_shadow_report,
+    replay_history,
     verify_bundle_evolution_checkpoint,
     verify_bundle_evolution_checkpoint_bundle,
     verify_bundle_evolution_checkpoint_bundle_diff,
@@ -111,6 +112,8 @@ _CHECKPOINT_CHAIN_KEYS = {"stages"}
 _CHECKPOINT_CHAIN_CHECKPOINT_KEYS = {"report", "start", "end"}
 _BUNDLE_KEYS = {"record_ids", "start", "end"}
 _REPLAY_DIFF_KEYS = {"record_ids", "from", "to"}
+_REPLAY_HISTORY_KEYS = {"policy", "records"}
+_REPLAY_HISTORY_CUTOFF_KEYS = {"policy", "records", "cutoff"}
 
 
 def _error(status_code: int, message: str) -> JSONResponse:
@@ -967,6 +970,24 @@ async def verify_bundle_evolution_checkpoint_bundle_evolution_checkpoint_bundle_
         ("proof", "expected"),
         wrap_valid=True,
     )
+
+
+@app.post("/history/replay")
+async def replay_history_endpoint(request: Request) -> Response:
+    try:
+        body = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_request()
+    if not isinstance(body, dict) or set(body) not in (
+        _REPLAY_HISTORY_KEYS,
+        _REPLAY_HISTORY_CUTOFF_KEYS,
+    ):
+        return _invalid_request()
+    try:
+        result = replay_history(body["policy"], body["records"], body.get("cutoff"))
+    except ValueError:
+        return _invalid_request()
+    return _record_response(result)
 
 
 @app.post("/decisions/{record_id}")
